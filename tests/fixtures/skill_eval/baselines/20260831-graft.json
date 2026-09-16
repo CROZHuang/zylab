@@ -1,0 +1,271 @@
+{
+ "summary": {
+  "cases": 16,
+  "errored": 0,
+  "indeterminate": 0,
+  "positive_ok": 14,
+  "positive_total": 14,
+  "negative_ok": 16,
+  "negative_total": 16
+ },
+ "results": [
+  {
+   "case": "git-safe-commit",
+   "error": null,
+   "completed": true,
+   "read": [
+    "git-workspace-safety"
+   ],
+   "positive_ok": true,
+   "positive_valid": true,
+   "hit": [
+    "git-workspace-safety"
+   ],
+   "negative_ok": true,
+   "negative_valid": true,
+   "false_positive": []
+  },
+  {
+   "case": "quantify-before-claiming",
+   "error": null,
+   "completed": true,
+   "read": [
+    "quantify-first"
+   ],
+   "positive_ok": true,
+   "positive_valid": true,
+   "hit": [
+    "quantify-first"
+   ],
+   "negative_ok": true,
+   "negative_valid": true,
+   "false_positive": []
+  },
+  {
+   "case": "after-fixing-a-bug",
+   "error": null,
+   "completed": true,
+   "read": [
+    "test-ratchet"
+   ],
+   "positive_ok": true,
+   "positive_valid": true,
+   "hit": [
+    "test-ratchet"
+   ],
+   "negative_ok": true,
+   "negative_valid": true,
+   "false_positive": []
+  },
+  {
+   "case": "install-a-package",
+   "error": null,
+   "completed": true,
+   "read": [
+    "pod-environment"
+   ],
+   "positive_ok": true,
+   "positive_valid": true,
+   "hit": [
+    "pod-environment"
+   ],
+   "negative_ok": true,
+   "negative_valid": true,
+   "false_positive": []
+  },
+  {
+   "case": "refactor-split-function",
+   "error": null,
+   "completed": true,
+   "read": [
+    "safe-refactor"
+   ],
+   "positive_ok": true,
+   "positive_valid": true,
+   "hit": [
+    "safe-refactor"
+   ],
+   "negative_ok": true,
+   "negative_valid": true,
+   "false_positive": []
+  },
+  {
+   "case": "negative-plain-knowledge",
+   "error": null,
+   "completed": true,
+   "read": [],
+   "positive_ok": null,
+   "positive_valid": false,
+   "hit": [],
+   "negative_ok": true,
+   "negative_valid": true,
+   "false_positive": []
+  },
+  {
+   "case": "negative-trivial-lookup",
+   "error": null,
+   "completed": true,
+   "read": [],
+   "positive_ok": null,
+   "positive_valid": false,
+   "hit": [],
+   "negative_ok": true,
+   "negative_valid": true,
+   "false_positive": []
+  },
+  {
+   "case": "vendor-docs-context-limit",
+   "error": null,
+   "completed": true,
+   "read": [
+    "vendor-docs"
+   ],
+   "positive_ok": true,
+   "positive_valid": true,
+   "hit": [
+    "vendor-docs"
+   ],
+   "negative_ok": true,
+   "negative_valid": true,
+   "false_positive": []
+  },
+  {
+   "case": "diagnose-intermittent-failure",
+   "error": null,
+   "completed": true,
+   "read": [
+    "diagnosing-bugs"
+   ],
+   "positive_ok": true,
+   "positive_valid": true,
+   "hit": [
+    "diagnosing-bugs"
+   ],
+   "negative_ok": true,
+   "negative_valid": true,
+   "false_positive": []
+  },
+  {
+   "case": "submit-a-gpu-job",
+   "error": null,
+   "completed": true,
+   "read": [
+    "compute-job-submit",
+    "experiment-log",
+    "quantify-first"
+   ],
+   "positive_ok": true,
+   "positive_valid": true,
+   "hit": [
+    "compute-job-submit"
+   ],
+   "negative_ok": true,
+   "negative_valid": true,
+   "false_positive": []
+  },
+  {
+   "case": "impact-of-widening-a-field",
+   "error": null,
+   "completed": true,
+   "read": [
+    "trace-change-impact"
+   ],
+   "positive_ok": true,
+   "positive_valid": true,
+   "hit": [
+    "trace-change-impact"
+   ],
+   "negative_ok": true,
+   "negative_valid": true,
+   "false_positive": []
+  },
+  {
+   "case": "diagnose-after-failed-fix",
+   "error": null,
+   "completed": true,
+   "read": [
+    "diagnosing-bugs"
+   ],
+   "positive_ok": true,
+   "positive_valid": true,
+   "hit": [
+    "diagnosing-bugs"
+   ],
+   "negative_ok": true,
+   "negative_valid": true,
+   "false_positive": []
+  },
+  {
+   "case": "is-this-wrapper-worth-it",
+   "error": null,
+   "completed": true,
+   "read": [
+    "codebase-design"
+   ],
+   "positive_ok": true,
+   "positive_valid": true,
+   "hit": [
+    "codebase-design"
+   ],
+   "negative_ok": true,
+   "negative_valid": true,
+   "false_positive": []
+  },
+  {
+   "case": "naming-an-overloaded-term",
+   "error": null,
+   "completed": true,
+   "read": [
+    "domain-modeling"
+   ],
+   "positive_ok": true,
+   "positive_valid": true,
+   "hit": [
+    "domain-modeling"
+   ],
+   "negative_ok": true,
+   "negative_valid": true,
+   "false_positive": []
+  },
+  {
+   "case": "test-the-composer-redraw",
+   "error": null,
+   "completed": true,
+   "read": [
+    "pty-tui-testing"
+   ],
+   "positive_ok": true,
+   "positive_valid": true,
+   "hit": [
+    "pty-tui-testing"
+   ],
+   "negative_ok": true,
+   "negative_valid": true,
+   "false_positive": []
+  },
+  {
+   "case": "where-should-the-boundary-go",
+   "error": null,
+   "completed": true,
+   "read": [
+    "codebase-design"
+   ],
+   "positive_ok": true,
+   "positive_valid": true,
+   "hit": [
+    "codebase-design"
+   ],
+   "negative_ok": true,
+   "negative_valid": true,
+   "false_positive": []
+  }
+ ],
+ "meta": {
+  "date": "2026-08-31",
+  "gateway": "boyue",
+  "model": "kimi-k3",
+  "catalog": 18,
+  "tools": 20,
+  "note": "Graft 落地后（工具表 15→20，SYSTEM 加了结构导航优先指令）。正向 14/14 负向 16/16 —— 一条 skill 都没被挤掉。refactor-split-function 少读 trace-change-impact 经重复探针证实是轮次波动（该用例合并 4/7），不是 graft 替代；对照组 impact-of-widening-a-field 三次全中。"
+ }
+}

@@ -1,0 +1,11 @@
+__pycache__/
+*.pyc
+.zylab/map/
+dist/
+.zylab-home/
+
+# graft's local graph cache — regenerable, not committed (run `graft build`).
+/.zylab-home/graft/zylab-1a743eb06b5af59dc1da/
+
+# 一次性采集日志，不入库
+logs/

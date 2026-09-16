@@ -1,0 +1,2 @@
+# git archive 出包时把提交标记烤进 core/_build.py，让 tarball 也能 zylab --version。
+core/_build.py export-subst

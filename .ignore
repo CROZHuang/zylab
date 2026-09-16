@@ -1,0 +1,5 @@
+# graft's cards are gitignored but should stay greppable: ripgrep reads
+# .ignore before .gitignore, so this re-admits the tree to search only.
+!.zylab-home/graft/zylab-1a743eb06b5af59dc1da/
+.zylab-home/graft/zylab-1a743eb06b5af59dc1da/.cache/
+.zylab-home/graft/zylab-1a743eb06b5af59dc1da/.graph/

@@ -1,0 +1,169 @@
+{
+  "version": 1,
+  "note": "触发评测用例。expect_any = 至少命中其一；expect_none = 一条都不该命中。正向与负向分开判定，不合成单一分数 —— 合成会让「该触发没触发」和「不该触发却触发」互相抵消。prompt 一律加上「这一轮先别改文件」之类的收敛语，避免评测本身产生副作用；但**不要写「不要读文件」**，那会连 SKILL.md 一起禁掉，2026-08-31 已经这样作废过两个用例。",
+  "cases": [
+    {
+      "name": "vendor-docs-context-limit",
+      "prompt": "boyue 网关上 glm-5.2 的 context limit 是多少？这一轮只回答，不改文件。",
+      "expect_any": [
+        "vendor-docs"
+      ],
+      "expect_none": [],
+      "why": "description 逐字命中 'checking gateways, model names, context limits'"
+    },
+    {
+      "name": "git-safe-commit",
+      "prompt": "如果这个仓库里有未提交的改动，我该怎么安全地提交？这一轮先别执行任何 git 写操作。",
+      "expect_any": [
+        "git-workspace-safety"
+      ],
+      "expect_none": [],
+      "why": "命中 'staging, committing, ... working in a dirty Git tree'"
+    },
+    {
+      "name": "quantify-before-claiming",
+      "prompt": "这个仓库大概有多少行 Python？这一轮先别动手，说说你打算怎么估、依据是什么。",
+      "expect_any": [
+        "quantify-first"
+      ],
+      "expect_none": [],
+      "why": "命中 'estimating counts ... before making a claim'"
+    },
+    {
+      "name": "refactor-split-function",
+      "prompt": "我打算把 core/skills.py 里的 render_index 拆成两个函数。动手前该注意什么？这一轮先别改代码。",
+      "expect_any": [
+        "safe-refactor",
+        "codebase-design"
+      ],
+      "expect_none": [],
+      "why": "命中 'refactoring ... extracting modules'；codebase-design 若将来加入也应命中"
+    },
+    {
+      "name": "after-fixing-a-bug",
+      "prompt": "我刚在这个仓库修了一个 bug。接下来该做什么才算改完？这一轮先别改代码。",
+      "expect_any": [
+        "test-ratchet",
+        "tdd"
+      ],
+      "expect_none": [],
+      "why": "命中 'fixing a bug ... require regression tests'"
+    },
+    {
+      "name": "install-a-package",
+      "prompt": "我需要在这台机器上装一个新的 Python 包给这个项目用。该怎么做？这一轮先别真的装。",
+      "expect_any": [
+        "pod-environment"
+      ],
+      "expect_none": [],
+      "why": "命中 'installing packages, creating venvs'"
+    },
+    {
+      "name": "test-the-composer-redraw",
+      "prompt": "我改了输入框的重绘逻辑，怎么验证没把光标位置搞坏？这一轮先别改代码。",
+      "expect_any": [
+        "pty-tui-testing"
+      ],
+      "expect_none": [],
+      "why": "命中 'testing terminal UI, PTY input, cursor movement, redraws'"
+    },
+    {
+      "name": "submit-a-gpu-job",
+      "prompt": "我要往集群提交一个需要 GPU 的训练任务，该怎么估资源？这一轮先别真的提交。",
+      "expect_any": [
+        "compute-job-submit"
+      ],
+      "expect_none": [
+        "adversarial-review",
+        "code-review"
+      ],
+      "why": "命中 'sizing, submitting ... a batch compute job'。**expect_none 里曾经错误地列入 experiment-log** —— 工作区规则明写「估算 runtime/VRAM 之前先查 EXPERIMENTS.md」，所以估资源时读它是正确行为，不是过度触发。评测跑出的失败也可能是期望写错了，不总是行为错了。"
+    },
+    {
+      "name": "negative-plain-knowledge",
+      "prompt": "用两句话解释一下 Python 的 GIL 是什么。",
+      "expect_any": [],
+      "expect_none": [
+        "compute-job-submit",
+        "git-workspace-safety",
+        "pod-environment",
+        "jsonl-data-safety",
+        "pty-tui-testing",
+        "safe-refactor",
+        "test-ratchet",
+        "code-review"
+      ],
+      "why": "纯知识问答，不该拖任何工程 skill 进来。**不能**加「不要读文件」之类的收敛语 —— 那会保证读不到 SKILL.md，让这条用例平凡通过，什么都证明不了。"
+    },
+    {
+      "name": "negative-trivial-lookup",
+      "prompt": "这个仓库的 README.md 第一行写的是什么？照抄给我即可。",
+      "expect_any": [],
+      "expect_none": [
+        "quantify-first",
+        "safe-refactor",
+        "test-ratchet",
+        "code-review",
+        "adversarial-review",
+        "literature-scout"
+      ],
+      "why": "一次琐碎读取，不该触发方法论 skill —— 过度触发同样是失败"
+    },
+    {
+      "name": "diagnose-intermittent-failure",
+      "prompt": "这个仓库的某个测试大概每十次挂一次，其他时候都过。我该怎么查？这一轮先别改代码。",
+      "expect_any": [
+        "diagnosing-bugs"
+      ],
+      "expect_none": [],
+      "why": "命中 'a failure is intermittent'"
+    },
+    {
+      "name": "diagnose-after-failed-fix",
+      "prompt": "我按自己的猜测改了一版，问题还在。接下来怎么办？这一轮先别再改。",
+      "expect_any": [
+        "diagnosing-bugs"
+      ],
+      "expect_none": [],
+      "why": "命中 'survived a first fix'"
+    },
+    {
+      "name": "impact-of-widening-a-field",
+      "prompt": "我想让 core/agent.py 里 ctx_limit 这个字段可以取 None。动手前要检查什么？这一轮先别改。",
+      "expect_any": [
+        "trace-change-impact"
+      ],
+      "expect_none": [],
+      "why": "命中 'the range a field can hold'；正是 AGENTS.md §4 那次事故的形态"
+    },
+    {
+      "name": "naming-an-overloaded-term",
+      "prompt": "这个项目里 session 这个词在不同文件里好像指不同东西。要不要统一？这一轮先别改代码。",
+      "expect_any": [
+        "domain-modeling"
+      ],
+      "expect_none": [],
+      "why": "命中 'a term means different things across files'"
+    },
+    {
+      "name": "where-should-the-boundary-go",
+      "prompt": "zylab 里 run() 和 _run_managed 是两条几乎重复的主循环。要不要合并？边界该怎么划？这一轮先别改代码。",
+      "expect_any": [
+        "codebase-design"
+      ],
+      "expect_none": [],
+      "why": "命中 'the same logic exists in two places'。这是本仓库真实存在的形态"
+    },
+    {
+      "name": "is-this-wrapper-worth-it",
+      "prompt": "我写了个只有三行的辅助函数包住一次字典取值。这个抽象值得留吗？这一轮先别改代码。",
+      "expect_any": [
+        "codebase-design"
+      ],
+      "expect_none": [
+        "safe-refactor"
+      ],
+      "why": "命中 'judging whether an abstraction earns its keep'。expect_none 排除 safe-refactor —— 这是判断要不要有，不是安全搬动"
+    }
+  ]
+}

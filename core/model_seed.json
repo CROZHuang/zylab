@@ -1,0 +1,2961 @@
+{
+ "generated_from_updated": "2026-09-01T08:02:48+00:00",
+ "models": {
+  "boyue/Pro/deepseek-ai/DeepSeek-R1": {
+   "context": 163840,
+   "context_source": "hf-config:native+yarn",
+   "endpoints": [
+    "openai"
+   ],
+   "family": "deepseek",
+   "gateway": "boyue",
+   "id": "Pro/deepseek-ai/DeepSeek-R1",
+   "listed": true,
+   "probed": "2026-08-21T12:10:28+00:00",
+   "status": "ok",
+   "supports_image": null,
+   "supports_reasoning": null,
+   "supports_temperature": true,
+   "supports_tools": true
+  },
+  "boyue/Pro/deepseek-ai/DeepSeek-V3": {
+   "context": 163840,
+   "context_source": "hf-config:native+yarn",
+   "endpoints": [
+    "openai"
+   ],
+   "family": "deepseek",
+   "gateway": "boyue",
+   "id": "Pro/deepseek-ai/DeepSeek-V3",
+   "listed": true,
+   "probed": "2026-08-21T12:10:34+00:00",
+   "status": "ok",
+   "supports_image": null,
+   "supports_reasoning": null,
+   "supports_temperature": true,
+   "supports_tools": true
+  },
+  "boyue/Pro/deepseek-ai/DeepSeek-V3.1-Terminus": {
+   "context": 163840,
+   "context_source": "hf-config:native+yarn",
+   "endpoints": [
+    "openai"
+   ],
+   "family": "deepseek",
+   "gateway": "boyue",
+   "id": "Pro/deepseek-ai/DeepSeek-V3.1-Terminus",
+   "listed": true,
+   "probed": "2026-08-21T12:10:36+00:00",
+   "status": "ok",
+   "supports_image": null,
+   "supports_reasoning": null,
+   "supports_temperature": true,
+   "supports_tools": true
+  },
+  "boyue/Pro/deepseek-ai/DeepSeek-V3.2": {
+   "context": 163840,
+   "context_source": "hf-config:native+yarn",
+   "endpoints": [
+    "openai"
+   ],
+   "family": "deepseek",
+   "gateway": "boyue",
+   "id": "Pro/deepseek-ai/DeepSeek-V3.2",
+   "listed": true,
+   "probed": "2026-08-21T11:57:02+00:00",
+   "status": "ok",
+   "supports_image": null,
+   "supports_reasoning": null,
+   "supports_temperature": true,
+   "supports_tools": true
+  },
+  "boyue/Pro/moonshotai/Kimi-K2-Instruct-0905": {
+   "context": null,
+   "endpoints": [
+    "openai"
+   ],
+   "family": "moonshot",
+   "gateway": "boyue",
+   "id": "Pro/moonshotai/Kimi-K2-Instruct-0905",
+   "listed": true,
+   "probed": "2026-08-21T12:29:09+00:00",
+   "status": "error",
+   "supports_image": null,
+   "supports_reasoning": null,
+   "supports_temperature": null,
+   "supports_tools": false
+  },
+  "boyue/Pro/moonshotai/Kimi-K2-Thinking": {
+   "context": null,
+   "endpoints": [
+    "openai"
+   ],
+   "family": "moonshot",
+   "gateway": "boyue",
+   "id": "Pro/moonshotai/Kimi-K2-Thinking",
+   "listed": true,
+   "probed": "2026-08-21T12:29:16+00:00",
+   "status": "error",
+   "supports_image": null,
+   "supports_reasoning": null,
+   "supports_temperature": null,
+   "supports_tools": false
+  },
+  "boyue/Pro/zai-org/GLM-5.1": {
+   "context": 202752,
+   "context_source": "hf-config:native",
+   "endpoints": [
+    "openai"
+   ],
+   "family": "智谱",
+   "gateway": "boyue",
+   "id": "Pro/zai-org/GLM-5.1",
+   "listed": true,
+   "probed": "2026-08-21T12:10:50+00:00",
+   "status": "ok",
+   "supports_image": null,
+   "supports_reasoning": null,
+   "supports_temperature": true,
+   "supports_tools": true
+  },
+  "boyue/Qwen/Qwen2-VL-72B-Instruct": {
+   "context": null,
+   "endpoints": [
+    "openai"
+   ],
+   "family": "阿里",
+   "gateway": "boyue",
+   "id": "Qwen/Qwen2-VL-72B-Instruct",
+   "listed": true,
+   "probed": "2026-08-21T12:29:22+00:00",
+   "status": "error",
+   "supports_image": null,
+   "supports_reasoning": null,
+   "supports_temperature": null,
+   "supports_tools": false
+  },
+  "boyue/Qwen/Qwen2.5-14B-Instruct": {
+   "context": 32768,
+   "context_source": "hf-config:native",
+   "endpoints": [
+    "openai"
+   ],
+   "family": "阿里",
+   "gateway": "boyue",
+   "id": "Qwen/Qwen2.5-14B-Instruct",
+   "listed": true,
+   "probed": "2026-08-21T12:10:58+00:00",
+   "status": "ok",
+   "supports_image": null,
+   "supports_reasoning": null,
+   "supports_temperature": true,
+   "supports_tools": true
+  },
+  "boyue/Qwen/Qwen2.5-32B-Instruct": {
+   "context": 32768,
+   "context_source": "hf-config:native",
+   "endpoints": [
+    "openai"
+   ],
+   "family": "阿里",
+   "gateway": "boyue",
+   "id": "Qwen/Qwen2.5-32B-Instruct",
+   "listed": true,
+   "probed": "2026-08-21T12:10:59+00:00",
+   "status": "ok",
+   "supports_image": null,
+   "supports_reasoning": null,
+   "supports_temperature": true,
+   "supports_tools": true
+  },
+  "boyue/Qwen/Qwen2.5-72B-Instruct": {
+   "context": 32768,
+   "context_source": "hf-config:native",
+   "endpoints": [
+    "openai"
+   ],
+   "family": "阿里",
+   "gateway": "boyue",
+   "id": "Qwen/Qwen2.5-72B-Instruct",
+   "listed": true,
+   "probed": "2026-08-21T12:11:01+00:00",
+   "status": "ok",
+   "supports_image": null,
+   "supports_reasoning": null,
+   "supports_temperature": true,
+   "supports_tools": true
+  },
+  "boyue/Qwen/Qwen2.5-72B-Instruct-128K": {
+   "context": null,
+   "endpoints": [
+    "openai"
+   ],
+   "family": "阿里",
+   "gateway": "boyue",
+   "id": "Qwen/Qwen2.5-72B-Instruct-128K",
+   "listed": true,
+   "probed": "2026-08-21T12:11:03+00:00",
+   "status": "ok",
+   "supports_image": null,
+   "supports_reasoning": null,
+   "supports_temperature": true,
+   "supports_tools": true
+  },
+  "boyue/Qwen/Qwen2.5-7B-Instruct": {
+   "context": null,
+   "endpoints": [
+    "openai"
+   ],
+   "family": "阿里",
+   "gateway": "boyue",
+   "id": "Qwen/Qwen2.5-7B-Instruct",
+   "listed": true,
+   "probed": "2026-08-21T12:11:05+00:00",
+   "status": "ok",
+   "supports_image": null,
+   "supports_reasoning": null,
+   "supports_temperature": true,
+   "supports_tools": false
+  },
+  "boyue/Qwen/Qwen2.5-Coder-32B-Instruct": {
+   "context": null,
+   "endpoints": [
+    "openai"
+   ],
+   "family": "阿里",
+   "gateway": "boyue",
+   "id": "Qwen/Qwen2.5-Coder-32B-Instruct",
+   "listed": true,
+   "probed": "2026-08-21T12:29:28+00:00",
+   "status": "error",
+   "supports_image": null,
+   "supports_reasoning": null,
+   "supports_temperature": null,
+   "supports_tools": false
+  },
+  "boyue/Qwen/Qwen3-14B": {
+   "context": 40960,
+   "context_source": "hf-config:native",
+   "endpoints": [
+    "openai"
+   ],
+   "family": "阿里",
+   "gateway": "boyue",
+   "id": "Qwen/Qwen3-14B",
+   "listed": true,
+   "probed": "2026-08-21T12:11:12+00:00",
+   "status": "ok",
+   "supports_image": null,
+   "supports_reasoning": null,
+   "supports_temperature": true,
+   "supports_tools": true
+  },
+  "boyue/Qwen/Qwen3-30B-A3B-Instruct-2507": {
+   "context": 262144,
+   "context_source": "hf-config:native",
+   "endpoints": [
+    "openai"
+   ],
+   "family": "阿里",
+   "gateway": "boyue",
+   "id": "Qwen/Qwen3-30B-A3B-Instruct-2507",
+   "listed": true,
+   "probed": "2026-08-21T12:11:14+00:00",
+   "status": "ok",
+   "supports_image": null,
+   "supports_reasoning": null,
+   "supports_temperature": true,
+   "supports_tools": true
+  },
+  "boyue/Qwen/Qwen3-32B": {
+   "context": null,
+   "endpoints": [
+    "openai"
+   ],
+   "family": "阿里",
+   "gateway": "boyue",
+   "id": "Qwen/Qwen3-32B",
+   "listed": true,
+   "probed": "2026-08-21T12:29:35+00:00",
+   "status": "error",
+   "supports_image": null,
+   "supports_reasoning": null,
+   "supports_temperature": null,
+   "supports_tools": false
+  },
+  "boyue/Qwen/Qwen3-8B": {
+   "context": 40960,
+   "context_source": "hf-config:native",
+   "endpoints": [
+    "openai"
+   ],
+   "family": "阿里",
+   "gateway": "boyue",
+   "id": "Qwen/Qwen3-8B",
+   "listed": true,
+   "probed": "2026-08-21T12:14:19+00:00",
+   "status": "ok",
+   "supports_image": null,
+   "supports_reasoning": null,
+   "supports_temperature": true,
+   "supports_tools": true
+  },
+  "boyue/Qwen/Qwen3-Coder-30B-A3B-Instruct": {
+   "context": 256000,
+   "context_source": "probed",
+   "context_upper_bound": 512000,
+   "endpoints": [
+    "openai"
+   ],
+   "family": "阿里",
+   "gateway": "boyue",
+   "id": "Qwen/Qwen3-Coder-30B-A3B-Instruct",
+   "listed": true,
+   "probed": "2026-08-21T09:35:49+00:00",
+   "status": "ok",
+   "supports_image": null,
+   "supports_reasoning": null,
+   "supports_temperature": true,
+   "supports_tools": true
+  },
+  "boyue/Qwen/Qwen3-Omni-30B-A3B-Instruct": {
+   "context": null,
+   "endpoints": [
+    "openai"
+   ],
+   "family": "阿里",
+   "gateway": "boyue",
+   "id": "Qwen/Qwen3-Omni-30B-A3B-Instruct",
+   "listed": true,
+   "probed": "2026-08-21T12:14:30+00:00",
+   "status": "ok",
+   "supports_image": null,
+   "supports_reasoning": null,
+   "supports_temperature": true,
+   "supports_tools": true
+  },
+  "boyue/Qwen/Qwen3-Omni-30B-A3B-Thinking": {
+   "context": null,
+   "endpoints": [
+    "openai"
+   ],
+   "family": "阿里",
+   "gateway": "boyue",
+   "id": "Qwen/Qwen3-Omni-30B-A3B-Thinking",
+   "listed": true,
+   "probed": "2026-08-21T12:14:31+00:00",
+   "status": "ok",
+   "supports_image": null,
+   "supports_reasoning": null,
+   "supports_temperature": true,
+   "supports_tools": true
+  },
+  "boyue/Qwen/Qwen3-VL-30B-A3B-Instruct": {
+   "context": 262144,
+   "context_source": "hf-config:native",
+   "endpoints": [
+    "openai"
+   ],
+   "family": "阿里",
+   "gateway": "boyue",
+   "id": "Qwen/Qwen3-VL-30B-A3B-Instruct",
+   "listed": true,
+   "probed": "2026-08-21T12:14:34+00:00",
+   "status": "ok",
+   "supports_image": null,
+   "supports_reasoning": null,
+   "supports_temperature": true,
+   "supports_tools": true
+  },
+  "boyue/Qwen/Qwen3-VL-30B-A3B-Thinking": {
+   "context": 262144,
+   "context_source": "hf-config:native",
+   "endpoints": [
+    "openai"
+   ],
+   "family": "阿里",
+   "gateway": "boyue",
+   "id": "Qwen/Qwen3-VL-30B-A3B-Thinking",
+   "listed": true,
+   "probed": "2026-08-21T12:14:36+00:00",
+   "status": "ok",
+   "supports_image": null,
+   "supports_reasoning": null,
+   "supports_temperature": true,
+   "supports_tools": true
+  },
+  "boyue/Qwen/Qwen3-VL-32B-Instruct": {
+   "context": 262144,
+   "context_source": "hf-config:native",
+   "endpoints": [
+    "openai"
+   ],
+   "family": "阿里",
+   "gateway": "boyue",
+   "id": "Qwen/Qwen3-VL-32B-Instruct",
+   "listed": true,
+   "probed": "2026-08-21T12:14:38+00:00",
+   "status": "ok",
+   "supports_image": null,
+   "supports_reasoning": null,
+   "supports_temperature": true,
+   "supports_tools": true
+  },
+  "boyue/Qwen/Qwen3-VL-32B-Thinking": {
+   "context": 262144,
+   "context_source": "hf-config:native",
+   "endpoints": [
+    "openai"
+   ],
+   "family": "阿里",
+   "gateway": "boyue",
+   "id": "Qwen/Qwen3-VL-32B-Thinking",
+   "listed": true,
+   "probed": "2026-08-21T12:14:40+00:00",
+   "status": "ok",
+   "supports_image": null,
+   "supports_reasoning": null,
+   "supports_temperature": true,
+   "supports_tools": true
+  },
+  "boyue/Qwen/Qwen3-VL-8B-Instruct": {
+   "context": 262144,
+   "context_source": "hf-config:native",
+   "endpoints": [
+    "openai"
+   ],
+   "family": "阿里",
+   "gateway": "boyue",
+   "id": "Qwen/Qwen3-VL-8B-Instruct",
+   "listed": true,
+   "probed": "2026-08-21T12:14:44+00:00",
+   "status": "ok",
+   "supports_image": null,
+   "supports_reasoning": null,
+   "supports_temperature": true,
+   "supports_tools": true
+  },
+  "boyue/Qwen/Qwen3-VL-8B-Thinking": {
+   "context": 262144,
+   "context_source": "hf-config:native",
+   "endpoints": [
+    "openai"
+   ],
+   "family": "阿里",
+   "gateway": "boyue",
+   "id": "Qwen/Qwen3-VL-8B-Thinking",
+   "listed": true,
+   "probed": "2026-08-21T12:14:46+00:00",
+   "status": "ok",
+   "supports_image": null,
+   "supports_reasoning": null,
+   "supports_temperature": true,
+   "supports_tools": true
+  },
+  "boyue/Qwen/Qwen3.5-35B-A3B": {
+   "context": 262144,
+   "context_source": "hf-config:native",
+   "endpoints": [
+    "openai"
+   ],
+   "family": "阿里",
+   "gateway": "boyue",
+   "id": "Qwen/Qwen3.5-35B-A3B",
+   "listed": true,
+   "probed": "2026-08-21T12:14:48+00:00",
+   "status": "ok",
+   "supports_image": null,
+   "supports_reasoning": null,
+   "supports_temperature": true,
+   "supports_tools": true
+  },
+  "boyue/Qwen/Qwen3.5-397B-A17B": {
+   "context": 262144,
+   "context_source": "hf-config:native",
+   "endpoints": [
+    "openai"
+   ],
+   "family": "阿里",
+   "gateway": "boyue",
+   "id": "Qwen/Qwen3.5-397B-A17B",
+   "listed": true,
+   "probed": "2026-08-21T11:58:20+00:00",
+   "status": "ok",
+   "supports_image": null,
+   "supports_reasoning": null,
+   "supports_temperature": true,
+   "supports_tools": true
+  },
+  "boyue/Qwen/Qwen3.5-4B": {
+   "context": 262144,
+   "context_source": "hf-config:native",
+   "endpoints": [
+    "openai"
+   ],
+   "family": "阿里",
+   "gateway": "boyue",
+   "id": "Qwen/Qwen3.5-4B",
+   "listed": true,
+   "probed": "2026-08-21T12:14:50+00:00",
+   "status": "ok",
+   "supports_image": null,
+   "supports_reasoning": null,
+   "supports_temperature": true,
+   "supports_tools": true
+  },
+  "boyue/Qwen/Qwen3.5-9B": {
+   "context": 262144,
+   "context_source": "hf-config:native",
+   "endpoints": [
+    "openai"
+   ],
+   "family": "阿里",
+   "gateway": "boyue",
+   "id": "Qwen/Qwen3.5-9B",
+   "listed": true,
+   "probed": "2026-08-21T12:14:52+00:00",
+   "status": "ok",
+   "supports_image": null,
+   "supports_reasoning": null,
+   "supports_temperature": true,
+   "supports_tools": true
+  },
+  "boyue/THUDM/GLM-4-32B-0414": {
+   "context": null,
+   "endpoints": [
+    "openai"
+   ],
+   "family": "智谱",
+   "gateway": "boyue",
+   "id": "THUDM/GLM-4-32B-0414",
+   "listed": true,
+   "probed": "2026-08-21T12:32:38+00:00",
+   "status": "error",
+   "supports_image": null,
+   "supports_reasoning": null,
+   "supports_temperature": null,
+   "supports_tools": false
+  },
+  "boyue/THUDM/GLM-4-9B-0414": {
+   "context": 32768,
+   "context_source": "hf-config:native",
+   "endpoints": [
+    "openai"
+   ],
+   "family": "智谱",
+   "gateway": "boyue",
+   "id": "THUDM/GLM-4-9B-0414",
+   "listed": true,
+   "probed": "2026-08-21T12:15:01+00:00",
+   "status": "ok",
+   "supports_image": null,
+   "supports_reasoning": null,
+   "supports_temperature": true,
+   "supports_tools": true
+  },
+  "boyue/THUDM/GLM-Z1-32B-0414": {
+   "context": null,
+   "endpoints": [
+    "openai"
+   ],
+   "family": "智谱",
+   "gateway": "boyue",
+   "id": "THUDM/GLM-Z1-32B-0414",
+   "listed": true,
+   "probed": "2026-08-21T12:32:44+00:00",
+   "status": "error",
+   "supports_image": null,
+   "supports_reasoning": null,
+   "supports_temperature": null,
+   "supports_tools": false
+  },
+  "boyue/THUDM/GLM-Z1-9B-0414": {
+   "context": 32768,
+   "context_source": "hf-config:native",
+   "endpoints": [
+    "openai"
+   ],
+   "family": "智谱",
+   "gateway": "boyue",
+   "id": "THUDM/GLM-Z1-9B-0414",
+   "listed": true,
+   "probed": "2026-08-21T12:15:07+00:00",
+   "status": "ok",
+   "supports_image": null,
+   "supports_reasoning": null,
+   "supports_temperature": true,
+   "supports_tools": true
+  },
+  "boyue/USD-guiji/deepseek-r1": {
+   "context": 256000,
+   "context_source": "alias-of:deepseek-r1(probed)",
+   "endpoints": [
+    "openai"
+   ],
+   "family": "deepseek",
+   "gateway": "boyue",
+   "id": "USD-guiji/deepseek-r1",
+   "listed": true,
+   "probed": "2026-08-21T12:15:13+00:00",
+   "status": "ok",
+   "supports_image": null,
+   "supports_reasoning": null,
+   "supports_temperature": true,
+   "supports_tools": true
+  },
+  "boyue/USD-guiji/deepseek-v3": {
+   "context": 163840,
+   "context_source": "alias-of:deepseek-ai/DeepSeek-V3(hf-config:native+yarn)",
+   "endpoints": [
+    "openai"
+   ],
+   "family": "deepseek",
+   "gateway": "boyue",
+   "id": "USD-guiji/deepseek-v3",
+   "listed": true,
+   "probed": "2026-08-21T12:15:17+00:00",
+   "status": "ok",
+   "supports_image": null,
+   "supports_reasoning": null,
+   "supports_temperature": true,
+   "supports_tools": true
+  },
+  "boyue/alibaba/tongyi-deepresearch-30b-a3b": {
+   "context": null,
+   "endpoints": [
+    "openai"
+   ],
+   "family": "阿里",
+   "gateway": "boyue",
+   "id": "alibaba/tongyi-deepresearch-30b-a3b",
+   "listed": true,
+   "probed": "2026-08-21T12:32:50+00:00",
+   "status": "error",
+   "supports_image": null,
+   "supports_reasoning": null,
+   "supports_temperature": null,
+   "supports_tools": false
+  },
+  "boyue/bailian/deepseek-v4-flash": {
+   "context": 1048576,
+   "context_source": "alias-of:deepseek-v4-flash(自报)",
+   "endpoints": [
+    "openai"
+   ],
+   "family": "deepseek",
+   "gateway": "boyue",
+   "id": "bailian/deepseek-v4-flash",
+   "listed": true,
+   "probed": "2026-08-21T12:15:24+00:00",
+   "status": "ok",
+   "supports_image": null,
+   "supports_reasoning": null,
+   "supports_temperature": true,
+   "supports_tools": true
+  },
+  "boyue/bailian/deepseek-v4-pro": {
+   "context": 1048576,
+   "context_seen_ok": 12152,
+   "context_source": "alias-of:deepseek-v4-pro(自报)",
+   "endpoints": [
+    "openai"
+   ],
+   "family": "deepseek",
+   "gateway": "boyue",
+   "id": "bailian/deepseek-v4-pro",
+   "listed": true,
+   "probed": "2026-08-21T11:57:17+00:00",
+   "status": "ok",
+   "supports_image": null,
+   "supports_reasoning": null,
+   "supports_temperature": true,
+   "supports_tools": true
+  },
+  "boyue/claude-opus-5": {
+   "gateway": "boyue",
+   "id": "claude-opus-5",
+   "probed": "2026-08-26T07:52:25+00:00",
+   "status": "error",
+   "supports_temperature": null,
+   "supports_tools": null
+  },
+  "boyue/claude-sonnet-5": {
+   "gateway": "boyue",
+   "id": "claude-sonnet-5",
+   "probed": "2026-08-26T07:56:58+00:00",
+   "status": "ok",
+   "supports_temperature": false,
+   "supports_tools": true
+  },
+  "boyue/deepseek-ai/DeepSeek-OCR": {
+   "context": null,
+   "endpoints": [
+    "openai"
+   ],
+   "family": "deepseek",
+   "gateway": "boyue",
+   "id": "deepseek-ai/DeepSeek-OCR",
+   "listed": true,
+   "probed": "2026-08-21T12:32:54+00:00",
+   "status": "error",
+   "supports_image": null,
+   "supports_reasoning": null,
+   "supports_temperature": null,
+   "supports_tools": false
+  },
+  "boyue/deepseek-ai/DeepSeek-R1": {
+   "context": 163840,
+   "context_source": "hf-config:native+yarn",
+   "endpoints": [
+    "openai"
+   ],
+   "family": "deepseek",
+   "gateway": "boyue",
+   "id": "deepseek-ai/DeepSeek-R1",
+   "listed": true,
+   "probed": "2026-08-21T12:15:26+00:00",
+   "status": "ok",
+   "supports_image": null,
+   "supports_reasoning": null,
+   "supports_temperature": true,
+   "supports_tools": true
+  },
+  "boyue/deepseek-ai/DeepSeek-R1-0528-Qwen3-8B": {
+   "context": null,
+   "endpoints": [
+    "openai"
+   ],
+   "family": "deepseek",
+   "gateway": "boyue",
+   "id": "deepseek-ai/DeepSeek-R1-0528-Qwen3-8B",
+   "listed": true,
+   "probed": "2026-08-21T12:32:55+00:00",
+   "status": "error",
+   "supports_image": null,
+   "supports_reasoning": null,
+   "supports_temperature": null,
+   "supports_tools": false
+  },
+  "boyue/deepseek-ai/DeepSeek-R1-Distill-Qwen-14B": {
+   "context": null,
+   "endpoints": [
+    "openai"
+   ],
+   "family": "deepseek",
+   "gateway": "boyue",
+   "id": "deepseek-ai/DeepSeek-R1-Distill-Qwen-14B",
+   "listed": true,
+   "probed": "2026-08-21T12:32:56+00:00",
+   "status": "error",
+   "supports_image": null,
+   "supports_reasoning": null,
+   "supports_temperature": null,
+   "supports_tools": false
+  },
+  "boyue/deepseek-ai/DeepSeek-V3": {
+   "context": 163840,
+   "context_source": "hf-config:native+yarn",
+   "endpoints": [
+    "openai"
+   ],
+   "family": "deepseek",
+   "gateway": "boyue",
+   "id": "deepseek-ai/DeepSeek-V3",
+   "listed": true,
+   "probed": "2026-08-21T12:15:40+00:00",
+   "status": "ok",
+   "supports_image": null,
+   "supports_reasoning": null,
+   "supports_temperature": true,
+   "supports_tools": true
+  },
+  "boyue/deepseek-ai/DeepSeek-V3.1-Terminus": {
+   "context": 163840,
+   "context_source": "hf-config:native+yarn",
+   "endpoints": [
+    "openai"
+   ],
+   "family": "deepseek",
+   "gateway": "boyue",
+   "id": "deepseek-ai/DeepSeek-V3.1-Terminus",
+   "listed": true,
+   "probed": "2026-08-21T11:57:00+00:00",
+   "status": "ok",
+   "supports_image": null,
+   "supports_reasoning": null,
+   "supports_temperature": true,
+   "supports_tools": true
+  },
+  "boyue/deepseek-ai/DeepSeek-V3.2": {
+   "context": 163840,
+   "context_source": "hf-config:native+yarn",
+   "endpoints": [
+    "openai"
+   ],
+   "family": "deepseek",
+   "gateway": "boyue",
+   "id": "deepseek-ai/DeepSeek-V3.2",
+   "listed": true,
+   "probed": "2026-08-21T11:56:53+00:00",
+   "status": "ok",
+   "supports_image": null,
+   "supports_reasoning": null,
+   "supports_temperature": true,
+   "supports_tools": true
+  },
+  "boyue/deepseek-chat": {
+   "context": 1000000,
+   "context_source": "probed",
+   "context_upper_bound": null,
+   "endpoints": [
+    "openai"
+   ],
+   "family": "deepseek",
+   "gateway": "boyue",
+   "id": "deepseek-chat",
+   "listed": true,
+   "probed": "2026-08-21T09:33:45+00:00",
+   "status": "ok",
+   "supports_image": null,
+   "supports_reasoning": null,
+   "supports_temperature": true,
+   "supports_tools": true
+  },
+  "boyue/deepseek-chat-beta": {
+   "context": 1000000,
+   "context_source": "alias-of:deepseek-chat(probed)",
+   "endpoints": [
+    "openai"
+   ],
+   "family": "deepseek",
+   "gateway": "boyue",
+   "id": "deepseek-chat-beta",
+   "listed": true,
+   "probed": "2026-08-21T12:15:43+00:00",
+   "status": "ok",
+   "supports_image": null,
+   "supports_reasoning": null,
+   "supports_temperature": true,
+   "supports_tools": true
+  },
+  "boyue/deepseek-r1": {
+   "context": 256000,
+   "context_source": "probed",
+   "context_upper_bound": 512000,
+   "endpoints": [
+    "openai"
+   ],
+   "family": "deepseek",
+   "gateway": "boyue",
+   "id": "deepseek-r1",
+   "listed": true,
+   "probed": "2026-08-21T11:56:49+00:00",
+   "status": "ok",
+   "supports_image": null,
+   "supports_reasoning": null,
+   "supports_temperature": true,
+   "supports_tools": true
+  },
+  "boyue/deepseek-r1-0528": {
+   "context": 256000,
+   "context_source": "alias-of:deepseek-r1(probed)",
+   "endpoints": [
+    "openai"
+   ],
+   "family": "deepseek",
+   "gateway": "boyue",
+   "id": "deepseek-r1-0528",
+   "listed": true,
+   "probed": "2026-08-21T12:15:44+00:00",
+   "status": "ok",
+   "supports_image": null,
+   "supports_reasoning": null,
+   "supports_temperature": true,
+   "supports_tools": true
+  },
+  "boyue/deepseek-r1-250528": {
+   "context": null,
+   "endpoints": [
+    "openai"
+   ],
+   "family": "deepseek",
+   "gateway": "boyue",
+   "id": "deepseek-r1-250528",
+   "listed": true,
+   "probed": "2026-08-21T12:33:01+00:00",
+   "status": "error",
+   "supports_image": null,
+   "supports_reasoning": null,
+   "supports_temperature": null,
+   "supports_tools": false
+  },
+  "boyue/deepseek-reasoner": {
+   "context": 1000000,
+   "context_source": "probed",
+   "context_upper_bound": null,
+   "endpoints": [
+    "openai"
+   ],
+   "family": "deepseek",
+   "gateway": "boyue",
+   "id": "deepseek-reasoner",
+   "listed": true,
+   "probed": "2026-08-21T09:33:46+00:00",
+   "status": "ok",
+   "supports_image": null,
+   "supports_reasoning": null,
+   "supports_temperature": true,
+   "supports_tools": true
+  },
+  "boyue/deepseek-reasoner-beta": {
+   "context": 1000000,
+   "context_source": "alias-of:deepseek-reasoner(probed)",
+   "endpoints": [
+    "openai"
+   ],
+   "family": "deepseek",
+   "gateway": "boyue",
+   "id": "deepseek-reasoner-beta",
+   "listed": true,
+   "probed": "2026-08-21T12:16:04+00:00",
+   "status": "ok",
+   "supports_image": null,
+   "supports_reasoning": null,
+   "supports_temperature": true,
+   "supports_tools": true
+  },
+  "boyue/deepseek-v3.2": {
+   "context": 128000,
+   "context_source": "probed",
+   "context_upper_bound": 200000,
+   "endpoints": [
+    "openai"
+   ],
+   "family": "deepseek",
+   "gateway": "boyue",
+   "id": "deepseek-v3.2",
+   "listed": true,
+   "probed": "2026-08-21T09:33:25+00:00",
+   "status": "ok",
+   "supports_image": null,
+   "supports_reasoning": null,
+   "supports_temperature": true,
+   "supports_tools": true
+  },
+  "boyue/deepseek-v4-flash": {
+   "context": 1000000,
+   "context_source": "probed",
+   "context_upper_bound": null,
+   "endpoints": [
+    "openai"
+   ],
+   "family": "deepseek",
+   "gateway": "boyue",
+   "id": "deepseek-v4-flash",
+   "listed": true,
+   "probed": "2026-08-21T09:33:24+00:00",
+   "status": "ok",
+   "supports_image": null,
+   "supports_reasoning": null,
+   "supports_temperature": true,
+   "supports_tools": true
+  },
+  "boyue/deepseek-v4-flash-0731": {
+   "context": 1048576,
+   "context_source": "alias-of:deepseek-v4-flash(自报)",
+   "endpoints": [
+    "openai"
+   ],
+   "family": "deepseek",
+   "gateway": "boyue",
+   "id": "deepseek-v4-flash-0731",
+   "listed": true,
+   "probed": "2026-08-21T12:16:05+00:00",
+   "status": "ok",
+   "supports_image": null,
+   "supports_reasoning": null,
+   "supports_temperature": true,
+   "supports_tools": true
+  },
+  "boyue/deepseek-v4-flash-beta": {
+   "context": 1048576,
+   "context_source": "alias-of:deepseek-v4-flash(自报)",
+   "endpoints": [
+    "openai"
+   ],
+   "family": "deepseek",
+   "gateway": "boyue",
+   "id": "deepseek-v4-flash-beta",
+   "listed": true,
+   "probed": "2026-08-21T12:16:07+00:00",
+   "status": "ok",
+   "supports_image": null,
+   "supports_reasoning": null,
+   "supports_temperature": true,
+   "supports_tools": true
+  },
+  "boyue/deepseek-v4-flash-responses": {
+   "context": null,
+   "endpoints": [
+    "openai"
+   ],
+   "family": "deepseek",
+   "gateway": "boyue",
+   "id": "deepseek-v4-flash-responses",
+   "listed": true,
+   "probed": "2026-08-21T12:33:10+00:00",
+   "status": "error",
+   "supports_image": null,
+   "supports_reasoning": null,
+   "supports_temperature": null,
+   "supports_tools": false
+  },
+  "boyue/deepseek-v4-flash-vision-exp": {
+   "endpoints": [
+    "openai"
+   ],
+   "family": "deepseek",
+   "gateway": "boyue",
+   "id": "deepseek-v4-flash-vision-exp",
+   "listed": true,
+   "probed": "2026-08-21T12:16:12+00:00",
+   "status": "ok",
+   "supports_image": null,
+   "supports_reasoning": null,
+   "supports_temperature": true,
+   "supports_tools": true
+  },
+  "boyue/deepseek-v4-flash-vision-exp-beta": {
+   "endpoints": [
+    "openai"
+   ],
+   "family": "deepseek",
+   "gateway": "boyue",
+   "id": "deepseek-v4-flash-vision-exp-beta",
+   "listed": true,
+   "probed": "2026-08-21T12:16:14+00:00",
+   "status": "ok",
+   "supports_image": null,
+   "supports_reasoning": null,
+   "supports_temperature": true,
+   "supports_tools": true
+  },
+  "boyue/deepseek-v4-flash-vision-exp-responses": {
+   "context": null,
+   "endpoints": [
+    "openai"
+   ],
+   "family": "deepseek",
+   "gateway": "boyue",
+   "id": "deepseek-v4-flash-vision-exp-responses",
+   "listed": true,
+   "probed": "2026-08-21T12:33:13+00:00",
+   "status": "error",
+   "supports_image": null,
+   "supports_reasoning": null,
+   "supports_temperature": null,
+   "supports_tools": false
+  },
+  "boyue/deepseek-v4-pro": {
+   "context": 1000000,
+   "context_source": "probed",
+   "context_upper_bound": null,
+   "endpoints": [
+    "openai"
+   ],
+   "family": "deepseek",
+   "gateway": "boyue",
+   "id": "deepseek-v4-pro",
+   "listed": true,
+   "probed": "2026-08-21T09:33:15+00:00",
+   "status": "ok",
+   "supports_image": null,
+   "supports_reasoning": null,
+   "supports_temperature": true,
+   "supports_tools": true
+  },
+  "boyue/deepseek-v4-pro-0813": {
+   "context": 1048576,
+   "context_seen_ok": 64082,
+   "context_source": "alias-of:deepseek-v4-pro(自报)",
+   "endpoints": [
+    "openai"
+   ],
+   "family": "deepseek",
+   "gateway": "boyue",
+   "id": "deepseek-v4-pro-0813",
+   "listed": true,
+   "probed": "2026-08-25T08:18:34+00:00",
+   "status": "ok",
+   "supports_image": null,
+   "supports_reasoning": null,
+   "supports_temperature": true,
+   "supports_tools": true
+  },
+  "boyue/deepseek-v4-pro-beta": {
+   "context": 1048576,
+   "context_source": "alias-of:deepseek-v4-pro(自报)",
+   "endpoints": [
+    "openai"
+   ],
+   "family": "deepseek",
+   "gateway": "boyue",
+   "id": "deepseek-v4-pro-beta",
+   "listed": true,
+   "probed": "2026-08-21T12:17:40+00:00",
+   "status": "ok",
+   "supports_image": null,
+   "supports_reasoning": null,
+   "supports_temperature": true,
+   "supports_tools": true
+  },
+  "boyue/deepseek-v4-pro-responses": {
+   "context": null,
+   "endpoints": [
+    "openai"
+   ],
+   "family": "deepseek",
+   "gateway": "boyue",
+   "id": "deepseek-v4-pro-responses",
+   "listed": true,
+   "probed": "2026-08-21T12:33:17+00:00",
+   "status": "error",
+   "supports_image": null,
+   "supports_reasoning": null,
+   "supports_temperature": null,
+   "supports_tools": false
+  },
+  "boyue/glm-4.5v": {
+   "context": 65536,
+   "context_source": "alias-of:zai-org/GLM-4.5V(hf-config:native)",
+   "endpoints": [
+    "openai"
+   ],
+   "family": "智谱",
+   "gateway": "boyue",
+   "id": "glm-4.5v",
+   "listed": true,
+   "probed": "2026-08-21T12:17:46+00:00",
+   "status": "ok",
+   "supports_image": null,
+   "supports_reasoning": null,
+   "supports_temperature": true,
+   "supports_tools": true
+  },
+  "boyue/glm-4.6": {
+   "context": 204800,
+   "context_source": "doc:zhipu",
+   "endpoints": [
+    "openai"
+   ],
+   "family": "智谱",
+   "gateway": "boyue",
+   "id": "glm-4.6",
+   "listed": true,
+   "probed": "2026-08-21T11:58:08+00:00",
+   "status": "ok",
+   "supports_image": null,
+   "supports_reasoning": null,
+   "supports_temperature": true,
+   "supports_tools": true
+  },
+  "boyue/glm-4.6v": {
+   "context": null,
+   "endpoints": [
+    "openai"
+   ],
+   "family": "智谱",
+   "gateway": "boyue",
+   "id": "glm-4.6v",
+   "listed": true,
+   "probed": "2026-08-21T12:17:49+00:00",
+   "status": "ok",
+   "supports_image": null,
+   "supports_reasoning": null,
+   "supports_temperature": true,
+   "supports_tools": true
+  },
+  "boyue/glm-4.7": {
+   "context": 204800,
+   "context_source": "doc:zhipu",
+   "endpoints": [
+    "openai"
+   ],
+   "family": "智谱",
+   "gateway": "boyue",
+   "id": "glm-4.7",
+   "listed": true,
+   "probed": "2026-08-21T09:35:32+00:00",
+   "status": "ok",
+   "supports_image": null,
+   "supports_reasoning": null,
+   "supports_temperature": true,
+   "supports_tools": true
+  },
+  "boyue/glm-4.7-Flash": {
+   "context": null,
+   "endpoints": [
+    "openai"
+   ],
+   "family": "智谱",
+   "gateway": "boyue",
+   "id": "glm-4.7-Flash",
+   "listed": true,
+   "probed": "2026-08-21T11:57:30+00:00",
+   "status": "ok",
+   "supports_image": null,
+   "supports_reasoning": null,
+   "supports_temperature": true,
+   "supports_tools": true
+  },
+  "boyue/glm-4.7-FlashX": {
+   "context": null,
+   "endpoints": [
+    "openai"
+   ],
+   "family": "智谱",
+   "gateway": "boyue",
+   "id": "glm-4.7-FlashX",
+   "listed": true,
+   "probed": "2026-08-21T12:17:52+00:00",
+   "status": "ok",
+   "supports_image": null,
+   "supports_reasoning": null,
+   "supports_temperature": true,
+   "supports_tools": true
+  },
+  "boyue/glm-5": {
+   "context": 204800,
+   "context_source": "doc:zhipu",
+   "endpoints": [
+    "openai"
+   ],
+   "family": "智谱",
+   "gateway": "boyue",
+   "id": "glm-5",
+   "listed": true,
+   "probed": "2026-08-21T09:34:22+00:00",
+   "status": "ok",
+   "supports_image": null,
+   "supports_reasoning": null,
+   "supports_temperature": true,
+   "supports_tools": true
+  },
+  "boyue/glm-5-turbo": {
+   "context": 204800,
+   "context_source": "doc:zhipu",
+   "endpoints": [
+    "openai"
+   ],
+   "family": "智谱",
+   "gateway": "boyue",
+   "id": "glm-5-turbo",
+   "listed": true,
+   "probed": "2026-08-21T11:57:28+00:00",
+   "status": "ok",
+   "supports_image": null,
+   "supports_reasoning": null,
+   "supports_temperature": true,
+   "supports_tools": true
+  },
+  "boyue/glm-5.1": {
+   "context": 204800,
+   "context_source": "doc:zhipu",
+   "endpoints": [
+    "openai"
+   ],
+   "family": "智谱",
+   "gateway": "boyue",
+   "id": "glm-5.1",
+   "listed": true,
+   "probed": "2026-08-21T11:57:26+00:00",
+   "status": "ok",
+   "supports_image": null,
+   "supports_reasoning": null,
+   "supports_temperature": true,
+   "supports_tools": true
+  },
+  "boyue/glm-5.2": {
+   "context": 1000000,
+   "context_source": "doc:zhipu",
+   "endpoints": [
+    "openai"
+   ],
+   "family": "智谱",
+   "gateway": "boyue",
+   "id": "glm-5.2",
+   "listed": true,
+   "probed": "2026-08-21T09:34:06+00:00",
+   "status": "ok",
+   "supports_image": null,
+   "supports_reasoning": null,
+   "supports_temperature": true,
+   "supports_tools": true
+  },
+  "boyue/glm-5.3": {
+   "context": 950017,
+   "context_seen_ok": 135049,
+   "context_source": "probed",
+   "context_upper_bound": 2000000,
+   "endpoints": [
+    "openai"
+   ],
+   "family": "智谱",
+   "gateway": "boyue",
+   "id": "glm-5.3",
+   "listed": true,
+   "probed": "2026-08-25T08:19:39+00:00",
+   "status": "ok",
+   "supports_image": null,
+   "supports_reasoning": null,
+   "supports_temperature": true,
+   "supports_tools": true
+  },
+  "boyue/glm-5v-turbo": {
+   "context": null,
+   "endpoints": [
+    "openai"
+   ],
+   "family": "智谱",
+   "gateway": "boyue",
+   "id": "glm-5v-turbo",
+   "listed": true,
+   "probed": "2026-08-21T12:18:08+00:00",
+   "status": "ok",
+   "supports_image": null,
+   "supports_reasoning": null,
+   "supports_temperature": true,
+   "supports_tools": true
+  },
+  "boyue/gpt-5.6-sol": {
+   "gateway": "boyue",
+   "id": "gpt-5.6-sol",
+   "probed": "2026-08-26T07:51:48+00:00",
+   "status": "ok",
+   "supports_temperature": true,
+   "supports_tools": true
+  },
+  "boyue/gpt-5.6-terra": {
+   "gateway": "boyue",
+   "id": "gpt-5.6-terra",
+   "probed": "2026-08-26T07:52:23+00:00",
+   "status": "ok",
+   "supports_temperature": true,
+   "supports_tools": true
+  },
+  "boyue/kimi-k2-thinking": {
+   "context": null,
+   "endpoints": [
+    "openai"
+   ],
+   "family": "moonshot",
+   "gateway": "boyue",
+   "id": "kimi-k2-thinking",
+   "listed": true,
+   "probed": "2026-08-21T09:33:56+00:00",
+   "status": "ok",
+   "supports_image": null,
+   "supports_reasoning": null,
+   "supports_temperature": true,
+   "supports_tools": true
+  },
+  "boyue/kimi-k2.5": {
+   "context": null,
+   "endpoints": [
+    "openai"
+   ],
+   "family": "moonshot",
+   "gateway": "boyue",
+   "id": "kimi-k2.5",
+   "listed": true,
+   "probed": "2026-08-21T11:57:20+00:00",
+   "status": "ok",
+   "supports_image": null,
+   "supports_reasoning": null,
+   "supports_temperature": true,
+   "supports_tools": true
+  },
+  "boyue/kimi-k2.6": {
+   "context": 262144,
+   "context_source": "alias-of:kimi-k2.6(自报)",
+   "endpoints": [
+    "openai"
+   ],
+   "family": "moonshot",
+   "gateway": "boyue",
+   "id": "kimi-k2.6",
+   "listed": true,
+   "probed": "2026-08-21T09:33:54+00:00",
+   "status": "ok",
+   "supports_image": null,
+   "supports_reasoning": null,
+   "supports_temperature": true,
+   "supports_tools": true
+  },
+  "boyue/kimi-k2.7-code": {
+   "context": 200000,
+   "context_source": "probed",
+   "context_upper_bound": 256000,
+   "endpoints": [
+    "openai"
+   ],
+   "family": "moonshot",
+   "gateway": "boyue",
+   "id": "kimi-k2.7-code",
+   "listed": true,
+   "probed": "2026-08-21T09:33:48+00:00",
+   "status": "ok",
+   "supports_image": null,
+   "supports_reasoning": null,
+   "supports_temperature": true,
+   "supports_tools": true
+  },
+  "boyue/kimi-k2.7-code-highspeed": {
+   "context": null,
+   "endpoints": [
+    "openai"
+   ],
+   "family": "moonshot",
+   "gateway": "boyue",
+   "id": "kimi-k2.7-code-highspeed",
+   "listed": true,
+   "probed": "2026-08-21T09:33:51+00:00",
+   "status": "ok",
+   "supports_image": null,
+   "supports_reasoning": null,
+   "supports_temperature": true,
+   "supports_tools": true
+  },
+  "boyue/kimi-k3": {
+   "context": 1000000,
+   "context_seen_ok": 68175,
+   "context_source": "alias-of:kimi-k3(probed)",
+   "endpoints": [
+    "openai"
+   ],
+   "family": "moonshot",
+   "gateway": "boyue",
+   "id": "kimi-k3",
+   "listed": true,
+   "probed": "2026-08-21T09:33:58+00:00",
+   "status": "ok",
+   "supports_image": null,
+   "supports_reasoning": null,
+   "supports_temperature": false,
+   "supports_tools": true
+  },
+  "boyue/kimi/kimi-k2.5": {
+   "context": null,
+   "endpoints": [
+    "openai"
+   ],
+   "family": "moonshot",
+   "gateway": "boyue",
+   "id": "kimi/kimi-k2.5",
+   "listed": true,
+   "probed": "2026-08-21T12:18:10+00:00",
+   "status": "ok",
+   "supports_image": null,
+   "supports_reasoning": null,
+   "supports_temperature": true,
+   "supports_tools": true
+  },
+  "boyue/kimi/kimi-k2.6": {
+   "context": 262144,
+   "context_source": "alias-of:kimi-k2.6(自报)",
+   "endpoints": [
+    "openai"
+   ],
+   "family": "moonshot",
+   "gateway": "boyue",
+   "id": "kimi/kimi-k2.6",
+   "listed": true,
+   "probed": "2026-08-21T12:18:12+00:00",
+   "status": "ok",
+   "supports_image": null,
+   "supports_reasoning": null,
+   "supports_temperature": true,
+   "supports_tools": true
+  },
+  "boyue/moonshot-v1-128k": {
+   "context": null,
+   "endpoints": [
+    "openai"
+   ],
+   "family": "moonshot",
+   "gateway": "boyue",
+   "id": "moonshot-v1-128k",
+   "listed": true,
+   "probed": "2026-08-21T11:57:24+00:00",
+   "status": "ok",
+   "supports_image": null,
+   "supports_reasoning": null,
+   "supports_temperature": true,
+   "supports_tools": true
+  },
+  "boyue/moonshot-v1-32k": {
+   "context": null,
+   "endpoints": [
+    "openai"
+   ],
+   "family": "moonshot",
+   "gateway": "boyue",
+   "id": "moonshot-v1-32k",
+   "listed": true,
+   "probed": "2026-08-21T12:18:13+00:00",
+   "status": "ok",
+   "supports_image": null,
+   "supports_reasoning": null,
+   "supports_temperature": true,
+   "supports_tools": true
+  },
+  "boyue/moonshot-v1-8k": {
+   "context": null,
+   "endpoints": [
+    "openai"
+   ],
+   "family": "moonshot",
+   "gateway": "boyue",
+   "id": "moonshot-v1-8k",
+   "listed": true,
+   "probed": "2026-08-21T12:18:24+00:00",
+   "status": "ok",
+   "supports_image": null,
+   "supports_reasoning": null,
+   "supports_temperature": true,
+   "supports_tools": true
+  },
+  "boyue/moonshotai/Kimi-K2-Instruct-0905": {
+   "context": null,
+   "endpoints": [
+    "openai"
+   ],
+   "family": "moonshot",
+   "gateway": "boyue",
+   "id": "moonshotai/Kimi-K2-Instruct-0905",
+   "listed": true,
+   "probed": "2026-08-21T12:33:20+00:00",
+   "status": "error",
+   "supports_image": null,
+   "supports_reasoning": null,
+   "supports_temperature": null,
+   "supports_tools": false
+  },
+  "boyue/moonshotai/Kimi-K2-Thinking": {
+   "context": null,
+   "endpoints": [
+    "openai"
+   ],
+   "family": "moonshot",
+   "gateway": "boyue",
+   "id": "moonshotai/Kimi-K2-Thinking",
+   "listed": true,
+   "probed": "2026-08-21T12:33:26+00:00",
+   "status": "error",
+   "supports_image": null,
+   "supports_reasoning": null,
+   "supports_temperature": null,
+   "supports_tools": false
+  },
+  "boyue/opengvlab/internvl3-14b": {
+   "context": null,
+   "endpoints": [
+    "openai"
+   ],
+   "family": "intern",
+   "gateway": "boyue",
+   "id": "opengvlab/internvl3-14b",
+   "listed": true,
+   "probed": "2026-08-21T12:33:31+00:00",
+   "status": "error",
+   "supports_image": null,
+   "supports_reasoning": null,
+   "supports_temperature": null,
+   "supports_tools": false
+  },
+  "boyue/opengvlab/internvl3-2b": {
+   "context": null,
+   "endpoints": [
+    "openai"
+   ],
+   "family": "intern",
+   "gateway": "boyue",
+   "id": "opengvlab/internvl3-2b",
+   "listed": true,
+   "probed": "2026-08-21T12:33:35+00:00",
+   "status": "error",
+   "supports_image": null,
+   "supports_reasoning": null,
+   "supports_temperature": null,
+   "supports_tools": false
+  },
+  "boyue/or/qwen3.5-9b": {
+   "context": 262144,
+   "context_source": "alias-of:Qwen/Qwen3.5-9B(hf-config:native)",
+   "endpoints": [
+    "openai"
+   ],
+   "family": "阿里",
+   "gateway": "boyue",
+   "id": "or/qwen3.5-9b",
+   "listed": true,
+   "probed": "2026-08-21T12:18:47+00:00",
+   "status": "ok",
+   "supports_image": null,
+   "supports_reasoning": null,
+   "supports_temperature": true,
+   "supports_tools": true
+  },
+  "boyue/qwen-image-2.0": {
+   "context": null,
+   "endpoints": [
+    "openai"
+   ],
+   "family": "阿里",
+   "gateway": "boyue",
+   "id": "qwen-image-2.0",
+   "listed": true,
+   "probed": "2026-08-21T12:18:49+00:00",
+   "status": "ok",
+   "supports_image": null,
+   "supports_reasoning": null,
+   "supports_temperature": true,
+   "supports_tools": false
+  },
+  "boyue/qwen-image-2.0-pro": {
+   "context": null,
+   "endpoints": [
+    "openai"
+   ],
+   "family": "阿里",
+   "gateway": "boyue",
+   "id": "qwen-image-2.0-pro",
+   "listed": true,
+   "probed": "2026-08-21T12:18:49+00:00",
+   "status": "ok",
+   "supports_image": null,
+   "supports_reasoning": null,
+   "supports_temperature": true,
+   "supports_tools": false
+  },
+  "boyue/qwen-image-edit-plus-2025-12-15": {
+   "context": null,
+   "endpoints": [
+    "openai"
+   ],
+   "family": "阿里",
+   "gateway": "boyue",
+   "id": "qwen-image-edit-plus-2025-12-15",
+   "listed": true,
+   "probed": "2026-08-21T12:18:50+00:00",
+   "status": "ok",
+   "supports_image": null,
+   "supports_reasoning": null,
+   "supports_temperature": true,
+   "supports_tools": false
+  },
+  "boyue/qwen-image-plus": {
+   "context": null,
+   "endpoints": [
+    "openai"
+   ],
+   "family": "阿里",
+   "gateway": "boyue",
+   "id": "qwen-image-plus",
+   "listed": true,
+   "probed": "2026-08-21T12:18:51+00:00",
+   "status": "ok",
+   "supports_image": null,
+   "supports_reasoning": null,
+   "supports_temperature": true,
+   "supports_tools": false
+  },
+  "boyue/qwen-long": {
+   "context": null,
+   "endpoints": [
+    "openai"
+   ],
+   "family": "阿里",
+   "gateway": "boyue",
+   "id": "qwen-long",
+   "listed": true,
+   "probed": "2026-08-21T12:18:52+00:00",
+   "status": "ok",
+   "supports_image": null,
+   "supports_reasoning": null,
+   "supports_temperature": true,
+   "supports_tools": true
+  },
+  "boyue/qwen-long-2025-01-25": {
+   "context": null,
+   "endpoints": [
+    "openai"
+   ],
+   "family": "阿里",
+   "gateway": "boyue",
+   "id": "qwen-long-2025-01-25",
+   "listed": true,
+   "probed": "2026-08-21T12:18:53+00:00",
+   "status": "ok",
+   "supports_image": null,
+   "supports_reasoning": null,
+   "supports_temperature": true,
+   "supports_tools": true
+  },
+  "boyue/qwen-long-latest": {
+   "context": null,
+   "endpoints": [
+    "openai"
+   ],
+   "family": "阿里",
+   "gateway": "boyue",
+   "id": "qwen-long-latest",
+   "listed": true,
+   "probed": "2026-08-21T12:18:55+00:00",
+   "status": "ok",
+   "supports_image": null,
+   "supports_reasoning": null,
+   "supports_temperature": true,
+   "supports_tools": true
+  },
+  "boyue/qwen-max": {
+   "context": null,
+   "endpoints": [
+    "openai"
+   ],
+   "family": "阿里",
+   "gateway": "boyue",
+   "id": "qwen-max",
+   "listed": true,
+   "probed": "2026-08-21T12:18:56+00:00",
+   "status": "ok",
+   "supports_image": null,
+   "supports_reasoning": null,
+   "supports_temperature": true,
+   "supports_tools": true
+  },
+  "boyue/qwen-plus": {
+   "context": null,
+   "endpoints": [
+    "openai"
+   ],
+   "family": "阿里",
+   "gateway": "boyue",
+   "id": "qwen-plus",
+   "listed": true,
+   "probed": "2026-08-21T12:18:58+00:00",
+   "status": "ok",
+   "supports_image": null,
+   "supports_reasoning": null,
+   "supports_temperature": true,
+   "supports_tools": true
+  },
+  "boyue/qwen-plus-0112": {
+   "context": null,
+   "endpoints": [
+    "openai"
+   ],
+   "family": "阿里",
+   "gateway": "boyue",
+   "id": "qwen-plus-0112",
+   "listed": true,
+   "probed": "2026-08-21T12:18:59+00:00",
+   "status": "ok",
+   "supports_image": null,
+   "supports_reasoning": null,
+   "supports_temperature": true,
+   "supports_tools": true
+  },
+  "boyue/qwen-plus-1220": {
+   "context": null,
+   "endpoints": [
+    "openai"
+   ],
+   "family": "阿里",
+   "gateway": "boyue",
+   "id": "qwen-plus-1220",
+   "listed": true,
+   "probed": "2026-08-21T12:19:01+00:00",
+   "status": "ok",
+   "supports_image": null,
+   "supports_reasoning": null,
+   "supports_temperature": true,
+   "supports_tools": true
+  },
+  "boyue/qwen-plus-2025-01-25": {
+   "context": null,
+   "endpoints": [
+    "openai"
+   ],
+   "family": "阿里",
+   "gateway": "boyue",
+   "id": "qwen-plus-2025-01-25",
+   "listed": true,
+   "probed": "2026-08-21T12:19:02+00:00",
+   "status": "ok",
+   "supports_image": null,
+   "supports_reasoning": null,
+   "supports_temperature": true,
+   "supports_tools": true
+  },
+  "boyue/qwen-plus-2025-12-01": {
+   "context": null,
+   "endpoints": [
+    "openai"
+   ],
+   "family": "阿里",
+   "gateway": "boyue",
+   "id": "qwen-plus-2025-12-01",
+   "listed": true,
+   "probed": "2026-08-21T12:19:03+00:00",
+   "status": "ok",
+   "supports_image": null,
+   "supports_reasoning": null,
+   "supports_temperature": true,
+   "supports_tools": true
+  },
+  "boyue/qwen-plus-latest": {
+   "context": null,
+   "endpoints": [
+    "openai"
+   ],
+   "family": "阿里",
+   "gateway": "boyue",
+   "id": "qwen-plus-latest",
+   "listed": true,
+   "probed": "2026-08-21T12:19:05+00:00",
+   "status": "ok",
+   "supports_image": null,
+   "supports_reasoning": null,
+   "supports_temperature": true,
+   "supports_tools": true
+  },
+  "boyue/qwen-turbo": {
+   "context": null,
+   "endpoints": [
+    "openai"
+   ],
+   "family": "阿里",
+   "gateway": "boyue",
+   "id": "qwen-turbo",
+   "listed": true,
+   "probed": "2026-08-21T12:19:06+00:00",
+   "status": "ok",
+   "supports_image": null,
+   "supports_reasoning": null,
+   "supports_temperature": true,
+   "supports_tools": true
+  },
+  "boyue/qwen-vl-max": {
+   "context": null,
+   "endpoints": [
+    "openai"
+   ],
+   "family": "阿里",
+   "gateway": "boyue",
+   "id": "qwen-vl-max",
+   "listed": true,
+   "probed": "2026-08-21T12:19:08+00:00",
+   "status": "ok",
+   "supports_image": null,
+   "supports_reasoning": null,
+   "supports_temperature": true,
+   "supports_tools": false
+  },
+  "boyue/qwen-vl-ocr-2025-11-20": {
+   "context": null,
+   "endpoints": [
+    "openai"
+   ],
+   "family": "阿里",
+   "gateway": "boyue",
+   "id": "qwen-vl-ocr-2025-11-20",
+   "listed": true,
+   "probed": "2026-08-21T12:19:10+00:00",
+   "status": "ok",
+   "supports_image": null,
+   "supports_reasoning": null,
+   "supports_temperature": true,
+   "supports_tools": true
+  },
+  "boyue/qwen2.5-72b-instruct": {
+   "context": null,
+   "endpoints": [
+    "openai"
+   ],
+   "family": "阿里",
+   "gateway": "boyue",
+   "id": "qwen2.5-72b-instruct",
+   "listed": true,
+   "probed": "2026-08-21T12:33:39+00:00",
+   "status": "error",
+   "supports_image": null,
+   "supports_reasoning": null,
+   "supports_temperature": null,
+   "supports_tools": false
+  },
+  "boyue/qwen2.5-omni-7b": {
+   "context": null,
+   "endpoints": [
+    "openai"
+   ],
+   "family": "阿里",
+   "gateway": "boyue",
+   "id": "qwen2.5-omni-7b",
+   "listed": true,
+   "probed": "2026-08-21T12:20:04+00:00",
+   "status": "ok",
+   "supports_image": null,
+   "supports_reasoning": null,
+   "supports_temperature": true,
+   "supports_tools": true
+  },
+  "boyue/qwen2.5-vl-72b-instruct": {
+   "context": null,
+   "endpoints": [
+    "openai"
+   ],
+   "family": "阿里",
+   "gateway": "boyue",
+   "id": "qwen2.5-vl-72b-instruct",
+   "listed": true,
+   "probed": "2026-08-21T12:35:04+00:00",
+   "status": "error",
+   "supports_image": null,
+   "supports_reasoning": null,
+   "supports_temperature": null,
+   "supports_tools": false
+  },
+  "boyue/qwen3-30b-a3b-instruct-2507": {
+   "context": 262144,
+   "context_source": "alias-of:Qwen/Qwen3-30B-A3B-Instruct-2507(hf-config:native)",
+   "endpoints": [
+    "openai"
+   ],
+   "family": "阿里",
+   "gateway": "boyue",
+   "id": "qwen3-30b-a3b-instruct-2507",
+   "listed": true,
+   "probed": "2026-08-21T12:21:09+00:00",
+   "status": "ok",
+   "supports_image": null,
+   "supports_reasoning": null,
+   "supports_temperature": true,
+   "supports_tools": true
+  },
+  "boyue/qwen3-30b-a3b-thinking-2507": {
+   "context": null,
+   "endpoints": [
+    "openai"
+   ],
+   "family": "阿里",
+   "gateway": "boyue",
+   "id": "qwen3-30b-a3b-thinking-2507",
+   "listed": true,
+   "probed": "2026-08-21T12:21:10+00:00",
+   "status": "ok",
+   "supports_image": null,
+   "supports_reasoning": null,
+   "supports_temperature": true,
+   "supports_tools": true
+  },
+  "boyue/qwen3-32b": {
+   "context": null,
+   "endpoints": [
+    "openai"
+   ],
+   "family": "阿里",
+   "gateway": "boyue",
+   "id": "qwen3-32b",
+   "listed": true,
+   "probed": "2026-08-21T12:21:12+00:00",
+   "status": "ok",
+   "supports_image": null,
+   "supports_reasoning": null,
+   "supports_temperature": true,
+   "supports_tools": true
+  },
+  "boyue/qwen3-8b": {
+   "context": 40960,
+   "context_source": "alias-of:Qwen/Qwen3-8B(hf-config:native)",
+   "endpoints": [
+    "openai"
+   ],
+   "family": "阿里",
+   "gateway": "boyue",
+   "id": "qwen3-8b",
+   "listed": true,
+   "probed": "2026-08-21T12:21:15+00:00",
+   "status": "ok",
+   "supports_image": null,
+   "supports_reasoning": null,
+   "supports_temperature": true,
+   "supports_tools": true
+  },
+  "boyue/qwen3-coder-30b-a3b-instruct": {
+   "context": 256000,
+   "context_source": "alias-of:Qwen/Qwen3-Coder-30B-A3B-Instruct(probed)",
+   "endpoints": [
+    "openai"
+   ],
+   "family": "阿里",
+   "gateway": "boyue",
+   "id": "qwen3-coder-30b-a3b-instruct",
+   "listed": true,
+   "probed": "2026-08-21T12:22:20+00:00",
+   "status": "ok",
+   "supports_image": null,
+   "supports_reasoning": null,
+   "supports_temperature": true,
+   "supports_tools": true
+  },
+  "boyue/qwen3-coder-480b-a35b-instruct": {
+   "context": null,
+   "endpoints": [
+    "openai"
+   ],
+   "family": "阿里",
+   "gateway": "boyue",
+   "id": "qwen3-coder-480b-a35b-instruct",
+   "listed": true,
+   "probed": "2026-08-21T11:58:13+00:00",
+   "status": "ok",
+   "supports_image": null,
+   "supports_reasoning": null,
+   "supports_temperature": true,
+   "supports_tools": true
+  },
+  "boyue/qwen3-coder-plus": {
+   "context": 1000000,
+   "context_source": "probed",
+   "context_upper_bound": null,
+   "endpoints": [
+    "openai"
+   ],
+   "family": "阿里",
+   "gateway": "boyue",
+   "id": "qwen3-coder-plus",
+   "listed": true,
+   "probed": "2026-08-21T09:35:45+00:00",
+   "status": "ok",
+   "supports_image": null,
+   "supports_reasoning": null,
+   "supports_temperature": true,
+   "supports_tools": true
+  },
+  "boyue/qwen3-coder-plus-2025-07-22": {
+   "context": 1000000,
+   "context_source": "alias-of:qwen3-coder-plus(probed)",
+   "endpoints": [
+    "openai"
+   ],
+   "family": "阿里",
+   "gateway": "boyue",
+   "id": "qwen3-coder-plus-2025-07-22",
+   "listed": true,
+   "probed": "2026-08-21T12:22:20+00:00",
+   "status": "ok",
+   "supports_image": null,
+   "supports_reasoning": null,
+   "supports_temperature": true,
+   "supports_tools": true
+  },
+  "boyue/qwen3-coder-plus-2025-09-23": {
+   "context": 1000000,
+   "context_source": "alias-of:qwen3-coder-plus(probed)",
+   "endpoints": [
+    "openai"
+   ],
+   "family": "阿里",
+   "gateway": "boyue",
+   "id": "qwen3-coder-plus-2025-09-23",
+   "listed": true,
+   "probed": "2026-08-21T12:22:21+00:00",
+   "status": "ok",
+   "supports_image": null,
+   "supports_reasoning": null,
+   "supports_temperature": true,
+   "supports_tools": true
+  },
+  "boyue/qwen3-max": {
+   "context": null,
+   "endpoints": [
+    "openai"
+   ],
+   "family": "阿里",
+   "gateway": "boyue",
+   "id": "qwen3-max",
+   "listed": true,
+   "probed": "2026-08-21T11:58:19+00:00",
+   "status": "ok",
+   "supports_image": null,
+   "supports_reasoning": null,
+   "supports_temperature": true,
+   "supports_tools": true
+  },
+  "boyue/qwen3-max-2025-09-23": {
+   "context": null,
+   "endpoints": [
+    "openai"
+   ],
+   "family": "阿里",
+   "gateway": "boyue",
+   "id": "qwen3-max-2025-09-23",
+   "listed": true,
+   "probed": "2026-08-21T12:22:22+00:00",
+   "status": "ok",
+   "supports_image": null,
+   "supports_reasoning": null,
+   "supports_temperature": true,
+   "supports_tools": true
+  },
+  "boyue/qwen3-max-2026-01-23": {
+   "context": null,
+   "endpoints": [
+    "openai"
+   ],
+   "family": "阿里",
+   "gateway": "boyue",
+   "id": "qwen3-max-2026-01-23",
+   "listed": true,
+   "probed": "2026-08-21T12:22:23+00:00",
+   "status": "ok",
+   "supports_image": null,
+   "supports_reasoning": null,
+   "supports_temperature": true,
+   "supports_tools": true
+  },
+  "boyue/qwen3-max-preview": {
+   "context": null,
+   "endpoints": [
+    "openai"
+   ],
+   "family": "阿里",
+   "gateway": "boyue",
+   "id": "qwen3-max-preview",
+   "listed": true,
+   "probed": "2026-08-21T12:22:28+00:00",
+   "status": "ok",
+   "supports_image": null,
+   "supports_reasoning": null,
+   "supports_temperature": true,
+   "supports_tools": true
+  },
+  "boyue/qwen3-next-80b-a3b-instruct": {
+   "context": null,
+   "endpoints": [
+    "openai"
+   ],
+   "family": "阿里",
+   "gateway": "boyue",
+   "id": "qwen3-next-80b-a3b-instruct",
+   "listed": true,
+   "probed": "2026-08-21T11:59:11+00:00",
+   "status": "ok",
+   "supports_image": null,
+   "supports_reasoning": null,
+   "supports_temperature": true,
+   "supports_tools": true
+  },
+  "boyue/qwen3-next-80b-a3b-thinking": {
+   "context": null,
+   "endpoints": [
+    "openai"
+   ],
+   "family": "阿里",
+   "gateway": "boyue",
+   "id": "qwen3-next-80b-a3b-thinking",
+   "listed": true,
+   "probed": "2026-08-21T12:22:28+00:00",
+   "status": "ok",
+   "supports_image": null,
+   "supports_reasoning": null,
+   "supports_temperature": true,
+   "supports_tools": true
+  },
+  "boyue/qwen3-vl-235b-a22b-instruct": {
+   "context": null,
+   "endpoints": [
+    "openai"
+   ],
+   "family": "阿里",
+   "gateway": "boyue",
+   "id": "qwen3-vl-235b-a22b-instruct",
+   "listed": true,
+   "probed": "2026-08-21T12:22:30+00:00",
+   "status": "ok",
+   "supports_image": null,
+   "supports_reasoning": null,
+   "supports_temperature": true,
+   "supports_tools": true
+  },
+  "boyue/qwen3-vl-235b-a22b-thinking": {
+   "context": null,
+   "endpoints": [
+    "openai"
+   ],
+   "family": "阿里",
+   "gateway": "boyue",
+   "id": "qwen3-vl-235b-a22b-thinking",
+   "listed": true,
+   "probed": "2026-08-21T12:22:32+00:00",
+   "status": "ok",
+   "supports_image": null,
+   "supports_reasoning": null,
+   "supports_temperature": true,
+   "supports_tools": true
+  },
+  "boyue/qwen3-vl-30b-a3b-instruct": {
+   "context": 262144,
+   "context_source": "alias-of:Qwen/Qwen3-VL-30B-A3B-Instruct(hf-config:native)",
+   "endpoints": [
+    "openai"
+   ],
+   "family": "阿里",
+   "gateway": "boyue",
+   "id": "qwen3-vl-30b-a3b-instruct",
+   "listed": true,
+   "probed": "2026-08-21T12:22:35+00:00",
+   "status": "ok",
+   "supports_image": null,
+   "supports_reasoning": null,
+   "supports_temperature": true,
+   "supports_tools": true
+  },
+  "boyue/qwen3-vl-30b-a3b-thinking": {
+   "context": 262144,
+   "context_source": "alias-of:Qwen/Qwen3-VL-30B-A3B-Thinking(hf-config:native)",
+   "endpoints": [
+    "openai"
+   ],
+   "family": "阿里",
+   "gateway": "boyue",
+   "id": "qwen3-vl-30b-a3b-thinking",
+   "listed": true,
+   "probed": "2026-08-21T12:22:36+00:00",
+   "status": "ok",
+   "supports_image": null,
+   "supports_reasoning": null,
+   "supports_temperature": true,
+   "supports_tools": true
+  },
+  "boyue/qwen3-vl-32b-instruct": {
+   "context": 262144,
+   "context_source": "alias-of:Qwen/Qwen3-VL-32B-Instruct(hf-config:native)",
+   "endpoints": [
+    "openai"
+   ],
+   "family": "阿里",
+   "gateway": "boyue",
+   "id": "qwen3-vl-32b-instruct",
+   "listed": true,
+   "probed": "2026-08-21T12:22:38+00:00",
+   "status": "ok",
+   "supports_image": null,
+   "supports_reasoning": null,
+   "supports_temperature": true,
+   "supports_tools": true
+  },
+  "boyue/qwen3-vl-32b-thinking": {
+   "context": 262144,
+   "context_source": "alias-of:Qwen/Qwen3-VL-32B-Thinking(hf-config:native)",
+   "endpoints": [
+    "openai"
+   ],
+   "family": "阿里",
+   "gateway": "boyue",
+   "id": "qwen3-vl-32b-thinking",
+   "listed": true,
+   "probed": "2026-08-21T12:22:39+00:00",
+   "status": "ok",
+   "supports_image": null,
+   "supports_reasoning": null,
+   "supports_temperature": true,
+   "supports_tools": true
+  },
+  "boyue/qwen3-vl-8b-instruct": {
+   "context": 262144,
+   "context_source": "alias-of:Qwen/Qwen3-VL-8B-Instruct(hf-config:native)",
+   "endpoints": [
+    "openai"
+   ],
+   "family": "阿里",
+   "gateway": "boyue",
+   "id": "qwen3-vl-8b-instruct",
+   "listed": true,
+   "probed": "2026-08-21T12:22:45+00:00",
+   "status": "ok",
+   "supports_image": null,
+   "supports_reasoning": null,
+   "supports_temperature": true,
+   "supports_tools": true
+  },
+  "boyue/qwen3-vl-8b-thinking": {
+   "context": 262144,
+   "context_source": "alias-of:Qwen/Qwen3-VL-8B-Thinking(hf-config:native)",
+   "endpoints": [
+    "openai"
+   ],
+   "family": "阿里",
+   "gateway": "boyue",
+   "id": "qwen3-vl-8b-thinking",
+   "listed": true,
+   "probed": "2026-08-21T12:22:46+00:00",
+   "status": "ok",
+   "supports_image": null,
+   "supports_reasoning": null,
+   "supports_temperature": true,
+   "supports_tools": true
+  },
+  "boyue/qwen3-vl-plus": {
+   "context": null,
+   "endpoints": [
+    "openai"
+   ],
+   "family": "阿里",
+   "gateway": "boyue",
+   "id": "qwen3-vl-plus",
+   "listed": true,
+   "probed": "2026-08-21T12:22:49+00:00",
+   "status": "ok",
+   "supports_image": null,
+   "supports_reasoning": null,
+   "supports_temperature": true,
+   "supports_tools": true
+  },
+  "boyue/qwen3.5-122b-a10b": {
+   "context": null,
+   "endpoints": [
+    "openai"
+   ],
+   "family": "阿里",
+   "gateway": "boyue",
+   "id": "qwen3.5-122b-a10b",
+   "listed": true,
+   "probed": "2026-08-21T12:22:50+00:00",
+   "status": "ok",
+   "supports_image": null,
+   "supports_reasoning": null,
+   "supports_temperature": true,
+   "supports_tools": true
+  },
+  "boyue/qwen3.5-27b": {
+   "context": null,
+   "endpoints": [
+    "openai"
+   ],
+   "family": "阿里",
+   "gateway": "boyue",
+   "id": "qwen3.5-27b",
+   "listed": true,
+   "probed": "2026-08-21T12:22:51+00:00",
+   "status": "ok",
+   "supports_image": null,
+   "supports_reasoning": null,
+   "supports_temperature": true,
+   "supports_tools": true
+  },
+  "boyue/qwen3.5-35b-a3b": {
+   "context": 262144,
+   "context_source": "alias-of:Qwen/Qwen3.5-35B-A3B(hf-config:native)",
+   "endpoints": [
+    "openai"
+   ],
+   "family": "阿里",
+   "gateway": "boyue",
+   "id": "qwen3.5-35b-a3b",
+   "listed": true,
+   "probed": "2026-08-21T12:22:52+00:00",
+   "status": "ok",
+   "supports_image": null,
+   "supports_reasoning": null,
+   "supports_temperature": true,
+   "supports_tools": true
+  },
+  "boyue/qwen3.5-397b-a17b": {
+   "context": 262144,
+   "context_source": "alias-of:Qwen/Qwen3.5-397B-A17B(hf-config:native)",
+   "endpoints": [
+    "openai"
+   ],
+   "family": "阿里",
+   "gateway": "boyue",
+   "id": "qwen3.5-397b-a17b",
+   "listed": true,
+   "probed": "2026-08-21T12:22:53+00:00",
+   "status": "ok",
+   "supports_image": null,
+   "supports_reasoning": null,
+   "supports_temperature": true,
+   "supports_tools": true
+  },
+  "boyue/qwen3.5-flash": {
+   "context": null,
+   "endpoints": [
+    "openai"
+   ],
+   "family": "阿里",
+   "gateway": "boyue",
+   "id": "qwen3.5-flash",
+   "listed": true,
+   "probed": "2026-08-21T12:22:54+00:00",
+   "status": "ok",
+   "supports_image": null,
+   "supports_reasoning": null,
+   "supports_temperature": true,
+   "supports_tools": true
+  },
+  "boyue/qwen3.5-flash-2026-02-23": {
+   "context": null,
+   "endpoints": [
+    "openai"
+   ],
+   "family": "阿里",
+   "gateway": "boyue",
+   "id": "qwen3.5-flash-2026-02-23",
+   "listed": true,
+   "probed": "2026-08-21T12:22:55+00:00",
+   "status": "ok",
+   "supports_image": null,
+   "supports_reasoning": null,
+   "supports_temperature": true,
+   "supports_tools": true
+  },
+  "boyue/qwen3.5-omni-flash": {
+   "context": null,
+   "endpoints": [
+    "openai"
+   ],
+   "family": "阿里",
+   "gateway": "boyue",
+   "id": "qwen3.5-omni-flash",
+   "listed": true,
+   "probed": "2026-08-21T12:22:56+00:00",
+   "status": "ok",
+   "supports_image": null,
+   "supports_reasoning": null,
+   "supports_temperature": true,
+   "supports_tools": true
+  },
+  "boyue/qwen3.5-omni-plus": {
+   "context": null,
+   "endpoints": [
+    "openai"
+   ],
+   "family": "阿里",
+   "gateway": "boyue",
+   "id": "qwen3.5-omni-plus",
+   "listed": true,
+   "probed": "2026-08-21T12:22:57+00:00",
+   "status": "ok",
+   "supports_image": null,
+   "supports_reasoning": null,
+   "supports_temperature": true,
+   "supports_tools": true
+  },
+  "boyue/qwen3.5-plus": {
+   "context": null,
+   "endpoints": [
+    "openai"
+   ],
+   "family": "阿里",
+   "gateway": "boyue",
+   "id": "qwen3.5-plus",
+   "listed": true,
+   "probed": "2026-08-21T11:58:17+00:00",
+   "status": "ok",
+   "supports_image": null,
+   "supports_reasoning": null,
+   "supports_temperature": true,
+   "supports_tools": true
+  },
+  "boyue/qwen3.6-27b": {
+   "context": null,
+   "endpoints": [
+    "openai"
+   ],
+   "family": "阿里",
+   "gateway": "boyue",
+   "id": "qwen3.6-27b",
+   "listed": true,
+   "probed": "2026-08-21T12:22:58+00:00",
+   "status": "ok",
+   "supports_image": null,
+   "supports_reasoning": null,
+   "supports_temperature": true,
+   "supports_tools": true
+  },
+  "boyue/qwen3.6-35b-a3b": {
+   "context": null,
+   "endpoints": [
+    "openai"
+   ],
+   "family": "阿里",
+   "gateway": "boyue",
+   "id": "qwen3.6-35b-a3b",
+   "listed": true,
+   "probed": "2026-08-21T12:23:10+00:00",
+   "status": "ok",
+   "supports_image": null,
+   "supports_reasoning": null,
+   "supports_temperature": true,
+   "supports_tools": true
+  },
+  "boyue/qwen3.6-flash": {
+   "context": null,
+   "endpoints": [
+    "openai"
+   ],
+   "family": "阿里",
+   "gateway": "boyue",
+   "id": "qwen3.6-flash",
+   "listed": true,
+   "probed": "2026-08-21T11:58:16+00:00",
+   "status": "ok",
+   "supports_image": null,
+   "supports_reasoning": null,
+   "supports_temperature": true,
+   "supports_tools": true
+  },
+  "boyue/qwen3.6-max-preview": {
+   "context": null,
+   "endpoints": [
+    "openai"
+   ],
+   "family": "阿里",
+   "gateway": "boyue",
+   "id": "qwen3.6-max-preview",
+   "listed": true,
+   "probed": "2026-08-21T12:23:11+00:00",
+   "status": "ok",
+   "supports_image": null,
+   "supports_reasoning": null,
+   "supports_temperature": true,
+   "supports_tools": true
+  },
+  "boyue/qwen3.6-plus": {
+   "context": null,
+   "endpoints": [
+    "openai"
+   ],
+   "family": "阿里",
+   "gateway": "boyue",
+   "id": "qwen3.6-plus",
+   "listed": true,
+   "probed": "2026-08-21T12:23:14+00:00",
+   "status": "ok",
+   "supports_image": null,
+   "supports_reasoning": null,
+   "supports_temperature": true,
+   "supports_tools": true
+  },
+  "boyue/qwen3.6-plus-2026-04-02": {
+   "context": null,
+   "endpoints": [
+    "openai"
+   ],
+   "family": "阿里",
+   "gateway": "boyue",
+   "id": "qwen3.6-plus-2026-04-02",
+   "listed": true,
+   "probed": "2026-08-21T12:23:51+00:00",
+   "status": "ok",
+   "supports_image": null,
+   "supports_reasoning": null,
+   "supports_temperature": true,
+   "supports_tools": true
+  },
+  "boyue/qwen3.7-max": {
+   "context": null,
+   "endpoints": [
+    "openai"
+   ],
+   "family": "阿里",
+   "gateway": "boyue",
+   "id": "qwen3.7-max",
+   "listed": true,
+   "probed": "2026-08-21T09:35:47+00:00",
+   "status": "ok",
+   "supports_image": null,
+   "supports_reasoning": null,
+   "supports_temperature": true,
+   "supports_tools": true
+  },
+  "boyue/qwen3.7-max-2026-05-20": {
+   "context": null,
+   "endpoints": [
+    "openai"
+   ],
+   "family": "阿里",
+   "gateway": "boyue",
+   "id": "qwen3.7-max-2026-05-20",
+   "listed": true,
+   "probed": "2026-08-21T12:23:55+00:00",
+   "status": "ok",
+   "supports_image": null,
+   "supports_reasoning": null,
+   "supports_temperature": true,
+   "supports_tools": true
+  },
+  "boyue/qwen3.7-plus": {
+   "context": null,
+   "endpoints": [
+    "openai"
+   ],
+   "family": "阿里",
+   "gateway": "boyue",
+   "id": "qwen3.7-plus",
+   "listed": true,
+   "probed": "2026-08-21T11:58:14+00:00",
+   "status": "ok",
+   "supports_image": null,
+   "supports_reasoning": null,
+   "supports_temperature": true,
+   "supports_tools": true
+  },
+  "boyue/qwen3.8-max": {
+   "context": null,
+   "context_seen_ok": 21591,
+   "endpoints": [
+    "openai"
+   ],
+   "family": "阿里",
+   "gateway": "boyue",
+   "id": "qwen3.8-max",
+   "listed": true,
+   "probed": "2026-08-21T09:35:46+00:00",
+   "status": "ok",
+   "supports_image": null,
+   "supports_reasoning": null,
+   "supports_temperature": true,
+   "supports_tools": true
+  },
+  "boyue/vanchin/deepseek-v4-pro": {
+   "context": 1048576,
+   "context_source": "alias-of:deepseek-v4-pro(自报)",
+   "endpoints": [
+    "openai"
+   ],
+   "family": "deepseek",
+   "gateway": "boyue",
+   "id": "vanchin/deepseek-v4-pro",
+   "listed": true,
+   "probed": "2026-08-21T12:23:57+00:00",
+   "status": "ok",
+   "supports_image": null,
+   "supports_reasoning": null,
+   "supports_temperature": true,
+   "supports_tools": true
+  },
+  "boyue/z-ai/glm-4.5": {
+   "context": 131072,
+   "context_source": "doc:zhipu",
+   "endpoints": [
+    "openai"
+   ],
+   "family": "智谱",
+   "gateway": "boyue",
+   "id": "z-ai/glm-4.5",
+   "listed": true,
+   "probed": "2026-08-21T12:25:01+00:00",
+   "status": "ok",
+   "supports_image": null,
+   "supports_reasoning": null,
+   "supports_temperature": true,
+   "supports_tools": true
+  },
+  "boyue/z-ai/glm-4.5v": {
+   "context": 65536,
+   "context_source": "alias-of:zai-org/GLM-4.5V(hf-config:native)",
+   "endpoints": [
+    "openai"
+   ],
+   "family": "智谱",
+   "gateway": "boyue",
+   "id": "z-ai/glm-4.5v",
+   "listed": true,
+   "probed": "2026-08-21T12:25:04+00:00",
+   "status": "ok",
+   "supports_image": null,
+   "supports_reasoning": null,
+   "supports_temperature": true,
+   "supports_tools": true
+  },
+  "boyue/z-ai/glm-4.6": {
+   "context": 204800,
+   "context_source": "doc:zhipu",
+   "endpoints": [
+    "openai"
+   ],
+   "family": "智谱",
+   "gateway": "boyue",
+   "id": "z-ai/glm-4.6",
+   "listed": true,
+   "probed": "2026-08-21T12:25:09+00:00",
+   "status": "ok",
+   "supports_image": null,
+   "supports_reasoning": null,
+   "supports_temperature": true,
+   "supports_tools": true
+  },
+  "boyue/zai-org/GLM-4.5-Air": {
+   "context": 131072,
+   "context_source": "hf-config:native",
+   "endpoints": [
+    "openai"
+   ],
+   "family": "智谱",
+   "gateway": "boyue",
+   "id": "zai-org/GLM-4.5-Air",
+   "listed": true,
+   "probed": "2026-08-21T11:58:10+00:00",
+   "status": "ok",
+   "supports_image": null,
+   "supports_reasoning": null,
+   "supports_temperature": true,
+   "supports_tools": true
+  },
+  "boyue/zai-org/GLM-4.5V": {
+   "context": 65536,
+   "context_source": "hf-config:native",
+   "endpoints": [
+    "openai"
+   ],
+   "family": "智谱",
+   "gateway": "boyue",
+   "id": "zai-org/GLM-4.5V",
+   "listed": true,
+   "probed": "2026-08-21T12:25:11+00:00",
+   "status": "ok",
+   "supports_image": null,
+   "supports_reasoning": null,
+   "supports_temperature": true,
+   "supports_tools": true
+  },
+  "deepinfer/Intern-S2-Preview-397B": {
+   "context": 262144,
+   "endpoints": null,
+   "family": "intern",
+   "gateway": "deepinfer",
+   "id": "Intern-S2-Preview-397B",
+   "listed": true,
+   "probed": "2026-08-21T09:32:45+00:00",
+   "status": "ok",
+   "supports_image": false,
+   "supports_reasoning": false,
+   "supports_temperature": true,
+   "supports_tools": true
+  },
+  "deepinfer/Qwen3.6-35B-A3B-FP8": {
+   "context": 262144,
+   "endpoints": null,
+   "family": "阿里",
+   "gateway": "deepinfer",
+   "id": "Qwen3.6-35B-A3B-FP8",
+   "listed": true,
+   "probed": "2026-08-21T09:32:52+00:00",
+   "status": "ok",
+   "supports_image": true,
+   "supports_reasoning": false,
+   "supports_temperature": true,
+   "supports_tools": true
+  },
+  "deepinfer/deepseek-v4-flash": {
+   "context": 1048576,
+   "context_seen_ok": 11237,
+   "endpoints": null,
+   "family": "deepseek",
+   "gateway": "deepinfer",
+   "id": "deepseek-v4-flash",
+   "listed": true,
+   "probed": "2026-08-21T09:30:56+00:00",
+   "status": "ok",
+   "supports_image": false,
+   "supports_reasoning": true,
+   "supports_temperature": true,
+   "supports_tools": true
+  },
+  "deepinfer/deepseek-v4-flash-0731": {
+   "context": 1048576,
+   "endpoints": null,
+   "family": "deepseek",
+   "gateway": "deepinfer",
+   "id": "deepseek-v4-flash-0731",
+   "listed": true,
+   "probed": "2026-08-21T09:30:57+00:00",
+   "status": "ok",
+   "supports_image": false,
+   "supports_reasoning": true,
+   "supports_temperature": true,
+   "supports_tools": true
+  },
+  "deepinfer/deepseek-v4-pro": {
+   "context": 1048576,
+   "context_seen_ok": 90110,
+   "endpoints": null,
+   "family": "deepseek",
+   "gateway": "deepinfer",
+   "id": "deepseek-v4-pro",
+   "listed": true,
+   "probed": "2026-08-21T09:30:58+00:00",
+   "status": "ok",
+   "supports_image": false,
+   "supports_reasoning": true,
+   "supports_temperature": true,
+   "supports_tools": true
+  },
+  "deepinfer/deepseek-v4-pro-0813": {
+   "context": 1048576,
+   "context_seen_ok": 19758,
+   "endpoints": null,
+   "family": "deepseek",
+   "gateway": "deepinfer",
+   "id": "deepseek-v4-pro-0813",
+   "listed": true,
+   "probed": "2026-08-21T09:31:01+00:00",
+   "status": "ok",
+   "supports_image": false,
+   "supports_reasoning": true,
+   "supports_temperature": true,
+   "supports_tools": true
+  },
+  "deepinfer/glm-5.2": {
+   "context": 256000,
+   "endpoints": null,
+   "family": "智谱",
+   "gateway": "deepinfer",
+   "id": "glm-5.2",
+   "listed": true,
+   "probed": "2026-08-21T09:32:52+00:00",
+   "status": "ok",
+   "supports_image": false,
+   "supports_reasoning": false,
+   "supports_temperature": true,
+   "supports_tools": true
+  },
+  "deepinfer/glm-5.2-1m": {
+   "context": 1048576,
+   "endpoints": null,
+   "family": "智谱",
+   "gateway": "deepinfer",
+   "id": "glm-5.2-1m",
+   "listed": true,
+   "probed": "2026-08-21T12:38:07+00:00",
+   "status": "ok",
+   "supports_image": false,
+   "supports_reasoning": false,
+   "supports_temperature": true,
+   "supports_tools": true
+  },
+  "deepinfer/glm-5.3": {
+   "context": 1048576,
+   "endpoints": null,
+   "family": "智谱",
+   "gateway": "deepinfer",
+   "id": "glm-5.3",
+   "listed": true,
+   "probed": "2026-09-01T08:00:27+00:00",
+   "status": "ok",
+   "supports_image": false,
+   "supports_reasoning": true,
+   "supports_temperature": true,
+   "supports_tools": true
+  },
+  "deepinfer/intern-s1": {
+   "context": 256000,
+   "endpoints": null,
+   "family": "intern",
+   "gateway": "deepinfer",
+   "id": "intern-s1",
+   "listed": true,
+   "probed": "2026-08-21T09:33:09+00:00",
+   "status": "ok",
+   "supports_image": true,
+   "supports_reasoning": false,
+   "supports_temperature": true,
+   "supports_tools": false
+  },
+  "deepinfer/kimi-k2.6": {
+   "context": 262144,
+   "endpoints": null,
+   "family": "moonshot",
+   "gateway": "deepinfer",
+   "id": "kimi-k2.6",
+   "listed": true,
+   "probed": "2026-08-21T11:56:48+00:00",
+   "status": "ok",
+   "supports_image": true,
+   "supports_reasoning": true,
+   "supports_temperature": true,
+   "supports_tools": true
+  },
+  "deepinfer/kimi-k3": {
+   "context": 1000000,
+   "context_seen_ok": 120886,
+   "context_source": "probed",
+   "context_upper_bound": null,
+   "endpoints": null,
+   "family": "moonshot",
+   "gateway": "deepinfer",
+   "id": "kimi-k3",
+   "listed": true,
+   "probed": "2026-08-21T09:32:34+00:00",
+   "status": "ok",
+   "supports_image": true,
+   "supports_reasoning": false,
+   "supports_temperature": true,
+   "supports_tools": true
+  },
+  "deepinfer/kimi-k3-256k": {
+   "context": 1000000,
+   "context_seen_ok": 148684,
+   "context_source": "probed",
+   "context_upper_bound": null,
+   "endpoints": null,
+   "family": "moonshot",
+   "gateway": "deepinfer",
+   "id": "kimi-k3-256k",
+   "listed": true,
+   "probed": "2026-08-25T06:41:13+00:00",
+   "status": "ok",
+   "supports_image": true,
+   "supports_reasoning": false,
+   "supports_temperature": true,
+   "supports_tools": true
+  },
+  "deepinfer/m": {
+   "context": 32000,
+   "context_seen_ok": 10,
+   "context_source": "learned-rejected",
+   "gateway": "deepinfer",
+   "id": "m",
+   "supports_temperature": false
+  },
+  "deepinfer/minimax-m2.7": {
+   "context_seen_ok": 5877,
+   "gateway": "deepinfer",
+   "id": "minimax-m2.7",
+   "probed": "2026-08-26T07:58:10+00:00",
+   "status": "ok",
+   "supports_temperature": true,
+   "supports_tools": true
+  },
+  "deepinfer/qwen3.8-27b-fp8": {
+   "context": 262144,
+   "endpoints": null,
+   "family": "阿里",
+   "gateway": "deepinfer",
+   "id": "qwen3.8-27b-fp8",
+   "listed": true,
+   "probed": "2026-08-21T09:32:52+00:00",
+   "status": "ok",
+   "supports_image": true,
+   "supports_reasoning": true,
+   "supports_temperature": true,
+   "supports_tools": true
+  }
+ },
+ "seed": true,
+ "source": "maintainer probe + vendor docs",
+ "version": 1
+}

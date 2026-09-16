@@ -1,0 +1,30 @@
+{
+  "schema_version": 1,
+  "component": "graft-hosted",
+  "required": false,
+  "node": {
+    "path": "../tools/node-v24.19.0/bin/node",
+    "version": "v24.19.0",
+    "sha256": "bc17c508ffeed0ec622934f9b7fa72f8e78da65350e63c3eceb56fa688aa5e12"
+  },
+  "graft": {
+    "path": "../Graft",
+    "revision": "fd57aea5fda60efb883fce8c2111bf08c9caa01b",
+    "upstream_revision": "ec3fc4151b391e229b859b7244572fbf4f7fdf7f",
+    "package_lock_sha256": "06155d001b63a7959872a258095c29482160e345e72a82dd9f59b44e55a67921",
+    "cli": "dist/cli.js",
+    "cli_sha256": "abd26b95525d835d4791f19f94b4d4bbc456d0af1e26b342336642d913c2ae57",
+    "dependencies": {
+      "path": "node_modules",
+      "installed_lock": "node_modules/.package-lock.json",
+      "installed_lock_sha256": "73fcb6e86fda7a4880b0feffde1a37d5195aa1f98a33fe8eb75add8eb7c45fd6",
+      "tree_algorithm": "sha256-tree-v2",
+      "tree_sha256": "bafa757acf9618680395eb24714bbe3eb66cec6d127d3dd43b390f5f8e706d9a",
+      "entries": 7338,
+      "bytes": 357017798
+    }
+  },
+  "launcher": {
+    "path": "../.local/bin/graft"
+  }
+}

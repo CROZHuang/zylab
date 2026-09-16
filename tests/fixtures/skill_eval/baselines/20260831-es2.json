@@ -1,0 +1,240 @@
+{
+ "summary": {
+  "cases": 14,
+  "errored": 0,
+  "indeterminate": 0,
+  "positive_ok": 12,
+  "positive_total": 12,
+  "negative_ok": 13,
+  "negative_total": 14
+ },
+ "results": [
+  {
+   "case": "quantify-before-claiming",
+   "error": null,
+   "completed": true,
+   "read": [
+    "quantify-first"
+   ],
+   "positive_ok": true,
+   "positive_valid": true,
+   "hit": [
+    "quantify-first"
+   ],
+   "negative_ok": true,
+   "negative_valid": true,
+   "false_positive": []
+  },
+  {
+   "case": "refactor-split-function",
+   "error": null,
+   "completed": true,
+   "read": [
+    "safe-refactor",
+    "trace-change-impact"
+   ],
+   "positive_ok": true,
+   "positive_valid": true,
+   "hit": [
+    "safe-refactor"
+   ],
+   "negative_ok": true,
+   "negative_valid": true,
+   "false_positive": []
+  },
+  {
+   "case": "install-a-package",
+   "error": null,
+   "completed": true,
+   "read": [
+    "pod-environment"
+   ],
+   "positive_ok": true,
+   "positive_valid": true,
+   "hit": [
+    "pod-environment"
+   ],
+   "negative_ok": true,
+   "negative_valid": true,
+   "false_positive": []
+  },
+  {
+   "case": "after-fixing-a-bug",
+   "error": null,
+   "completed": true,
+   "read": [
+    "test-ratchet"
+   ],
+   "positive_ok": true,
+   "positive_valid": true,
+   "hit": [
+    "test-ratchet"
+   ],
+   "negative_ok": true,
+   "negative_valid": true,
+   "false_positive": []
+  },
+  {
+   "case": "git-safe-commit",
+   "error": null,
+   "completed": true,
+   "read": [
+    "git-workspace-safety"
+   ],
+   "positive_ok": true,
+   "positive_valid": true,
+   "hit": [
+    "git-workspace-safety"
+   ],
+   "negative_ok": true,
+   "negative_valid": true,
+   "false_positive": []
+  },
+  {
+   "case": "negative-plain-knowledge",
+   "error": null,
+   "completed": true,
+   "read": [],
+   "positive_ok": null,
+   "positive_valid": false,
+   "hit": [],
+   "negative_ok": true,
+   "negative_valid": true,
+   "false_positive": []
+  },
+  {
+   "case": "negative-trivial-lookup",
+   "error": null,
+   "completed": true,
+   "read": [],
+   "positive_ok": null,
+   "positive_valid": false,
+   "hit": [],
+   "negative_ok": true,
+   "negative_valid": true,
+   "false_positive": []
+  },
+  {
+   "case": "vendor-docs-context-limit",
+   "error": null,
+   "completed": true,
+   "read": [
+    "vendor-docs"
+   ],
+   "positive_ok": true,
+   "positive_valid": true,
+   "hit": [
+    "vendor-docs"
+   ],
+   "negative_ok": true,
+   "negative_valid": true,
+   "false_positive": []
+  },
+  {
+   "case": "test-the-composer-redraw",
+   "error": null,
+   "completed": true,
+   "read": [
+    "pty-tui-testing"
+   ],
+   "positive_ok": true,
+   "positive_valid": true,
+   "hit": [
+    "pty-tui-testing"
+   ],
+   "negative_ok": true,
+   "negative_valid": true,
+   "false_positive": []
+  },
+  {
+   "case": "submit-a-gpu-job",
+   "error": null,
+   "completed": true,
+   "read": [
+    "compute-job-submit",
+    "experiment-log"
+   ],
+   "positive_ok": true,
+   "positive_valid": true,
+   "hit": [
+    "compute-job-submit"
+   ],
+   "negative_ok": false,
+   "negative_valid": true,
+   "false_positive": [
+    "experiment-log"
+   ]
+  },
+  {
+   "case": "diagnose-after-failed-fix",
+   "error": null,
+   "completed": true,
+   "read": [
+    "diagnosing-bugs"
+   ],
+   "positive_ok": true,
+   "positive_valid": true,
+   "hit": [
+    "diagnosing-bugs"
+   ],
+   "negative_ok": true,
+   "negative_valid": true,
+   "false_positive": []
+  },
+  {
+   "case": "naming-an-overloaded-term",
+   "error": null,
+   "completed": true,
+   "read": [
+    "domain-modeling"
+   ],
+   "positive_ok": true,
+   "positive_valid": true,
+   "hit": [
+    "domain-modeling"
+   ],
+   "negative_ok": true,
+   "negative_valid": true,
+   "false_positive": []
+  },
+  {
+   "case": "impact-of-widening-a-field",
+   "error": null,
+   "completed": true,
+   "read": [
+    "trace-change-impact"
+   ],
+   "positive_ok": true,
+   "positive_valid": true,
+   "hit": [
+    "trace-change-impact"
+   ],
+   "negative_ok": true,
+   "negative_valid": true,
+   "false_positive": []
+  },
+  {
+   "case": "diagnose-intermittent-failure",
+   "error": null,
+   "completed": true,
+   "read": [
+    "diagnosing-bugs"
+   ],
+   "positive_ok": true,
+   "positive_valid": true,
+   "hit": [
+    "diagnosing-bugs"
+   ],
+   "negative_ok": true,
+   "negative_valid": true,
+   "false_positive": []
+  }
+ ],
+ "meta": {
+  "date": "2026-08-31",
+  "gateway": "boyue",
+  "model": "kimi-k3",
+  "catalog": 17,
+  "note": "ES2 之后。13/14 与 ES1-lite 基线一致；唯一变化是 submit-a-gpu-job 从读 3 条降到 2 条，experiment-log 仍未挡住。"
+ }
+}
