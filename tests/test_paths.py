@@ -11,7 +11,24 @@ ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, ROOT)
 from core import paths
 
-EXACT_MACHINE_PATH = re.compile(r"""["'](?:/yanfang/?|/root/data(?:/[^"']*)?)["']""")
+def _machine_path_roots():
+    """这台机器专属的路径前缀 —— **推导出来，不写死**。
+
+    闸门要守的规矩是「路径事实只能来自 paths.py 或配置」。以前这里硬编码了
+    维护者机器的两个前缀，于是闸门自己成了仓库里最后一处机器标识。改成从
+    已声明的受保护路径 + `$HOME` 推导：在维护者机器上等价于原来那两条，
+    在别人的 clone 上自动变成他自己的，闸门的意义反而更强。
+    """
+    roots = [r for r in paths.protected_paths() if r not in ("/", "")]
+    home = os.path.expanduser("~").rstrip("/")
+    if home and home != "/":
+        roots.append(home)
+    return roots
+
+
+EXACT_MACHINE_PATH = re.compile(
+    r"""["'](?:%s)(?:/[^"']*)?/?["']"""
+    % "|".join(re.escape(r) for r in _machine_path_roots() or ["\0"]))
 
 
 def _docstring_lines(source):
@@ -61,7 +78,12 @@ class PathsTests(unittest.TestCase):
         早先这里断言必须含某个具体挂载点，前提是「同事的机器长得一样」。
         那个前提是错的：同一个集群的机器挂载也不同。
         """
-        with mock.patch.dict(os.environ, {}, clear=False):
+        # 必须同时隔开**两个**来源：环境变量和用户 settings。protected_paths()
+        # 取的是两者的并集，所以只清环境变量的话，在配过受保护路径的机器上
+        # 这条会红、在干净 clone 上会绿 —— 断言一个依机器而变的值，正是这个
+        # 文件反复在防的毛病。把 ZYLAB_HOME 指到空目录，settings 那一半也就没了。
+        with tempfile.TemporaryDirectory() as tmp, \
+                mock.patch.dict(os.environ, {"ZYLAB_HOME": tmp}, clear=False):
             os.environ.pop("ZYLAB_PROTECTED_PATHS", None)
             os.environ.pop("ZYLAB_PROTECTED_REMOTES", None)
             self.assertEqual(paths.protected_paths(), [])
@@ -69,7 +91,8 @@ class PathsTests(unittest.TestCase):
             self.assertFalse(paths.is_protected("/anywhere"))
 
     def test_declared_protected_paths_take_effect(self):
-        with mock.patch.dict(os.environ, {
+        with tempfile.TemporaryDirectory() as tmp, mock.patch.dict(os.environ, {
+                "ZYLAB_HOME": tmp,          # 隔开用户 settings 那一半来源
                 "ZYLAB_PROTECTED_PATHS": os.pathsep.join(
                     ["/data/archive", "/mnt/readonly/"]),
                 "ZYLAB_PROTECTED_REMOTES": "arch:bucket,other:x"}):

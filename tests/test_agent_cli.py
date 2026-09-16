@@ -282,8 +282,14 @@ class TransportApprovalScopeTests(unittest.TestCase):
                 authorizer=sess.authorize_insecure_transport)
             try:
                 client.set_gateway("deepinfer")
-                with mock.patch.object(
-                        CLI.sys.stdin, "isatty", return_value=True):
+                # 这条测的是**明文 HTTP 路由被拒**，所以必须自带一个 http://
+                # endpoint：内置 profile 不再携带地址（地址是部署事实），不声明
+                # 的话先撞上 base_not_configured，抛的就不是 ValueError 了。
+                with mock.patch.dict(
+                        client.GATEWAYS["boyue"],
+                        {"base": "http://example.invalid/v1"}), \
+                        mock.patch.object(
+                            CLI.sys.stdin, "isatty", return_value=True):
                     with self.assertRaises(ValueError):
                         sess.request_route_change("model-a", "boyue")
                 self.assertIsNone(sess._pending_route)
