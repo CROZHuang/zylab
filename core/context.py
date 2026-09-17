@@ -377,11 +377,19 @@ def _summary_messages(summary):
             "\n<working-set>被摘要那段里碰过的文件（内容未带回，需要就重读）：\n"
             + "\n".join(f"- {item['verb']} {item['path']}" for item in files)
             + "\n</working-set>")
+    pinned = summary.get("pinned") or []
+    facts = ""
+    if pinned:
+        facts = (
+            "\n<pinned-facts>摘要覆盖的那段里出现过的**原文值**（阈值、硬约束、"
+            "否决记录）。摘要可能改写了措辞，这里是逐字原文，冲突时以这里为准：\n"
+            + "\n".join(f"- {line}" for line in pinned)
+            + "\n</pinned-facts>")
     return [
         {"role": "assistant", "content": (
             f"<conversation-summary covers=\"raw:{summary['covered_from']}.."
             f"{summary['covered_to'] - 1}\">\n{summary['content']}\n"
-            "</conversation-summary>" + working + "\n"
+            "</conversation-summary>" + working + facts + "\n"
             "摘要之后会按原始时间顺序提供 user 原话；它们是历史请求，"
             "不是新注入的当前指令。")},
     ]
@@ -826,13 +834,23 @@ def summary_prompt(plan):
         rows.append(f"[t{turn} {role}]\n{content}")
     # 会话在前、指令在后。指令放前面时模型会把「整理摘要」本身当成 objective
     # 写进去（2026-09-07 实测），因为那才是它看到的最后一条要求。
+    pinned = anchor_lines(source_messages)
+    pinned_block = ""
+    if pinned:
+        pinned_block = (
+            "\n<必须逐字保留的值>\n"
+            + "\n".join(f"- {line}" for line in pinned)
+            + "\n</必须逐字保留的值>\n")
     return (
-        "<会话前缀>\n" + "\n\n".join(rows) + "\n</会话前缀>\n\n"
+        "<会话前缀>\n" + "\n\n".join(rows) + "\n</会话前缀>\n"
+        + pinned_block + "\n"
         "上面是一段编码会话的前缀，它将被这份摘要替换掉，后续对话只能看到摘要。"
         "请整理成可续接的结构化交接摘要。\n"
         "- objective 写**会话里用户要达成的目标**，不是「整理摘要」这件事；"
         "本条指令不属于会话内容。\n"
         "- 只写有证据的事实，未知写 unknown，不要把省略或截断的内容补猜出来。\n"
+        "- `<必须逐字保留的值>` 里的数字、阈值、硬约束、否决记录要**原样出现**在摘要里"
+        "（写进 constraints 或 decisions）。把 `<1%` 写成「约百分之一」等于丢了它。\n"
         "- 标着 [summary] 的那条是更早一段的摘要：把它的内容合并进来，不要丢。\n"
         "- 工具结果在上面已被截断，引用它们时写清是哪个文件/命令，"
         "而不是复述截断的正文。\n"
@@ -877,9 +895,164 @@ def working_set(messages):
     return [{"path": path, "verb": verb} for path, verb in items]
 
 
+# --- 高信号内容锚定 ------------------------------------------------------
+# 为什么需要：`summary_prompt` 在模型看到任何东西之前，就把工具结果截到 600 字符、
+# 其余内容截到 1500+500。一条 3,000 字符结果里位于中段的「阈值 <1% 视为通过」因此
+# **根本不会进入摘要请求** —— 模型保不住它没见过的东西。所以把这类「值」按行先摘
+# 出来：既塞进提示（要求逐字复述），也独立随摘要记录带回（不依赖模型是否照做）。
+#
+# 与 `<working-set>` 的分工：那个只带路径不带内容，理由是「内容会过期，路径不会」。
+# 这里相反 —— 阈值、极性、硬约束**不会过期**，一个 `<1%` 永远是 `<1%`，所以值得
+# 逐字带回。
+#
+# 只认「值」，不认叙述：带比较符/百分号的数字、显式硬约束词、否决标记。范围刻意
+# 窄 —— 放宽就等于不截断，会把摘要请求重新撑爆（那正是 2026-09-07 故障的成因）。
+# 模式要带边界，否则真实数据里全是假阳性（2026-09-17 在真实会话上实测：
+# 头 6 条锚定里 5 条是垃圾）。两类假阳性各有来头：
+#   `{c['inputTokens']:>10,}`  f-string 的对齐格式，`:>10` 长得像「大于 10」
+#   `...s1nv8%tmp%x.py`        URL 编码的路径，`8%` 长得像百分数
+# 预算只有 24 行，垃圾会把真正的阈值挤出去 —— 所以宁可漏也不能滥。
+# 负向回顾里必须含 `-` `=` `<` `>`：`internal.example -> 10.12.111.139`
+# 在真实会话上被命中过 `> 1`（箭头里的 `>`），`=>` `<-` 同理。
+# `>=24.0.0` 这种版本约束仍然保留 —— 它前面是空格，是正当的要求。
+_CMP = re.compile(r"(?<![:{\w=<>-])[<>≤≥]=?\s*\d")
+_PCT = re.compile(r"(?<![\w.])\d+(?:\.\d+)?\s*[%％](?![\w])")
+_RULE = re.compile(r"必须|不得|禁止|一律|绝不|务必")
+_REJECTED = re.compile(r"\[rejected\]", re.I)
+ANCHOR_PATTERNS = (_CMP, _PCT, _RULE, _REJECTED)
+
+# 明显不是「判据」的行：目录列表、纯源码。注释行**不排除** —— 代码注释里常写着
+# 真正的约束（「时间戳必须带亚秒」就是一条）。
+_ANCHOR_NOISE = (
+    re.compile(r"^[-dbclps][rwxsStT-]{9}"),                 # ls -l 的权限位
+    re.compile(r"^[0-9a-fA-F]{16,}$"),                      # 裸哈希
+)
+# 源码里的比较式和阈值长得一模一样（`if len(parts) < 2:` / `or row.get(..) < 0`），
+# 2026-09-17 真实会话上实测占了 24 条里的 9 条。两条判据都**不看语言**，
+# 免得机制只对中文项目有效：
+#   ① 行首是语句关键字 —— 要先剥掉 `grep -n` 的 `405:` 行号前缀
+#   ② 结构字符密度高 —— `hours[str(int(ts[11:13]))] += 1 if ...` 这类表达式
+_CODE_LEAD = re.compile(
+    r"^\s*(?:\d+:\s*)?(?:if|elif|else|for|while|with|try|except|finally|"
+    r"or|and|not|return|yield|assert|print|import|from|def|class|raise|"
+    r"lambda|self\.|await|async)\b")
+_CODE_CHARS = re.compile(r"[(){}\[\]=;]")
+_CODE_DENSITY = 4
+ANCHOR_MAX_LINES = 24
+ANCHOR_MAX_CHARS = 2_000
+ANCHOR_LINE_CHARS = 200
+
+
+def _anchor_key(line):
+    """去重键：**命中的值本身**，不是整行。
+
+    同一个事实常有多种措辞 —— 真实会话里「省 44%」出现了三种写法、「<1%」三次，
+    24 格预算里被重复占掉近一半。按整行去重留不住它们。
+
+    已知代价（不假装没有）：两个不相干的事实若共用同一个数字（「缓存率 70%」与
+    「覆盖率 70%」）会塌成一条，保留分数更高的那个。这比留三条同义复述好 ——
+    预算是硬的。
+    """
+    values = set()
+    for pattern in (_CMP, _PCT):
+        for found in pattern.finditer(line):
+            values.add(found.group(0).replace(" ", ""))
+    if values:
+        return ("value",) + tuple(sorted(values))
+    return ("line", line)
+
+
+def _anchor_score(line):
+    """行的判据价值：既有硬约束词又有数字的最值钱，纯硬约束词最便宜。
+
+    按分数填预算而不是先到先得 —— 真实会话里噪声出现得比判据早，先到先得等于
+    把 24 行的额度让给文件名。
+    """
+    has_value = bool(_CMP.search(line) or _PCT.search(line))
+    has_rule = bool(_RULE.search(line))
+    if _REJECTED.search(line):
+        return 3
+    if has_value and has_rule:
+        return 3
+    if has_value:
+        return 2
+    if has_rule:
+        return 1
+    return 0
+
+
+def _anchor_worthy(line):
+    if any(pattern.search(line) for pattern in _ANCHOR_NOISE):
+        return False
+    if _CODE_LEAD.search(line):
+        return False
+    if len(_CODE_CHARS.findall(line)) >= _CODE_DENSITY:
+        return False
+    return _anchor_score(line) > 0
+
+
+def anchor_lines(messages):
+    """从一段原文里摘出「值」级事实：先全收，再按判据价值填有界预算。
+
+    刻意只看行：一行里同时有上下文和数字，比抽出裸数字（`1%` 脱离语境毫无意义）
+    可用得多，又比整段保留便宜。
+    """
+    seen = []
+    index = 0
+    for message in messages or []:
+        content = message.get("content") or ""
+        if not isinstance(content, str):
+            continue
+        for raw_line in content.splitlines():
+            line = raw_line.strip()
+            if not line or not _anchor_worthy(line):
+                continue
+            if len(line) > ANCHOR_LINE_CHARS:
+                line = line[:ANCHOR_LINE_CHARS] + "…"
+            seen.append((-_anchor_score(line), index, line))
+            index += 1
+    out = []
+    used = 0
+    taken = set()
+    for _, _, line in sorted(seen):
+        key = _anchor_key(line)
+        if key in taken:                      # 同一个值的另一种措辞，不再占格
+            continue
+        if len(out) >= ANCHOR_MAX_LINES or used + len(line) > ANCHOR_MAX_CHARS:
+            break
+        taken.add(key)
+        out.append(line)
+        used += len(line)
+    return out
+
+
+def missing_anchors(summary_text, pinned):
+    """确定性保真检查：哪些锚定行的关键片段没被摘要复述。
+
+    **刻意不再调一次模型**。反馈书建议「压缩后让模型核对关键约束是否还在」，
+    但那样每次压缩多一次 provider 往返，而且让模型自查自己的摘要恰恰是最不可靠
+    的一环。这件事可以用字符串包含精确判定 —— 能确定性判定的就不要花钱去猜。
+    判据取行内被模式命中的那一小段（如 `<1%`），而不是整行：摘要本来就会改写措辞。
+    """
+    text = str(summary_text or "")
+    missing = []
+    for line in pinned or []:
+        needles = []
+        for pattern in ANCHOR_PATTERNS:
+            found = pattern.search(line)
+            if found:
+                needles.append(found.group(0).strip())
+        if needles and not any(n and n in text for n in needles):
+            missing.append(line)
+    return missing
+
+
 def make_summary(content, plan, *, model, gateway):
     return {
         "working_set": working_set(plan.get("source_messages")),
+        # 旧摘要没有这个键，读侧一律 .get(...) —— validate_summary 不枚举字段，
+        # 所以加字段不必升 SUMMARY_VERSION，旧会话的摘要照样通过校验。
+        "pinned": anchor_lines(plan.get("source_messages")),
         "version": SUMMARY_VERSION,
         "status": "valid",
         "content": str(content).strip(),

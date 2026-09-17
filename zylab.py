@@ -5877,7 +5877,10 @@ class Session:
                             + _compaction_effect(
                                 event.get("before"), event.get("after"),
                                 event.get("model"), self.ag.model)
-                            + f"，摘要 {len(event['v']):,} 字符]\r\n"))
+                            + f"，摘要 {len(event['v']):,} 字符"
+                            + _anchor_notice(
+                                getattr(self.ag, "context_summary", None))
+                            + "]\r\n"))
                 elif event_type == "usage":
                     self.last_ctx = event.get("ctx", 0)
                     update_activity(
@@ -10532,6 +10535,15 @@ def _catalog_change_notice(result):
             + " · /model check 可逐个实测]\r\n")
 
 
+def _anchor_notice(record):
+    """摘要没复述的原文值有多少条。不改 _compaction_effect 的签名（它有测试钉着）。"""
+    missing = (record or {}).get("missing_anchors") or []
+    if not missing:
+        return ""
+    return (f"，{len(missing)} 条原文值未被摘要复述"
+            "（已随 <pinned-facts> 原样带回）")
+
+
 def _compaction_effect(before, after, summary_model=None, current_model=None):
     """把压缩前后的上下文 token 说清楚；拿不到数字就退回不吹牛的说法。"""
     swapped = (f"，由 {summary_model} 代写"
@@ -10564,11 +10576,13 @@ def cmd_compact(sess, rest):
             after = sess.ag.context_report()["estimated_request_tokens"]
         except Exception:                             # noqa: BLE001
             after = None
-        used = (getattr(sess.ag, "context_summary", None) or {}).get("model")
+        record = getattr(sess.ag, "context_summary", None) or {}
+        used = record.get("model")
         print(DIM(
             "  [已压缩 —— "
             + _compaction_effect(before, after, used, sess.ag.model)
-            + f"，摘要 {len(s):,} 字符]"))
+            + f"，摘要 {len(s):,} 字符"
+            + _anchor_notice(record) + "]"))
     else:
         print(DIM("  [无需压缩]"))
 

@@ -197,10 +197,6 @@ class PromptShapeTests(unittest.TestCase):
             self.assertIn(f"## {heading}", prompt)
 
 
-if __name__ == "__main__":
-    unittest.main()
-
-
 class EffectLineTests(unittest.TestCase):
     def test_effect_line_reports_tokens_and_names_a_stand_in_model(self):
         import zylab                                   # noqa: PLC0415
@@ -294,3 +290,169 @@ class CatalogDelistingTests(unittest.TestCase):
         from core import models                        # noqa: PLC0415
         self.assertNotEqual(
             models.family_of(route["model"]), models.family_of(agent.model))
+
+
+class PinnedFactsTests(unittest.TestCase):
+    """高信号「值」必须活过压缩 —— 摘要改写措辞也不能把它们改掉。
+
+    钉的是 2026-09-17 反馈书差距 1/2：`summary_prompt` 在模型看到之前就把工具
+    结果截到 600 字符，位于中段的阈值根本进不了摘要请求。模型保不住它没见过的
+    东西，所以值要单独摘出来、逐字带回。
+    """
+
+    def _messages_with(self, *contents):
+        messages = [{"role": "system", "content": "sys"}]
+        for index, text in enumerate(contents):
+            block = turn(index)
+            block[2]["content"] = text        # 工具结果就是值的来源
+            messages.extend(block)
+        messages.extend(turn(99))
+        return messages
+
+    def test_values_are_lifted_even_when_buried_past_the_truncation(self):
+        # 值刻意放在第 900 字符之后——旧行为下工具结果被截到 600，它必然丢。
+        buried = "填充。" * 300 + "\n阈值规则：误差 <1% 视为通过\n" + "尾部。" * 50
+        messages = self._messages_with(buried)
+        pinned = C.anchor_lines(messages)
+        self.assertTrue(any("<1%" in line for line in pinned), pinned)
+        plan = C.plan_compaction(messages, None, keep_tail=1)
+        prompt = C.summary_prompt(plan)
+        # 截断仍然发生（提示不能重新撑爆），但值另走一条路进了提示
+        self.assertIn("<必须逐字保留的值>", prompt)
+        self.assertIn("<1%", prompt)
+
+    def test_only_values_are_lifted_not_narrative(self):
+        messages = self._messages_with(
+            "这里是一段普通叙述，没有任何阈值或硬约束。",
+            "上限 95% 以上算超标",
+            "这一步**必须**先做",
+            "[rejected] 裸数字匹配 —— 脱离语境无意义")
+        pinned = C.anchor_lines(messages)
+        self.assertNotIn("这里是一段普通叙述，没有任何阈值或硬约束。", pinned)
+        self.assertEqual(len(pinned), 3, pinned)
+
+    def test_pinned_rides_the_summary_verbatim(self):
+        messages = self._messages_with("阈值 <1% 视为通过")
+        plan = C.plan_compaction(messages, None, keep_tail=1)
+        summary = C.make_summary("## objective\nx", plan,
+                                 model="m", gateway="g")
+        self.assertTrue(summary["pinned"])
+        rendered = C._summary_messages(summary)[0]["content"]
+        self.assertIn("<pinned-facts>", rendered)
+        self.assertIn("<1%", rendered)
+
+    def test_old_summaries_without_pinned_still_render_and_validate(self):
+        """加字段不能打翻旧会话：validate_summary 不枚举字段，读侧必须 .get()。"""
+        messages = self._messages_with("阈值 <1% 视为通过")
+        plan = C.plan_compaction(messages, None, keep_tail=1)
+        summary = C.make_summary("## objective\nx", plan,
+                                 model="m", gateway="g")
+        del summary["pinned"]                       # 模拟改动前写下的摘要
+        rendered = C._summary_messages(summary)[0]["content"]
+        self.assertNotIn("<pinned-facts>", rendered)
+        self.assertTrue(C.validate_summary(messages, summary)[0])
+
+    def test_fidelity_check_is_deterministic_and_catches_paraphrase(self):
+        """反馈书建议再调一次模型核对；这里用确定性判定替代。
+
+        理由：每次压缩多一次 provider 往返，而让模型自查自己的摘要恰恰是最不
+        可靠的一环。能用字符串包含精确判定的事，不花钱去猜。
+        """
+        pinned = ["阈值 <1% 视为通过", "这一步必须先做"]
+        missing = C.missing_anchors("用约百分之一为界；这一步必须先做", pinned)
+        self.assertEqual(missing, ["阈值 <1% 视为通过"])
+        self.assertEqual(
+            C.missing_anchors("constraints: <1% 视为通过；必须先做", pinned), [])
+
+    def test_real_world_noise_is_not_anchored(self):
+        """回归：真实会话上头 6 条锚定里 5 条是垃圾（2026-09-17 实测）。
+
+        两类假阳性各有来头，合成测试永远碰不到，所以用真实形态钉住：
+          `{x:>10,}`            f-string 对齐格式，`:>10` 长得像「大于 10」
+          `...s1nv8%tmp%x.py`   URL 编码路径，`8%` 长得像百分数
+        预算只有 24 行，放进垃圾等于把真正的阈值挤出去。
+        """
+        noise = [
+            "20260821T115615_158857__tmp%tmpr62s1nv8%x.py",
+            "-rw-r--r-- 1 root root    3 Aug 21 11:56 x.py",
+            'print(DIM(f"  {g:12} in {c[\'inputTokens\']:>10,} / "',
+            "0123456789abcdef0123456789abcdef",
+        ]
+        for line in noise:
+            with self.subTest(line=line[:40]):
+                self.assertFalse(C._anchor_worthy(line), line)
+        for line in ("阈值规则：误差 <1% 视为通过", "阈值 95% 以上为超标",
+                     "# 时间戳必须带亚秒：同一秒内连改两次会互相覆盖"):
+            with self.subTest(line=line[:40]):
+                self.assertTrue(C._anchor_worthy(line), line)
+
+    def test_arrows_are_not_comparators(self):
+        """`->` / `=>` / `<-` 里的符号不是比较符。
+
+        2026-09-17 真实会话上 `internal.example -> 10.12.111.139` 被 `_CMP`
+        命中了 `'> 1'`（箭头里的 `>`，负向回顾漏了 `-`）。一个以精度为职责的
+        机制不能留下说不清为什么会命中的行。
+        """
+        for line in ("host.example -> 10.12.111.139", "a => 42", "x <- 7"):
+            with self.subTest(line=line):
+                self.assertFalse(C._anchor_worthy(line), line)
+        # 版本约束里的 `>=` 是正当要求，不能因为修箭头而连坐
+        self.assertTrue(
+            C._anchor_worthy("harness 要求 >=24.0.0，否则装不上"))
+
+    def test_same_value_in_different_phrasings_collapses(self):
+        """同义复述吃预算：真实会话里「省 44%」出现三种写法，只该钉一条。"""
+        content = "\n".join([
+            "工具结果老化：长会话上下文省 44%",
+            "- `5d5be68` 工具结果老化（省 44% 上下文）",
+            "- **工具结果老化**：长会话上下文省 44%（8-21）",
+            "缓存命中率 70%",
+        ])
+        pinned = C.anchor_lines([{"role": "tool", "content": content}])
+        self.assertEqual(len(pinned), 2, pinned)
+        self.assertTrue(any("44%" in line for line in pinned), pinned)
+        self.assertTrue(any("70%" in line for line in pinned), pinned)
+
+    def test_budget_goes_to_the_valuable_lines_first(self):
+        """噪声在真实会话里出现得比判据早 —— 先到先得会把额度让给噪声。"""
+        early_rule_only = ["这一步必须先做" for _ in range(30)]
+        late_value = "阈值 <1% 视为通过"
+        content = "\n".join(early_rule_only + [late_value])
+        pinned = C.anchor_lines([{"role": "tool", "content": content}])
+        self.assertIn(late_value, pinned)
+
+    def test_anchors_are_bounded(self):
+        """不能因为「保留值」把摘要请求重新撑爆 —— 那是 09-07 故障的成因。"""
+        many = "\n".join(f"第 {i} 项上限 {i}% 以上" for i in range(200))
+        pinned = C.anchor_lines([{"role": "tool", "content": many}])
+        self.assertLessEqual(len(pinned), C.ANCHOR_MAX_LINES)
+        self.assertLessEqual(sum(len(x) for x in pinned), C.ANCHOR_MAX_CHARS)
+
+
+class AgingPolicyTests(unittest.TestCase):
+    """老化力度随窗口放宽，但永不比基准更狠（反馈书差距 3）。"""
+
+    def test_base_window_is_byte_for_byte_unchanged(self):
+        self.assertEqual(
+            A.aging_policy(A.AGE_SCALE_BASE),
+            {"age_after_turns": A.AGE_AFTER_TURNS,
+             "age_keep_head": A.AGE_KEEP_HEAD,
+             "age_min_chars": A.AGE_MIN_CHARS})
+
+    def test_small_window_never_gets_stricter_than_base(self):
+        for limit in (0, None, 8_000, 128_000):
+            with self.subTest(limit=limit):
+                policy = A.aging_policy(limit)
+                self.assertEqual(policy["age_keep_head"], A.AGE_KEEP_HEAD)
+
+    def test_large_window_relaxes_and_stays_bounded(self):
+        policy = A.aging_policy(1_049_000)
+        self.assertGreater(policy["age_keep_head"], A.AGE_KEEP_HEAD)
+        ceiling = A.aging_policy(100_000_000)
+        self.assertEqual(
+            ceiling["age_keep_head"],
+            int(A.AGE_KEEP_HEAD * A.AGE_SCALE_MAX))
+
+
+if __name__ == "__main__":
+    unittest.main()

@@ -96,9 +96,37 @@ def compact_threshold(ctx_limit, override=None):
 #
 # 为什么不直接删：删掉会留下孤儿 tool_call_id，服务端会拒。必须**替换内容**
 # 而保留消息结构。
-AGE_AFTER_TURNS = 3        # 最近几轮的工具结果保持原文
+AGE_AFTER_TURNS = 3        # 最近几轮的工具结果保持原文（256k 窗口的基准值）
 AGE_KEEP_HEAD = 200        # 老化后保留开头多少字符（够模型认出这是什么）
 AGE_MIN_CHARS = 400        # 小于这个长度的结果不值得老化
+AGE_SCALE_BASE = 256_000   # 上面三个值以这个窗口为基准
+AGE_SCALE_MAX = 4.0        # 放宽上限；再宽就不如让压缩去做
+
+
+def aging_policy(ctx_limit):
+    """老化力度随模型窗口放宽 —— 但永不比基准更狠。
+
+    为什么要改：这三个值是写死的常量，不随窗口变。1M 窗口上把 3 轮之前的工具结果
+    砍到 200 字符，省下的额度根本用不上，丢掉的细节却是真的（DEVLOG 里同源的抱怨：
+    「1M 窗口的模型只用到 18% 就压缩，白扔 82 万」）。
+
+    **按窗口线性放宽并设上下限，不按「当前压力」自适应**：老化本身会改变
+    token 估算，按压力反馈调节会自激振荡（这一轮老化多了 → 估算降了 → 下一轮
+    老化少了 → 估算涨了）。窗口是外生常量，不会。
+
+    下限锁在 1.0：小窗口模型上行为与今天逐字相同，这次改动不可能让任何现有
+    配置变得更省不了。
+    """
+    try:
+        scale = float(ctx_limit or 0) / AGE_SCALE_BASE
+    except (TypeError, ValueError):
+        scale = 1.0
+    scale = max(1.0, min(AGE_SCALE_MAX, scale))
+    return {
+        "age_after_turns": max(1, int(AGE_AFTER_TURNS * scale)),
+        "age_keep_head": max(1, int(AGE_KEEP_HEAD * scale)),
+        "age_min_chars": max(1, int(AGE_MIN_CHARS * scale)),
+    }
 
 SYSTEM = """你是 zylab，一个跑在终端里的软件工程助理。你通过工具直接操作这台机器，\
 而不是只给建议。
@@ -970,9 +998,9 @@ class Agent:
             usable_budget=getattr(self, "compact_at", None),
             model_limit_source=getattr(self, "ctx_limit_source", "unknown"),
             last_provider_tokens=getattr(self, "last_total", 0),
-            age_after_turns=AGE_AFTER_TURNS,
-            age_min_chars=AGE_MIN_CHARS,
-            age_keep_head=AGE_KEEP_HEAD,
+            # 三个老化参数统一由 aging_policy 给（含 age_after_turns）——
+            # 这里再显式传一次就是重复关键字，运行期 TypeError，编译查不出来。
+            **aging_policy(getattr(self, "ctx_limit", None) or CTX_LIMIT),
         )
 
     def context_report(self, offered_tools=None, control_messages=None):
@@ -1137,6 +1165,11 @@ class Agent:
             summary, plan,
             model=used.get("model") or self.model,
             gateway=used.get("gateway") or self.gateway)
+        # 确定性保真检查：哪些原文值没被摘要复述。**不是失败**——值已经随
+        # <pinned-facts> 逐字带回，这里只为让「丢了什么」可见，而不是压缩后
+        # 模型和用户都不知道丢了什么（反馈书差距 2）。
+        record["missing_anchors"] = context_projection.missing_anchors(
+            summary, record.get("pinned"))
         if slot == "recap":
             # 交接摘要只给 resume 看，**绝不**进 provider 投影：这个会话还有
             # 大把预算，用摘要替换原文是白丢细节（compact_threshold 那条注释
