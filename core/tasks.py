@@ -9,6 +9,7 @@ background 只改变 UI/事件所有权，不改变 worker、artifact 或取消�
 """
 from __future__ import annotations
 from . import paths
+from . import wincompat
 
 import collections
 import codecs
@@ -18,7 +19,6 @@ import math
 import os
 import queue
 import re
-import selectors
 import signal
 import subprocess
 import threading
@@ -275,7 +275,7 @@ class _Artifact:
             flags |= os.O_NOFOLLOW
         fd = os.open(self.path, flags, 0o600)
         try:
-            os.fchmod(fd, 0o600)
+            wincompat.fchmod(fd, 0o600)
             self._stream = os.fdopen(fd, "wb", buffering=0)
             self._opened = True
         except BaseException:
@@ -718,14 +718,7 @@ class TaskHandle:
             pid = self.process_pid
         if pid is None:
             return False
-        try:
-            os.killpg(pid, 0)
-            return True
-        except ProcessLookupError:
-            return False
-        except PermissionError:
-            # 同 uid 的 managed group 不应发生；保守视为仍存在。
-            return True
+        return wincompat.group_exists(pid)
 
     def _send_group(self, sig, *, allow_exited_leader=False):
         with self._lock:
@@ -736,11 +729,7 @@ class TaskHandle:
         if (not allow_exited_leader
                 and (proc is None or proc.poll() is not None)):
             return False
-        try:
-            os.killpg(pid, sig)
-            return True
-        except ProcessLookupError:
-            return False
+        return wincompat.signal_process_group(pid, sig)
 
     def _cleanup_process_group(self):
         """TERM→KILL 清理 leader 退出后仍留在同 PGID 的子进程。"""
@@ -901,20 +890,20 @@ class TaskHandle:
         proc = subprocess.Popen(
             list(argv), cwd=cwd, env=env,
             stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-            start_new_session=True, bufsize=0)
+            **wincompat.popen_group_kwargs(), bufsize=0)
         try:
             # Popen 之后的 bind、selector 构造和每一次 register 必须都在
             # 同一个 cleanup boundary 内；任何 setup 错误都不能泄漏 PGID。
             self.bind_process(proc)
-            selector = selectors.DefaultSelector()
+            selector = wincompat.DefaultSelector()
             pipes = {
                 proc.stdout: "stdout",
                 proc.stderr: "stderr",
             }
             for pipe, stream_name in pipes.items():
-                os.set_blocking(pipe.fileno(), False)
+                wincompat.set_blocking(pipe.fileno(), False)
                 selector.register(
-                    pipe, selectors.EVENT_READ, stream_name)
+                    pipe, wincompat.EVENT_READ, stream_name)
             deadline = (
                 time.monotonic() + timeout_seconds
                 if timeout_seconds is not None else None)
@@ -1231,7 +1220,7 @@ class TaskManager:
             flags |= os.O_NOFOLLOW
         fd = os.open(temporary, flags, 0o600)
         try:
-            os.fchmod(fd, 0o600)
+            wincompat.fchmod(fd, 0o600)
             with os.fdopen(fd, "wb", closefd=True) as stream:
                 fd = -1
                 stream.write(payload)

@@ -39,7 +39,7 @@ class DecisionOrderingTests(unittest.TestCase):
             "## decisions\n"
             "- [t3] 冻结 v4 疾病树\n"
             "- [t41] v14 作废，改用 v17b\n"
-            "- [t22] 判读归一化用 ordinal_score\n")), replay_limit=5))
+            "- [t22] 排序归一化用 ordinal_score\n")), replay_limit=5))
         first = text.index("v14 作废")
         self.assertLess(first, text.index("ordinal_score"))
         self.assertNotIn("冻结 v4", text)             # 最早的那条被挤掉了

@@ -24,6 +24,46 @@ zylab --usage <session前缀>     # 单个会话
 zylab --yolo                   # 仅批准普通 ask；hard/deny 仍拒绝（慎用）
 ```
 
+## 平台
+
+| 平台 | 状态 |
+|---|---|
+| **Linux** | 主平台。全部测试在这里跑绿，OS 级沙箱（mount + network namespace）可用。 |
+| **macOS** | 应当可用，**未在真机验证**。差别只有一处：OS 级沙箱依赖 Linux 的 `unshare`/`mount`/`setpriv`，macOS 没有。 |
+| **Windows** | 有专门的兼容层，**但只做到「设计完整 + import 安全」，Windows 分支未在真机执行过**。 |
+
+这三行是**声明，不是营销**。下面写清每一条的依据和代价。
+
+**macOS**：POSIX 原语（`termios`/`fcntl`/`select`/`killpg`）都在，所以终端交互、文件锁、
+进程树终止、检查点的 `openat` 防替换链都走原生路径。唯一的差别是沙箱能力探测会返回
+不可用（缺 `unshare`/`mount`/`setpriv`），此时：`ask-unsandboxed`（默认）下每次 Bash
+都要你**逐次确认**；`strict` 下直接拒绝执行。**受保护路径的词法守卫不受影响** ——
+它在工具层，和沙箱是两道独立的门。
+
+**Windows**：`core/wincompat.py` 是所有平台差异的唯一入口，零三方依赖（只用 stdlib +
+系统 DLL 的 ctypes）：
+
+| POSIX 原语 | Windows 等价物 |
+|---|---|
+| `fcntl.flock` | `msvcrt.locking` 字节范围锁 |
+| `termios`/`tty` raw 模式 | `SetConsoleMode` |
+| `select.select` | 控制台 `msvcrt.kbhit`；管道 `PeekNamedPipe` |
+| `os.killpg` | `taskkill /T /F` |
+| `os.open(..., dir_fd=)` | 退化为绝对路径 + 身份比对 |
+| `st_uid == geteuid()` | 退化为 NTFS ACL 下的常规文件检查 |
+
+**已知的语义代价（不假装没有）**：`msvcrt` 锁的是字节范围而非整个 fd，并发写方必须也走
+这一层才互斥；检查点的 TOCTOU 防替换从 `openat` 级退化到路径解析级；`taskkill /F` 是强杀，
+没有 POSIX 那个 `TERM → 宽限 → KILL` 的序列；没有 `SIGWINCH`，窗口尺寸改用轮询。
+
+**验证到哪一步**：测试钉住了两件事 —— POSIX 包装与原语同义（跨进程 flock 互斥、进程树
+终止、`fd_*` 的 at 语义、raw 模式进出对称），以及**11 个核心模块在 `fcntl`/`termios`/`tty`
+缺失时仍能 import**（那正是 Windows 上撞到的第一个错误）。**没有**钉住的是 `msvcrt`/`ctypes`
+那些分支本身 —— 在 Linux 上无法伪造（`sys.platform` 一改，标准库就去找 Windows 专属的
+`_winapi`），只能真机跑。所以在 Windows 上第一次用请当作 beta。
+
+Windows 上用 `python zylab.py`（不是 `./zylab`）。
+
 ## 安装
 
 不需要 pip / venv，纯标准库，Python 3.10+。

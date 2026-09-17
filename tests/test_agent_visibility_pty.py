@@ -17,7 +17,7 @@ ANSI = re.compile(r"\x1b\[[0-9;?]*[A-Za-z]|\x1b\][^\x07]*\x07")
 
 BODY = r'''
 RUNNING = [
-    {"id": "a-111111111111", "kind": "subagent", "state": "running", "name": "归纳病理线摘要",
+    {"id": "a-111111111111", "kind": "subagent", "state": "running", "name": "归纳调研线摘要",
      "model": "kimi-k3", "gateway": "deepinfer", "seat": "Kimi",
      "created_at": "2026-09-07T12:05:00+00:00", "started_at": "2026-09-07T12:05:00+00:00",
      "parent_session_id": "think-pty", "parent_turn_id": ""},
@@ -84,7 +84,7 @@ class AgentVisibilityPTYTests(unittest.TestCase):
         plain = ANSI.sub("", out)
         self.assertEqual(result["events"], 2)
         # J1：永久完成行
-        self.assertIn('● Agent "归纳病理线摘要" finished · 5m 5s', plain)
+        self.assertIn('● Agent "归纳调研线摘要" finished · 5m 5s', plain)
         self.assertIn('● Agent "抓取 arXiv 元数据" finished · 5m 5s', plain)
         self.assertIn("/agents peek a-1111111111", plain)
         # J2：正文不进父时间线
@@ -94,7 +94,7 @@ class AgentVisibilityPTYTests(unittest.TestCase):
         self.assertIn("ZYLAB_TEST_WAITING_1", out)
         self.assertLess(out.find("ZYLAB_TEST_WAITING_2"), out.find("ZYLAB_TEST_WAITING_1"))
         # J4：名册行（席位 + label）出现过；J5：状态栏计数出现过
-        self.assertIn("○ Kimi  归纳病理线摘要", plain)
+        self.assertIn("○ Kimi  归纳调研线摘要", plain)
         self.assertIn("○ GLM  抓取 arXiv 元数据", plain)
         self.assertIn("2 agents", plain)
 

@@ -11,7 +11,7 @@ from core import agent_events as E
 NOW = datetime(2026, 9, 7, 12, 10, 5, tzinfo=timezone.utc)
 RECORD = {
     "id": "a-1413d26fc3", "kind": "subagent", "state": "completed",
-    "name": "归纳病理线摘要", "task": "读四份摘要并归纳", "model": "kimi-k3", "gateway": "deepinfer",
+    "name": "归纳调研线摘要", "task": "读四份摘要并归纳", "model": "kimi-k3", "gateway": "deepinfer",
     "seat": "Kimi", "created_at": "2026-09-07T12:05:00+00:00",
     "started_at": "2026-09-07T12:05:00+00:00", "ended_at": "2026-09-07T12:10:05+00:00",
     "result": "REPORT_SENTINEL " + "x" * 100,
@@ -21,7 +21,7 @@ RECORD = {
 class ConvertersTests(unittest.TestCase):
     def test_agent_record_becomes_finished_event_with_elapsed_and_tokens(self):
         ev = E.from_agent_record("finished", RECORD, tokens=89_600, activity="read_file c88a.txt")
-        self.assertEqual((ev.kind, ev.source, ev.label, ev.seat), ("finished", "subagent", "归纳病理线摘要", "Kimi"))
+        self.assertEqual((ev.kind, ev.source, ev.label, ev.seat), ("finished", "subagent", "归纳调研线摘要", "Kimi"))
         self.assertEqual(ev.elapsed, 305.0)
         self.assertEqual(ev.tokens, 89_600)
         self.assertEqual(ev.activity, "read_file c88a.txt")
@@ -88,7 +88,7 @@ class FormattingTests(unittest.TestCase):
     def test_finished_line_and_hint_never_carry_the_report_body(self):
         ev = E.from_agent_record("finished", RECORD, tokens=89_600)
         line = E.finished_line(ev)
-        self.assertEqual(line, '● Agent "归纳病理线摘要" finished · 5m 5s · ↓ 89.6k tokens')
+        self.assertEqual(line, '● Agent "归纳调研线摘要" finished · 5m 5s · ↓ 89.6k tokens')
         hint = E.finished_hint(ev)
         self.assertIn("/agents peek a-1413d26fc", hint)
         self.assertTrue(hint.startswith("  ⎿  "))
@@ -101,7 +101,7 @@ class FormattingTests(unittest.TestCase):
         ev = E.from_agent_record("activity", {**RECORD, "state": "running", "ended_at": None}, tokens=3100,
                                  activity="web_fetch export.arxiv.org", now=NOW)
         row = E.roster_row(ev)
-        self.assertTrue(row.startswith("○ Kimi  归纳病理线摘要  web_fetch export.arxiv.org  5m 05s · ↓ 3.1k"), row)
+        self.assertTrue(row.startswith("○ Kimi  归纳调研线摘要  web_fetch export.arxiv.org  5m 05s · ↓ 3.1k"), row)
         self.assertEqual(E.waiting_line(3), "等待 3 个后台代理完成")
         self.assertEqual(E.waiting_line(0), "")
 

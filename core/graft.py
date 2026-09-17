@@ -10,6 +10,7 @@ import re
 import shutil
 import signal
 import stat
+from . import wincompat
 import subprocess
 import sys
 from pathlib import Path
@@ -104,7 +105,7 @@ def resolve_executable(policy):
         except OSError:
             continue
         if (not path.is_file() or not os.access(path, os.X_OK)
-                or info.st_uid != os.geteuid()
+                or info.st_uid != wincompat.geteuid()
                 or info.st_mode & (stat.S_IWGRP | stat.S_IWOTH)
                 or _replaceable_parent(path)
                 or _protected(path)):
@@ -138,7 +139,7 @@ def _network_namespace_probe():
     except OSError as exc:
         return {"error": f"无法检查 unshare：{type(exc).__name__}"}
     if (not executable.is_file() or not os.access(executable, os.X_OK)
-            or info.st_uid not in {0, os.geteuid()}
+            or info.st_uid not in {0, wincompat.geteuid()}
             or info.st_mode & (stat.S_IWGRP | stat.S_IWOTH)
             or _replaceable_parent(executable)):
         return {"error": f"unshare executable 不可信：{executable}"}
@@ -370,7 +371,7 @@ def cache_dir(root, policy, *, create=True):
             info = base.stat()
         except OSError as exc:
             raise GraftError(f"无法检查 Graft cache root：{base}") from exc
-        if (not base.is_dir() or info.st_uid != os.geteuid()
+        if (not base.is_dir() or info.st_uid != wincompat.geteuid()
                 or info.st_mode & (stat.S_IWGRP | stat.S_IWOTH)):
             raise GraftError(
                 f"Graft cache root 必须是当前用户私有目录（0700/0755）：{base}")
@@ -392,7 +393,7 @@ def cache_dir(root, policy, *, create=True):
             info = path.stat()
         except OSError as exc:
             raise GraftError(f"无法检查 Graft project cache：{path}") from exc
-        if (not path.is_dir() or info.st_uid != os.geteuid()
+        if (not path.is_dir() or info.st_uid != wincompat.geteuid()
                 or info.st_mode & (stat.S_IRWXG | stat.S_IRWXO)):
             raise GraftError(
                 f"Graft project cache 必须是当前用户私有目录：{path}")
@@ -438,21 +439,21 @@ def _direct_worker(argv, *, cwd, env, timeout):
     proc = subprocess.Popen(
         argv, cwd=cwd, env=env, stdin=subprocess.DEVNULL,
         stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-        start_new_session=True)
+        **wincompat.popen_group_kwargs())
     timed_out = False
     try:
         stdout, stderr = proc.communicate(timeout=timeout)
     except subprocess.TimeoutExpired:
         timed_out = True
         try:
-            os.killpg(proc.pid, signal.SIGTERM)
+            wincompat.signal_process_group(proc.pid, signal.SIGTERM)
         except (OSError, ProcessLookupError):
             pass
         try:
             stdout, stderr = proc.communicate(timeout=2)
         except subprocess.TimeoutExpired:
             try:
-                os.killpg(proc.pid, signal.SIGKILL)
+                wincompat.signal_process_group(proc.pid, signal.SIGKILL)
             except (OSError, ProcessLookupError):
                 pass
             stdout, stderr = proc.communicate()
@@ -460,14 +461,14 @@ def _direct_worker(argv, *, cwd, env, timeout):
         # /graft build is a synchronous admin command.  Ctrl-C must not leave
         # the worker or any Node/git descendant running after the CLI returns.
         try:
-            os.killpg(proc.pid, signal.SIGTERM)
+            wincompat.signal_process_group(proc.pid, signal.SIGTERM)
         except (OSError, ProcessLookupError):
             pass
         try:
             proc.communicate(timeout=2)
         except BaseException:
             try:
-                os.killpg(proc.pid, signal.SIGKILL)
+                wincompat.signal_process_group(proc.pid, signal.SIGKILL)
             except (OSError, ProcessLookupError):
                 pass
             try:
@@ -481,7 +482,7 @@ def _direct_worker(argv, *, cwd, env, timeout):
         # The worker may have timed out a grandchild and returned an error
         # envelope.  Clean any remaining member of its process group.
         try:
-            os.killpg(proc.pid, signal.SIGTERM)
+            wincompat.signal_process_group(proc.pid, signal.SIGTERM)
         except (OSError, ProcessLookupError):
             pass
     return proc.returncode, stdout, stderr

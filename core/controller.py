@@ -628,7 +628,13 @@ class SessionController:
     def _dispatch_steer(self, item):
         if self.current_turn_id is None:
             raise ControllerError("steer dispatch 缺少 active turn")
-        message = {"role": "user", "content": item.text}
+        # steer 前缀：转向是新指令，但上一问题的回答义务不因此消失。
+        # 实测（09-16 会话）steer + 边界压缩叠加时模型会丢掉未输出的回答；
+        # 前缀把「先收尾」钉在触发点，比 SYSTEM 常驻约束更近。
+        content = (
+            "[steer：用户在你工作时发来新输入。若上一个问题已有调查结果"
+            "但还没给出最终回答，先完成那个回答再转向新任务。]\n\n" + item.text)
+        message = {"role": "user", "content": content}
         self.journal.dispatch_queued_input(
             self.session_id, item.id, turn_id=self.current_turn_id,
             dispatched_at=self._clock(), events=[{

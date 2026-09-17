@@ -3094,6 +3094,11 @@ with tempfile.TemporaryDirectory() as home:
         message["content"] for message in agent.messages
         if message.get("role") == "user"
     ]
+    # steer 落盘带收尾前缀（09-16 契约），断言剥掉前缀后的原文。
+    users = [
+        u.split("]\n\n", 1)[1] if u.startswith("[steer：") else u
+        for u in users
+    ]
     modes = [
         event["payload"].get("mode")
         for event in session.controller.journal.events

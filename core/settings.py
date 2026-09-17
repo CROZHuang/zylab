@@ -13,7 +13,7 @@
 其余字段（模型、网关、参数）项目级可以自由覆盖 —— 那些不构成权限提升。
 """
 from . import paths
-import fcntl
+from . import wincompat
 import json
 import math
 import os
@@ -952,12 +952,12 @@ def _user_lock():
         flags |= os.O_NOFOLLOW
     fd = os.open(lock_path, flags, 0o600)
     try:
-        os.fchmod(fd, 0o600)
-        fcntl.flock(fd, fcntl.LOCK_EX)
+        wincompat.fchmod(fd, 0o600)
+        wincompat.flock(fd, wincompat.LOCK_EX)
         yield
     finally:
         try:
-            fcntl.flock(fd, fcntl.LOCK_UN)
+            wincompat.flock(fd, wincompat.LOCK_UN)
         finally:
             os.close(fd)
 
@@ -983,7 +983,7 @@ def _write_user_unlocked(value):
         dir=USER_FILE.parent, text=True)
     tmp = Path(tmp_name)
     try:
-        os.fchmod(fd, 0o600)
+        wincompat.fchmod(fd, 0o600)
         stream = os.fdopen(fd, "w", encoding="utf-8")
         fd = -1
         with stream:

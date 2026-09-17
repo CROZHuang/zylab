@@ -22,6 +22,7 @@
    批准按参数 SHA-256 绑定到一次调用，执行层会重新计算并拒绝缺失或失配的批准。
 """
 from . import paths
+from . import wincompat
 import fnmatch
 import hashlib
 import glob as globlib
@@ -31,7 +32,6 @@ import queue
 import re
 import signal
 import threading
-import select
 import shlex
 import subprocess
 import time
@@ -1220,22 +1220,8 @@ def _redact_runtime_text(value):
 
 def _terminate_process_group(process, *, grace=0.35):
     """Terminate the whole start_new_session process group, leader or not."""
-    pgid = int(process.pid)
-    try:
-        os.killpg(pgid, signal.SIGTERM)
-    except ProcessLookupError:
-        return
-    deadline = time.monotonic() + max(0.0, float(grace))
-    while time.monotonic() < deadline:
-        try:
-            os.killpg(pgid, 0)
-        except ProcessLookupError:
-            return
-        time.sleep(0.01)
-    try:
-        os.killpg(pgid, signal.SIGKILL)
-    except ProcessLookupError:
-        pass
+    # POSIX: killpg TERM + 宽限后 KILL；Windows: taskkill /T /F（见 wincompat）
+    wincompat.terminate_process_tree(int(process.pid), grace=grace)
 
 
 class _BoundedCapture:
@@ -1279,7 +1265,7 @@ def _run_bash_direct(argv, *, cwd, timeout):
     try:
         process = subprocess.Popen(
             argv, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-            cwd=cwd, start_new_session=True)
+            cwd=cwd, **wincompat.popen_group_kwargs())
     except OSError as exc:
         raise RuntimeError(_redact_runtime_text(str(exc))) from exc
     capture = _BoundedCapture()
@@ -1303,13 +1289,13 @@ def _run_bash_direct(argv, *, cwd, timeout):
                 remaining = max(
                     0.0, (drain_deadline or time.monotonic())
                     - time.monotonic())
-            ready, _, _ = select.select(
-                [pipe.fileno()], [], [], min(0.1, max(0.0, remaining)))
+            ready = wincompat.wait_pipe_readable(
+                pipe.fileno(), min(0.1, max(0.0, remaining)))
             if not ready:
                 if timed_out and process.poll() is not None:
                     # A killed descendant can take a moment to close its pipe.
-                    ready, _, _ = select.select(
-                        [pipe.fileno()], [], [], 0.1)
+                    ready = wincompat.wait_pipe_readable(
+                        pipe.fileno(), 0.1)
                     if not ready:
                         break
                 continue
@@ -1598,7 +1584,7 @@ def t_grep(pattern, path=".", glob=None, ignore_case=False, max_results=100,
     # 全树 grep 要二十多分钟。这不是能靠调参解决的，只能「早停 + 说实话」。
     proc = subprocess.Popen(
         cmd, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
-        start_new_session=bool(_task))
+        **wincompat.popen_group_kwargs(bool(_task)))
     if _task is not None:
         _task.bind_process(proc, managed_output=False)
     fd = proc.stdout.fileno()
@@ -1644,8 +1630,8 @@ def t_grep(pattern, path=".", glob=None, ignore_case=False, max_results=100,
                 if _task is not None:
                     _task.request_timeout()
                 break
-            ready, _, _ = select.select([
-                fd], [], [], min(0.05 if _task is not None else 0.5, left))
+            ready = wincompat.wait_pipe_readable(
+                fd, min(0.05 if _task is not None else 0.5, left))
             if ready:
                 chunk = os.read(fd, 1 << 16)
                 if not chunk:

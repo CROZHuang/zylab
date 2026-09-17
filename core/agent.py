@@ -116,6 +116,9 @@ SYSTEM = """你是 zylab，一个跑在终端里的软件工程助理。你通�
 - 改代码前先读懂周围的代码，风格、命名、注释密度都跟着现有文件走。
 - 改完要验证：跑测试、跑 --help、做 import 检查。没验证过就不要说「已完成」。
 - 失败要说出来，带上真实输出。不要把跑不通说成跑通了。
+- 模型工作中收到用户新输入（steer 转向）时：若当前问题已有调查结果但尚未给出
+  最终回答，**先完成该回答再转向新任务**；调查数据刚被压缩成摘要时，基于摘要作答，
+  不要重查。用户的问题一个都不能被冲掉。
 - 理解/调研/评估类请求（"熟悉代码""看看结构""评价一下"）是只读的：不改任何文件、
   不改配置。中途发现环境或配置问题，先报告并给出修法，由用户决定，不自行修。
 - zylab 自己的状态目录（.zylab-home：settings/sessions/keys/workflows）不是工作对象；
@@ -419,6 +422,32 @@ def Path_up(start):
         if parent == p:
             return seen
         p = parent
+
+
+def _repair_truncated_calls(calls):
+    """把流式截断产生的残缺 tool arguments 替换为合法占位 JSON。
+
+    DeepSeek 流式分片偶发截断（09-17 实测：HTTP 400 Unterminated string,
+    line 1 column 13）。本地校验（json.loads）已拒绝执行，但这条 assistant
+    消息会随下轮请求原样回传服务端——服务端解析到坏字符串直接 400，
+    整个工具循环卡死。这里在回传前修复：解析失败的 arguments 换成
+    {"_truncated": "<原始前 120 字符>"}，历史可追溯、JSON 合法，
+    模型看到占位会自行重发调用。
+    """
+    import json as _json
+    repaired = []
+    for call in calls:
+        call = dict(call)
+        raw_args = str(call.get("function", {}).get("arguments") or "")
+        try:
+            _json.loads(raw_args)
+        except (ValueError, TypeError):
+            fn = dict(call.get("function") or {})
+            fn["arguments"] = _json.dumps(
+                {"_truncated": raw_args[:120]}, ensure_ascii=False)
+            call["function"] = fn
+        repaired.append(call)
+    return repaired
 
 
 def _turn_indices(max_turns):
@@ -1901,7 +1930,13 @@ class Agent:
 
             message = {"role": "assistant", "content": text}
             if calls:
-                message["tool_calls"] = calls
+                # 残缺 arguments 修复：流式分片截断会拼出未闭合 JSON
+                # （实测 DeepSeek 09-17：HTTP 400 Unterminated string）。
+                # 本地校验会拒绝执行，但这条 assistant 消息仍会随下轮
+                # 请求回传服务端——服务端解析坏 arguments 直接 400，
+                # 整个会话卡死。回传前把坏 arguments 替换为合法占位，
+                # 模型看到占位会自行重试调用。
+                message["tool_calls"] = _repair_truncated_calls(calls)
             action = controller.complete_response(
                 message, tool_calls=calls, usage=usage, reason=reason)
             self.messages.append(message)

@@ -842,7 +842,8 @@ class BashTaskTests(unittest.TestCase):
 
     def test_selector_register_failure_kills_reaps_and_unbinds(self):
         real_popen = tasks.subprocess.Popen
-        real_selector = tasks.selectors.DefaultSelector()
+        from core import wincompat as _wc
+        real_selector = _wc.DefaultSelector()
         failing_selector = mock.Mock(wraps=real_selector)
         failing_selector.register.side_effect = OSError(
             "selector register failed")
@@ -860,7 +861,7 @@ class BashTaskTests(unittest.TestCase):
             with mock.patch(
                     "core.tasks.subprocess.Popen",
                     side_effect=capture_popen), mock.patch(
-                    "core.tasks.selectors.DefaultSelector",
+                    "core.wincompat.DefaultSelector",
                     return_value=failing_selector):
                 terminal = list(manager.run(
                     "bash",

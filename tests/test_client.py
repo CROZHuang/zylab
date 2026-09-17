@@ -868,3 +868,67 @@ class TestIsolationFromRealCredentials(unittest.TestCase):
         """环境变量优先于文件，所以本机的 keys.env 根本轮不到被读。"""
         self.assertEqual(client.api_key(client.route_for("boyue")),
                          "fictional-test-key")
+
+
+class DSMLLeakFilterTests(unittest.TestCase):
+    """DeepSeek 偶发把 tool-call 语法写进 content 通道（<｜DSML｜tool_calls>）。
+
+    流式过滤必须做到：
+    1. 标记被 chunk 边界劈开时也能剥干净；
+    2. 剥掉的块里若有合法 tool call JSON，回收成真正的 tool 事件；
+    3. 正文其他内容原样保留。
+    """
+
+    def _events(self, lines):
+        with mock.patch.object(client._OPENER, "open",
+                               return_value=FakeResponse(lines)):
+            return list(client.stream_chat(
+                "deepseek-v4-pro", [{"role": "user", "content": "x"}]))
+
+    def test_dsml_leak_split_across_chunks_is_stripped(self):
+        leak = ('<｜DSML｜tool_calls>\n'
+                '<｜DSML｜invoke name="bash">\n'
+                '<｜DSML｜parameter name="arguments" string="false">'
+                '{"command": "ls"}\n'
+                '</｜DSML｜parameter>\n'
+                '</｜DSML｜invoke>\n'
+                '</｜DSML｜tool_calls>')
+        events = self._events([
+            sse(chunk(content="答案前半")),
+            sse(chunk(content=leak[:20])),
+            sse(chunk(content=leak[20:])),
+            sse(chunk(content="答案后半")),
+            sse({"choices": [{"delta": {}, "finish_reason": "stop"}]}),
+            "data: [DONE]\n",
+        ])
+        text = "".join(e["v"] for e in events if e["t"] == "text")
+        self.assertIn("答案前半", text)
+        self.assertIn("答案后半", text)
+        self.assertNotIn("DSML", text)
+        self.assertNotIn("tool_calls", text)
+
+    def test_dsml_leak_tool_call_is_recovered(self):
+        leak = ('<｜DSML｜tool_calls>\n'
+                '<｜DSML｜invoke name="bash">\n'
+                '<｜DSML｜parameter name="arguments" string="false">'
+                '{"command": "ls"}\n'
+                '</｜DSML｜parameter>\n'
+                '</｜DSML｜invoke>\n'
+                '</｜DSML｜tool_calls>')
+        events = self._events([
+            sse(chunk(content=leak)),
+            sse({"choices": [{"delta": {}, "finish_reason": "stop"}]}),
+            "data: [DONE]\n",
+        ])
+        tools = [e for e in events if e["t"] == "tool"]
+        self.assertEqual(len(tools), 1)
+        self.assertEqual(tools[0]["v"][0]["function"]["name"], "bash")
+
+    def test_plain_text_untouched(self):
+        events = self._events([
+            sse(chunk(content="普通正文，没有泄漏")),
+            sse({"choices": [{"delta": {}, "finish_reason": "stop"}]}),
+            "data: [DONE]\n",
+        ])
+        text = "".join(e["v"] for e in events if e["t"] == "text")
+        self.assertEqual(text, "普通正文，没有泄漏")

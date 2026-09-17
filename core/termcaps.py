@@ -8,12 +8,11 @@
 """
 import json
 import os
-import select
 import sys
-import termios
 import time
-import tty
 from dataclasses import asdict, dataclass
+
+from . import wincompat
 
 ESC = "\x1b"
 BUDGET_SECONDS = 0.15
@@ -93,16 +92,14 @@ class _Query:
         self.saved = None
 
     def __enter__(self):
-        self.saved = termios.tcgetattr(self.fd)
-        tty.setcbreak(self.fd)
-        attrs = termios.tcgetattr(self.fd)
-        attrs[3] &= ~termios.ECHO
-        termios.tcsetattr(self.fd, termios.TCSANOW, attrs)
+        # Windows 无 termios；探测查询在无终端能力的平台上不会得到应答，
+        # raw 上下文仍要成对进出（_Win32Raw 是 no-op 保持行为一致）。
+        self._ctx = wincompat.raw_mode(self.fd, cbreak=True)
+        self._ctx.__enter__()
         return self
 
     def __exit__(self, *exc):
-        if self.saved is not None:
-            termios.tcsetattr(self.fd, termios.TCSANOW, self.saved)
+        self._ctx.__exit__(*exc)
         return False
 
     def ask(self, seq, until, timeout):
@@ -114,10 +111,13 @@ class _Query:
             left = deadline - time.monotonic()
             if left <= 0:
                 break
-            r, _, _ = select.select([self.fd], [], [], left)
+            r = wincompat.wait_fd(self.fd, left)
             if not r:
                 break
-            chunk = os.read(self.fd, 512)
+            if wincompat.IS_WINDOWS:
+                chunk = wincompat.read_console(512, 0.05)
+            else:
+                chunk = os.read(self.fd, 512)
             if not chunk:
                 break
             buf += chunk
@@ -190,7 +190,7 @@ def probe(*, stream_in=None, stream_out=None, environ=None, budget=BUDGET_SECOND
             fields["osc52_write"] = (b"]52;" in clip) or known
             # 把没读完的应答残渣清掉，免得漏进输入
             q.ask("", b"\x00", 0.02)
-    except (OSError, termios.error):
+    except (OSError, wincompat.termios_error()):
         return TermCaps(tty=True, truecolor=truecolor, cols=cols, rows=rows)
     return TermCaps(**fields)
 

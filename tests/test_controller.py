@@ -128,7 +128,13 @@ class ControllerCase(unittest.TestCase):
             for row in self.db.get_events("s1")
             if row["kind"] == "user_message"
         ]
-        self.assertEqual(user_texts, ["first", "adjust", "later"])
+        # steer 落盘带收尾前缀（09-16 契约：转向不能冲掉未答完的问题），
+        # next_turn 原文透传。
+        self.assertEqual(len(user_texts), 3)
+        self.assertEqual(user_texts[0], "first")
+        self.assertTrue(user_texts[1].startswith("[steer：用户在你工作时发来新输入"))
+        self.assertTrue(user_texts[1].endswith("adjust"))
+        self.assertEqual(user_texts[2], "later")
 
     def test_retrieve_cancels_latest_undispatched_item(self):
         self.ctrl.submit("first")

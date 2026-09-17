@@ -746,6 +746,10 @@ class Session:
         # 会让同一 turn 跨模型或跨网关，破坏上下文与审计边界。
         self._pending_route = None
         self.always = set()             # 本次会话内已批准的工具
+        # UNSANDBOXED Bash 的会话级放行：用户在本次会话内选过 "always" 后，
+        # 后续同会话的 unsandboxed bash 不再逐条弹窗（仍走 approve_unsandboxed
+        # 绑定、仍受 protected 路径硬守卫约束）。不持久化、不跨会话。
+        self._unsandboxed_session_approved = False
         self.plan_mode = False          # plan mode：只读探索
         # SPEC-CC-parity B1：Shift+Tab 循环 default → accept-edits → plan。
         # accept-edits = write_file/edit_file 免确认，bash 等一切照旧问；/auto 仍是独立
@@ -4198,6 +4202,25 @@ class Session:
                 "source": "sandbox_policy",
             }
 
+        # 会话级放行：本次会话内已选过 "always" 的，直接绑定 approval，不再弹窗。
+        # 仍调用 approve_unsandboxed() 把确认绑到本次 prepared args（沙箱证据、
+        # protected 路径硬守卫照常生效），只是省掉交互。
+        if getattr(self, "_unsandboxed_session_approved", False):
+            try:
+                approved = args.approve_unsandboxed()
+            except Exception as exc:
+                print(RED(f"  ✗ 无法绑定 unsandboxed approval：{exc}"))
+                return {
+                    "allowed": False,
+                    "decision": "unsandboxed_approval_failed",
+                    "source": "sandbox_policy",
+                }
+            result["prepared"] = approved
+            result["sandbox"] = approved.sandbox_evidence()
+            result["decision"] = str(result.get("decision") or "once") + \
+                "+unsandboxed_always"
+            return result
+
         evidence = args.sandbox_evidence() or {}
         reason = str(evidence.get("reason") or "sandbox runtime 不可用")
         if self.renderer:
@@ -4209,13 +4232,14 @@ class Session:
             "  受保护路径硬守卫仍会执行，但复杂 shell 不再有 OS 只读边界。"))
         options = [
             ("once", "仅这一次以 UNSANDBOXED 运行"),
+            ("always", "本次会话内 UNSANDBOXED 都允许"),
             ("deny", "取消（推荐）"),
         ]
         picked = self.pick(
-            options, page=2, allow_filter=False,
+            options, page=3, allow_filter=False,
             render=lambda option: option[1])
         choice = picked[0] if picked else "deny"
-        if choice != "once":
+        if choice == "deny":
             print(DIM("  ✗ 已取消 UNSANDBOXED Bash"))
             return {
                 "allowed": False,
@@ -4233,9 +4257,16 @@ class Session:
             }
         result["prepared"] = approved
         result["sandbox"] = approved.sandbox_evidence()
-        result["decision"] = str(result.get("decision") or "once") + \
-            "+unsandboxed_once"
-        print(YELLOW("  ! 本次将明确以 UNSANDBOXED 运行"))
+        if choice == "always":
+            self._unsandboxed_session_approved = True
+            result["decision"] = str(result.get("decision") or "once") + \
+                "+unsandboxed_always"
+            print(YELLOW("  ✓ 本次会话内 UNSANDBOXED Bash 不再逐条询问"
+                         "（protected 路径硬守卫仍生效）"))
+        else:
+            result["decision"] = str(result.get("decision") or "once") + \
+                "+unsandboxed_once"
+            print(YELLOW("  ! 本次将明确以 UNSANDBOXED 运行"))
         return result
 
     def _authorize_memory_risk(self, name, args):

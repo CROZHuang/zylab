@@ -8,7 +8,16 @@ while stdout remains exactly one small JSON envelope for the parent to parse.
 from __future__ import annotations
 
 import contextlib
-import fcntl
+import sys
+from pathlib import Path
+# graft_worker 被当独立脚本启动（Popen [python, graft_worker.py, ...]），
+# 没有 parent package，相对导入会 ImportError。双模式导入：包内相对、
+# 脚本直跑时把 repo root（core/ 的父目录）补进 sys.path 再绝对导入。
+try:
+    from . import wincompat
+except ImportError:                       # 脚本模式
+    sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+    from core import wincompat
 import json
 import os
 import re
@@ -52,7 +61,7 @@ def _graph_lock(graph: str, *, deadline: float):
         info = directory.stat()
     except OSError as exc:
         raise WorkerError(f"无法检查 Graft cache：{directory}") from exc
-    if (not directory.is_dir() or info.st_uid != os.geteuid()
+    if (not directory.is_dir() or info.st_uid != wincompat.geteuid()
             or info.st_mode & (stat.S_IRWXG | stat.S_IRWXO)):
         raise WorkerError(f"Graft cache 不是当前用户私有目录：{directory}")
     lock_path = directory / ".zylab-hosted.lock"
@@ -66,20 +75,20 @@ def _graph_lock(graph: str, *, deadline: float):
     try:
         lock_info = os.fstat(descriptor)
         if (not stat.S_ISREG(lock_info.st_mode)
-                or lock_info.st_uid != os.geteuid()
+                or lock_info.st_uid != wincompat.geteuid()
                 or lock_info.st_mode & (stat.S_IRWXG | stat.S_IRWXO)):
             raise WorkerError(f"Graft cache 锁不可信：{lock_path}")
         while True:
-            try:
-                fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            # wincompat.flock 的契约：竞争失败返回 False（不抛异常）。
+            if wincompat.flock(
+                    descriptor, wincompat.LOCK_EX | wincompat.LOCK_NB):
                 break
-            except BlockingIOError:
-                remaining = _remaining(deadline)
-                time.sleep(min(0.05, remaining))
+            remaining = _remaining(deadline)
+            time.sleep(min(0.05, remaining))
         try:
             yield
         finally:
-            fcntl.flock(descriptor, fcntl.LOCK_UN)
+            wincompat.flock(descriptor, wincompat.LOCK_UN)
     finally:
         os.close(descriptor)
 

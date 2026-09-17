@@ -20,18 +20,16 @@ from dataclasses import dataclass, replace as dataclass_replace
 import os
 import queue
 import re
-import select as _select
 import shutil
 import subprocess
 import sys
-import termios
 import threading
 import time
 import unicodedata
-import tty
 from urllib.parse import urlsplit
 
 from . import goals
+from . import wincompat
 
 # ---- 转义序列 → 键名。终端把方向键等发成多字节序列，必须解码后才能用。
 KEYS = {
@@ -289,24 +287,21 @@ class raw_mode:
         self.capture_signals = capture_signals
 
     def __enter__(self):
-        self.saved = termios.tcgetattr(self.fd)
-        if self.cbreak:
-            tty.setcbreak(self.fd)
-            if self.capture_signals:
-                attrs = termios.tcgetattr(self.fd)
-                attrs[3] &= ~termios.ISIG
-                termios.tcsetattr(self.fd, termios.TCSANOW, attrs)
-        else:
-            tty.setraw(self.fd)
+        self._ctx = wincompat.raw_mode(
+            self.fd, cbreak=self.cbreak,
+            capture_signals=self.capture_signals)
+        self._ctx.__enter__()
         self._set_bracketed_paste(True)
         return self
 
     def __exit__(self, *a):
-        # 先关粘贴模式再还原 termios：顺序反了的话写入会经过已恢复的行规程，
+        # 先关粘贴模式再还原终端模式：顺序反了的话写入会经过已恢复的行规程，
         # 可能被回显出来。
         self._set_bracketed_paste(False)
-        if self.saved is not None:
-            termios.tcsetattr(self.fd, termios.TCSADRAIN, self.saved)
+        ctx = getattr(self, "_ctx", None)
+        if ctx is not None:
+            ctx.__exit__(*a)
+            self._ctx = None
 
     # raw_mode 在本文件里有四个使用点（InputPump、Terminal、以及 read_line 内
     # 的两处），它们**会嵌套**。若按进出各发一次开关，内层退出就会把外层还需要
@@ -359,8 +354,14 @@ def _raw_read(n=1, timeout=None, stream=None):
     """
     source = stream or sys.stdin
     fd = source.fileno()
+    if wincompat.IS_WINDOWS:
+        # Windows 控制台不能 os.read（见 wincompat.read_console 文档）。
+        raw = wincompat.read_console(n, timeout)
+        if not raw:
+            return ""
+        return raw.decode("utf-8", "replace")
     if timeout is not None:
-        if not _select.select([fd], [], [], timeout)[0]:
+        if not wincompat.wait_fd(fd, timeout):
             return ""
     try:
         raw = os.read(fd, n)
@@ -382,8 +383,10 @@ def _raw_read(n=1, timeout=None, stream=None):
 
 def _blocking_read(n, timeout=0.05, stream=None):
     """补读多字节字符的后续字节。同一个按键的字节几乎总是一起到达。"""
+    if wincompat.IS_WINDOWS:
+        return wincompat.read_console(n, timeout)   # bytes
     fd = (stream or sys.stdin).fileno()
-    if not _select.select([fd], [], [], timeout)[0]:
+    if not wincompat.wait_fd(fd, timeout):
         return b""
     try:
         return os.read(fd, n)

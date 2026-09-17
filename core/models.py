@@ -24,7 +24,7 @@ import hashlib
 import json
 import re
 import os
-import fcntl
+from . import wincompat
 import tempfile
 import time
 import uuid
@@ -393,11 +393,11 @@ def _cache_lock():
         flags |= os.O_NOFOLLOW
     fd = os.open(lock_path, flags, 0o600)
     try:
-        os.fchmod(fd, 0o600)
-        fcntl.flock(fd, fcntl.LOCK_EX)
+        wincompat.fchmod(fd, 0o600)
+        wincompat.flock(fd, wincompat.LOCK_EX)
         yield
     finally:
-        fcntl.flock(fd, fcntl.LOCK_UN)
+        wincompat.flock(fd, wincompat.LOCK_UN)
         os.close(fd)
 
 
@@ -406,7 +406,7 @@ def _write_unlocked(db):
     fd, tmp_name = tempfile.mkstemp(
         prefix=f".{CACHE.name}.", suffix=".tmp", dir=CACHE.parent)
     try:
-        os.fchmod(fd, 0o600)
+        wincompat.fchmod(fd, 0o600)
         handle = os.fdopen(fd, "w", encoding="utf-8")
         fd = -1
         with handle:

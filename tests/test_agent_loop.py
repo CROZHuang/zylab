@@ -818,7 +818,8 @@ class ManagedController(unittest.TestCase):
             else:
                 self.assertEqual(
                     [m["content"] for m in messages if m["role"] == "user"][-2:],
-                    ["go", "adjust"])
+                    ["go", "[steer：用户在你工作时发来新输入。若上一个问题已有调查结果"
+                           "但还没给出最终回答，先完成那个回答再转向新任务。]\n\nadjust"])
                 yield {"t": "text", "v": "done"}
             yield {"t": "done", "reason": "stop", "usage": {}}
 
@@ -893,7 +894,9 @@ class ManagedController(unittest.TestCase):
                 yield {"t": "poll"}
                 yield {"t": "text", "v": "first"}
             else:
-                self.assertEqual(messages[-1]["content"], "adjust")
+                self.assertEqual(messages[-1]["content"],
+                                 "[steer：用户在你工作时发来新输入。若上一个问题已有调查结果"
+                                 "但还没给出最终回答，先完成那个回答再转向新任务。]\n\nadjust")
                 yield {"t": "text", "v": "second"}
             yield {"t": "done", "reason": "stop", "usage": {}}
 
@@ -910,7 +913,8 @@ class ManagedController(unittest.TestCase):
         self.assertEqual(
             [message["content"] for message in ag.messages
              if message["role"] == "user"],
-            ["go", "adjust"])
+            ["go", "[steer：用户在你工作时发来新输入。若上一个问题已有调查结果"
+                   "但还没给出最终回答，先完成那个回答再转向新任务。]\n\nadjust"])
         self.assertEqual(
             [event["kind"] for event in journal.events].count(
                 "turn_completed"), 1)
@@ -1000,7 +1004,8 @@ class ManagedController(unittest.TestCase):
         self.assertEqual(
             [message["content"] for message in ag.messages
              if message["role"] == "user"],
-            ["go", "adjust"])
+            ["go", "[steer：用户在你工作时发来新输入。若上一个问题已有调查结果"
+                   "但还没给出最终回答，先完成那个回答再转向新任务。]\n\nadjust"])
         self.assertEqual(controller.state, C.ControllerState.IDLE)
         self.assertEqual(
             [event["kind"] for event in journal.events].count(

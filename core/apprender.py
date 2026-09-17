@@ -13,6 +13,8 @@ import io
 import os
 import signal
 import sys
+
+from . import wincompat
 import threading
 import time
 
@@ -74,9 +76,10 @@ class AppRenderer:
         self._entered = True
         self._painter.reset()
         # 窗口缩放即时重排：信号处理器在主线程的字节码之间运行，pump.get() 的等待会被打断后重试。
-        if threading.get_ident() == threading.main_thread().ident:
+        if (threading.get_ident() == threading.main_thread().ident
+                and wincompat.WINCH_SIGNAL is not None):
             try:
-                self._prev_winch = signal.signal(signal.SIGWINCH, self._on_winch)
+                self._prev_winch = signal.signal(wincompat.WINCH_SIGNAL, self._on_winch)
             except (ValueError, OSError):
                 self._prev_winch = None
 
@@ -85,7 +88,7 @@ class AppRenderer:
             return
         if self._prev_winch is not None:
             try:
-                signal.signal(signal.SIGWINCH, self._prev_winch)
+                signal.signal(wincompat.WINCH_SIGNAL, self._prev_winch)
             except (ValueError, OSError):
                 pass
             self._prev_winch = None

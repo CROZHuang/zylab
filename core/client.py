@@ -630,6 +630,53 @@ class _PhaseChain:
             sink.mark(phase, attempt)
 
 
+# DeepSeek 偶发把 tool-call 语法写进 content 通道（实测 09-16 会话）。
+# 标记形如 <｜DSML｜tool_calls>…</｜DSML｜tool_calls>；GLM 走结构化
+# tool_calls 字段，从不泄漏。只对已知泄漏的模型族启用缓冲过滤，
+# 其他模型零开销直通。
+_DSML_TOOL_CALL_RE = re.compile(
+    r"<｜DSML｜tool_calls>.*?</｜DSML｜tool_calls>", re.DOTALL)
+_DSML_OPEN_RE = re.compile(r"<｜DSML｜tool_calls>")
+
+
+def dsml_may_leak(route, model):
+    """是否对该模型启用 DSML 泄漏过滤。保守起见只认 deepseek 族。"""
+    return "deepseek" in str(model or "").lower()
+
+
+def _strip_dsml_tool_calls(text):
+    """剥掉 DSML tool_calls 块；尝试回收里面的合法 tool call。
+
+    返回 (剩余正文, 回收出的 calls)。回收失败（JSON 不合法）时整块
+    丢弃——宁可丢一次调用也不能把语法泄漏给用户。
+    """
+    calls = []
+    for match in _DSML_TOOL_CALL_RE.finditer(text):
+        block = match.group(0)
+        for invoke in re.finditer(
+                r'<｜DSML｜invoke name="([^"]+)">(.*?)</｜DSML｜invoke>',
+                block, re.DOTALL):
+            name, body = invoke.group(1), invoke.group(2)
+            arg_match = re.search(
+                r'<｜DSML｜parameter name="arguments"[^>]*>(.*?)'
+                r'</｜DSML｜parameter>', body, re.DOTALL)
+            if not arg_match:
+                continue
+            try:
+                args = json.loads(arg_match.group(1))
+            except (ValueError, TypeError):
+                continue
+            calls.append({
+                "id": f"dsml-{len(calls)}",
+                "type": "function",
+                "function": {
+                    "name": name,
+                    "arguments": json.dumps(args, ensure_ascii=False),
+                },
+            })
+    return _DSML_TOOL_CALL_RE.sub("", text), calls
+
+
 def stream_chat_background(*args, poll_interval=0.025, queue_size=256,
                            **kwargs):
     """主线程可轮询的 ``stream_chat`` 适配器。
@@ -1308,6 +1355,51 @@ def _stream_once(model, messages, tools=None, max_tokens=8192, temperature=0.3,
                  "Content-Type": "application/json", "Accept": "text/event-stream"})
 
     acc = {}          # index -> {id, name, args}
+    # DeepSeek 偶发把 tool-call 语法（<｜DSML｜tool_calls>…）写进 content 通道。
+    # 过滤必须在累积缓冲上做：标记可能被 chunk 边界劈开，单 chunk 过滤会漏。
+    # 缓冲策略：正文先攒着，确认不含未闭合标记才放行；流结束时丢弃残余。
+    dsml_buf = ""
+    dsml_active = False
+
+    def _flush_dsml_buffer():
+        """把缓冲里确认干净的正文放行；返回 (text, recovered_tool_calls)。"""
+        nonlocal dsml_buf, dsml_active
+        text, dsml_buf = dsml_buf, ""
+        calls = []
+        if not dsml_active and _DSML_OPEN_RE.search(text):
+            # 有未闭合标记：只放行标记起点之前的安全前缀
+            safe = text.find("<｜DSML｜")
+            if safe > 0:
+                dsml_buf = text[safe:]
+                text = text[:safe]
+            else:
+                dsml_buf = text
+                text = ""
+            dsml_active = True
+        elif dsml_active:
+            # 上一轮扣住的半截标记，这轮拼上再看
+            if "</｜DSML｜tool_calls>" in text:
+                stripped, recovered = _strip_dsml_tool_calls(text)
+                calls = recovered
+                text = stripped
+                dsml_active = False
+            else:
+                # 还没闭合：继续扣住，不放行
+                dsml_buf = text
+                text = ""
+        else:
+            # 无未闭合标记：尾部可能有半截 '<'，先扣住
+            tail = text.rfind("<")
+            if tail >= 0:
+                dsml_buf = text[tail:]
+                text = text[:tail]
+        if dsml_buf and not dsml_active:
+            stripped, recovered = _strip_dsml_tool_calls(dsml_buf)
+            calls = recovered
+            if stripped:
+                text += stripped
+            dsml_buf = ""
+        return text, calls
     usage = {}
     reason = None
     terminal = False
@@ -1377,7 +1469,15 @@ def _stream_once(model, messages, tools=None, max_tokens=8192, temperature=0.3,
                     if d.get("reasoning_content"):
                         yield {"t": "reasoning", "v": d["reasoning_content"]}
                     if d.get("content"):
-                        yield {"t": "text", "v": d["content"]}
+                        if dsml_may_leak(route, model):
+                            dsml_buf += d["content"]
+                            safe_text, recovered = _flush_dsml_buffer()
+                            if safe_text:
+                                yield {"t": "text", "v": safe_text}
+                            for call in recovered:
+                                yield {"t": "tool", "v": [call]}
+                        else:
+                            yield {"t": "text", "v": d["content"]}
                     for tc in d.get("tool_calls") or []:
                         i = tc.get("index", 0)
                         slot = acc.setdefault(
@@ -1405,6 +1505,13 @@ def _stream_once(model, messages, tools=None, max_tokens=8192, temperature=0.3,
         if callable(releaser):
             releaser(resp)
         _mark_phase(phases, "ended", attempt)
+    # 流结束：把 DSML 缓冲里扣住的残余正文放行（含未闭合标记时丢弃残余）。
+    if dsml_may_leak(route, model) and dsml_buf:
+        tail_text, tail_calls = _flush_dsml_buffer()
+        if tail_text:
+            yield {"t": "text", "v": tail_text}
+        for recovered in tail_calls:
+            yield {"t": "tool", "v": [recovered]}
 
     if not terminal:
         if _cancelled(cancel):

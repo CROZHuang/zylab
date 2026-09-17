@@ -12,8 +12,8 @@
                        派生物，删了能重算。
 """
 from . import paths
+from . import wincompat
 import atexit
-import fcntl
 import json
 import os
 import re
@@ -140,18 +140,24 @@ def _exclusive_file_lock(target):
         flags |= os.O_NOFOLLOW
     fd = os.open(lock_path, flags, 0o600)
     try:
-        os.fchmod(fd, 0o600)
-        fcntl.flock(fd, fcntl.LOCK_EX)
+        wincompat.fchmod(fd, 0o600)
+        wincompat.flock(fd, wincompat.LOCK_EX)
         yield
     finally:
         try:
-            fcntl.flock(fd, fcntl.LOCK_UN)
+            wincompat.flock(fd, wincompat.LOCK_UN)
         finally:
             os.close(fd)
 
 
 def _fsync_directory(path):
     """Persist directory-entry changes or raise when durability is unavailable."""
+    if wincompat.IS_WINDOWS:
+        # Windows 没有目录 fsync 的对应物；NTFS 元数据日志已保证 rename 的持久
+        # 顺序足够强（FlushFileBuffers 语义由 os.replace 内部的
+        # MoveFileEx(REPLACE_EXISTING) 近似）。接受弱化：崩溃后丢最后一次
+        # rename 的概率与 POSIX 不同，但 marker/canonical 双写顺序仍成立。
+        return
     flags = os.O_RDONLY
     if hasattr(os, "O_CLOEXEC"):
         flags |= os.O_CLOEXEC
@@ -172,7 +178,7 @@ def _atomic_write_text(path, text):
         prefix=f".{path.name}.", suffix=".tmp", dir=path.parent, text=True)
     tmp = Path(tmp_name)
     try:
-        os.fchmod(fd, 0o600)
+        wincompat.fchmod(fd, 0o600)
         stream = os.fdopen(fd, "w", encoding="utf-8")
         fd = -1
         with stream:

@@ -13,7 +13,7 @@ from . import paths
 
 import difflib
 import errno
-import fcntl
+from . import wincompat
 import hashlib
 import json
 import os
@@ -200,16 +200,16 @@ def _read_regular_once(path: str, first_lstat: os.stat_result) -> tuple[bytes, o
     except OSError as exc:
         raise UnsafePathError(f"无法安全打开目标文件: {path}: {exc}") from exc
     try:
-        before = os.fstat(fd)
+        before = wincompat.fstat(fd)
         if (before.st_dev, before.st_ino) != (first_lstat.st_dev, first_lstat.st_ino):
             raise ExternalChangeError(f"读取前目标身份已变化: {path}")
         chunks: list[bytes] = []
         while True:
-            chunk = os.read(fd, 1024 * 1024)
+            chunk = wincompat.read(fd, 1024 * 1024)
             if not chunk:
                 break
             chunks.append(chunk)
-        after = os.fstat(fd)
+        after = wincompat.fstat(fd)
         if (before.st_dev, before.st_ino, before.st_size, before.st_mtime_ns) != (
                 after.st_dev, after.st_ino, after.st_size, after.st_mtime_ns):
             raise ExternalChangeError(f"读取期间目标文件发生变化: {path}")
@@ -568,6 +568,8 @@ def _assert_parent_identity(identity: PathIdentity) -> None:
 def _open_stable_parent(identity: PathIdentity) -> int:
     """Open the approved parent without following a swapped pathname."""
     parent = os.path.dirname(identity.canonical_path)
+    if wincompat.IS_WINDOWS:
+        return wincompat.fd_open_dir(parent)
     flags = (os.O_RDONLY | getattr(os, "O_CLOEXEC", 0)
              | getattr(os, "O_DIRECTORY", 0)
              | getattr(os, "O_NOFOLLOW", 0))
@@ -577,7 +579,7 @@ def _open_stable_parent(identity: PathIdentity) -> int:
         raise ExternalChangeError(
             f"无法安全打开目标父目录: {parent}: {exc}") from exc
     try:
-        info = os.fstat(fd)
+        info = wincompat.fstat(fd)
         if (not stat.S_ISDIR(info.st_mode)
                 or (info.st_dev, info.st_ino) != (
                     identity.parent_device, identity.parent_inode)
@@ -594,23 +596,23 @@ def _read_regular_once_at(parent_fd: int, name: str,
     flags = (os.O_RDONLY | getattr(os, "O_CLOEXEC", 0)
              | getattr(os, "O_NOFOLLOW", 0))
     try:
-        fd = os.open(name, flags, dir_fd=parent_fd)
+        fd = wincompat.fd_open(parent_fd, name, flags)
     except OSError as exc:
         raise ExternalChangeError(
             f"无法安全重读目标文件 {name}: {exc}") from exc
     try:
-        before = os.fstat(fd)
+        before = wincompat.fstat(fd)
         if (not stat.S_ISREG(before.st_mode)
                 or (before.st_dev, before.st_ino) != (
                     first_stat.st_dev, first_stat.st_ino)):
             raise ExternalChangeError(f"目标文件身份已变化: {name}")
         chunks: list[bytes] = []
         while True:
-            chunk = os.read(fd, 1024 * 1024)
+            chunk = wincompat.read(fd, 1024 * 1024)
             if not chunk:
                 break
             chunks.append(chunk)
-        after = os.fstat(fd)
+        after = wincompat.fstat(fd)
         if (before.st_dev, before.st_ino, before.st_size,
                 before.st_mtime_ns) != (
                 after.st_dev, after.st_ino, after.st_size,
@@ -627,7 +629,7 @@ def _assert_entry_at(parent_fd: int, identity: PathIdentity, *,
     """CAS check one entry through a stable approved directory descriptor."""
     name = os.path.basename(identity.canonical_path)
     try:
-        current = os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
+        current = wincompat.fd_stat_nofollow(parent_fd, name)
     except FileNotFoundError:
         if expected_sha256 is None:
             return
@@ -680,11 +682,11 @@ def _atomic_replace_snapshot(identity: PathIdentity, *,
         flags = (os.O_WRONLY | os.O_CREAT | os.O_EXCL
                  | getattr(os, "O_CLOEXEC", 0)
                  | getattr(os, "O_NOFOLLOW", 0))
-        temp_fd = os.open(
-            temp_name, flags, replacement_mode, dir_fd=parent_fd)
+        temp_fd = wincompat.fd_open(
+            parent_fd, temp_name, flags, replacement_mode)
         created = True
-        os.fchmod(temp_fd, replacement_mode)
-        with os.fdopen(temp_fd, "wb", closefd=True) as handle:
+        wincompat.fchmod(temp_fd, replacement_mode)
+        with wincompat.fdopen(temp_fd, "wb", closefd=True) as handle:
             temp_fd = -1
             handle.write(replacement)
             handle.flush()
@@ -696,13 +698,11 @@ def _atomic_replace_snapshot(identity: PathIdentity, *,
             parent_fd, identity,
             expected_sha256=expected_sha256,
             expected_mode=expected_mode)
-        os.replace(
-            temp_name, name,
-            src_dir_fd=parent_fd, dst_dir_fd=parent_fd)
+        wincompat.fd_replace(parent_fd, temp_name, parent_fd, name)
         replaced = True
         created = False
-        os.fsync(parent_fd)
-        final = os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
+        wincompat.fsync(parent_fd)
+        final = wincompat.fd_stat_nofollow(parent_fd, name)
         data, _ = _read_regular_once_at(parent_fd, name, final)
         if _sha(data) != _sha(replacement):
             raise CheckpointError(
@@ -728,13 +728,13 @@ def _atomic_replace_snapshot(identity: PathIdentity, *,
             committed=replaced) from exc
     finally:
         if temp_fd >= 0:
-            os.close(temp_fd)
+            wincompat.close(temp_fd)
         if created:
             try:
-                os.unlink(temp_name, dir_fd=parent_fd)
+                wincompat.fd_unlink(parent_fd, temp_name)
             except FileNotFoundError:
                 pass
-        os.close(parent_fd)
+        wincompat.close(parent_fd)
 def assert_prepared_unchanged(prepared: PreparedWrite) -> None:
     """Recheck lstat/resolved identity and raw SHA against approval bytes."""
     _check_protected(prepared.canonical_path, prepared.protected_paths)
@@ -772,6 +772,12 @@ def assert_prepared_unchanged(prepared: PreparedWrite) -> None:
 
 
 def _fsync_dir(path: os.PathLike[str] | str) -> None:
+    # Windows 上目录条目的 fsync 无等价 API；NTFS 元数据日志已提供
+    # 崩溃后 rename 可见性的近似保证。这里只做存在性检查，不静默扩大语义。
+    if wincompat.IS_WINDOWS:
+        if not os.path.isdir(os.fspath(path)):
+            raise NotADirectoryError(str(path))
+        return
     flags = os.O_RDONLY
     if hasattr(os, "O_DIRECTORY"):
         flags |= os.O_DIRECTORY
@@ -790,6 +796,8 @@ def _open_verified_directory(path: Path) -> int:
         raise CheckpointError(f"无法检查目录 {path}: {exc}") from exc
     if stat.S_ISLNK(before.st_mode) or not stat.S_ISDIR(before.st_mode):
         raise CheckpointError(f"目录路径不安全: {path}")
+    if wincompat.IS_WINDOWS:
+        return wincompat.fd_open_dir(str(path))
     flags = (os.O_RDONLY | getattr(os, "O_CLOEXEC", 0)
              | getattr(os, "O_DIRECTORY", 0)
              | getattr(os, "O_NOFOLLOW", 0))
@@ -798,7 +806,7 @@ def _open_verified_directory(path: Path) -> int:
     except OSError as exc:
         raise CheckpointError(f"无法安全打开目录 {path}: {exc}") from exc
     try:
-        after = os.fstat(fd)
+        after = wincompat.fstat(fd)
         if (not stat.S_ISDIR(after.st_mode)
                 or (after.st_dev, after.st_ino) != (
                     before.st_dev, before.st_ino)):
@@ -823,7 +831,7 @@ def _capture_directory_anchor(path: Path,
     _check_protected(os.path.realpath(path), protected_paths)
     fd = _open_verified_directory(path)
     try:
-        info = os.fstat(fd)
+        info = wincompat.fstat(fd)
         return _DirectoryAnchor(
             path=path,
             resolved=os.path.realpath(path),
@@ -844,6 +852,8 @@ def _open_directory_anchor(anchor: _DirectoryAnchor,
     _check_protected(str(anchor.path), protected_paths)
     resolved = os.path.realpath(anchor.path)
     _check_protected(resolved, protected_paths)
+    if wincompat.IS_WINDOWS:
+        return wincompat.fd_open_dir(resolved)
     flags = (os.O_RDONLY | getattr(os, "O_CLOEXEC", 0)
              | getattr(os, "O_DIRECTORY", 0)
              | getattr(os, "O_NOFOLLOW", 0))
@@ -853,7 +863,7 @@ def _open_directory_anchor(anchor: _DirectoryAnchor,
         raise ManifestError(
             f"无法打开已锚定目录 {anchor.path}: {exc}") from exc
     try:
-        info = os.fstat(fd)
+        info = wincompat.fstat(fd)
         if (not stat.S_ISDIR(info.st_mode)
                 or (info.st_dev, info.st_ino) != (
                     anchor.device, anchor.inode)
@@ -871,16 +881,16 @@ def _read_private_at(directory_fd: int, name: str) -> bytes:
     flags = (os.O_RDONLY | getattr(os, "O_CLOEXEC", 0)
              | getattr(os, "O_NOFOLLOW", 0))
     try:
-        fd = os.open(name, flags, dir_fd=directory_fd)
+        fd = wincompat.fd_open(directory_fd, name, flags)
     except OSError as exc:
         raise ManifestError(f"无法安全读取私有文件 {name}: {exc}") from exc
     try:
-        info = os.fstat(fd)
+        info = wincompat.fstat(fd)
         if not stat.S_ISREG(info.st_mode):
             raise ManifestError(f"私有文件类型不安全: {name}")
         chunks: list[bytes] = []
         while True:
-            chunk = os.read(fd, 1024 * 1024)
+            chunk = wincompat.read(fd, 1024 * 1024)
             if not chunk:
                 break
             chunks.append(chunk)
@@ -894,7 +904,7 @@ def _atomic_private_at(directory_fd: int, name: str, data: bytes) -> None:
     if os.path.basename(name) != name or name in ("", ".", ".."):
         raise ManifestError(f"非法私有文件名: {name!r}")
     try:
-        current = os.stat(name, dir_fd=directory_fd, follow_symlinks=False)
+        current = wincompat.fd_stat_nofollow(directory_fd, name)
     except FileNotFoundError:
         current = None
     except OSError as exc:
@@ -908,19 +918,18 @@ def _atomic_private_at(directory_fd: int, name: str, data: bytes) -> None:
     fd = -1
     created = False
     try:
-        fd = os.open(temp_name, flags, 0o600, dir_fd=directory_fd)
+        fd = wincompat.fd_open(directory_fd, temp_name, flags, 0o600)
         created = True
-        os.fchmod(fd, 0o600)
-        with os.fdopen(fd, "wb", closefd=True) as handle:
+        wincompat.fchmod(fd, 0o600)
+        with wincompat.fdopen(fd, "wb", closefd=True) as handle:
             fd = -1
             handle.write(data)
             handle.flush()
-            os.fsync(handle.fileno())
-        os.replace(
-            temp_name, name,
-            src_dir_fd=directory_fd, dst_dir_fd=directory_fd)
+            handle.flush()
+            wincompat.fsync(handle.fileno())
+        wincompat.fd_replace(directory_fd, temp_name, directory_fd, name)
         created = False
-        os.fsync(directory_fd)
+        wincompat.fsync(directory_fd)
     except OSError as exc:
         raise ManifestError(f"无法持久化私有文件 {name}: {exc}") from exc
     finally:
@@ -928,7 +937,7 @@ def _atomic_private_at(directory_fd: int, name: str, data: bytes) -> None:
             os.close(fd)
         if created:
             try:
-                os.unlink(temp_name, dir_fd=directory_fd)
+                wincompat.fd_unlink(directory_fd, temp_name)
             except FileNotFoundError:
                 pass
 
@@ -1084,7 +1093,7 @@ def _atomic_private(path: Path, data: bytes) -> None:
     try:
         fd, temp_name = tempfile.mkstemp(prefix=".kcp-", suffix=".tmp",
                                          dir=path.parent)
-        os.fchmod(fd, 0o600)
+        wincompat.fchmod(fd, 0o600)
         with os.fdopen(fd, "wb", closefd=True) as handle:
             fd = -1
             handle.write(data)
@@ -1228,8 +1237,8 @@ class CheckpointStore:
         session_fd = -1
         try:
             try:
-                os.mkdir(name, 0o700, dir_fd=parent_fd)
-                os.fsync(parent_fd)
+                wincompat.fd_mkdir(parent_fd, name, 0o700)
+                wincompat.fsync(parent_fd)
             except FileExistsError:
                 pass
             except OSError as exc:
@@ -1239,19 +1248,19 @@ class CheckpointStore:
                      | getattr(os, "O_DIRECTORY", 0)
                      | getattr(os, "O_NOFOLLOW", 0))
             try:
-                session_fd = os.open(name, flags, dir_fd=parent_fd)
+                session_fd = wincompat.fd_open(parent_fd, name, flags)
             except OSError as exc:
                 raise ManifestError(
                     f"无法安全打开 checkpoint session 目录 {name}: {exc}") from exc
-            info = os.fstat(session_fd)
+            info = wincompat.fstat(session_fd)
             if not stat.S_ISDIR(info.st_mode):
                 raise ManifestError(
                     f"checkpoint session 不是目录: {name}")
-            os.fchmod(session_fd, 0o700)
+            wincompat.fchmod(session_fd, 0o700)
             yield session_fd
             # Detect a parent-entry replacement before reporting success.  All
             # writes above still targeted the pinned original directory.
-            current = os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
+            current = wincompat.fd_stat_nofollow(parent_fd, name)
             if (not stat.S_ISDIR(current.st_mode)
                     or (current.st_dev, current.st_ino) != (
                         info.st_dev, info.st_ino)):
@@ -1259,8 +1268,8 @@ class CheckpointStore:
                     f"checkpoint session 目录在操作期间被替换: {name}")
         finally:
             if session_fd >= 0:
-                os.close(session_fd)
-            os.close(parent_fd)
+                wincompat.close(session_fd)
+            wincompat.close(parent_fd)
 
     def _session_dir(self, session_id: str) -> Path:
         name = _validate_id(session_id, "session_id")
@@ -1283,23 +1292,23 @@ class CheckpointStore:
                  | getattr(os, "O_NOFOLLOW", 0))
         with self._session_directory(session_id) as directory_fd:
             try:
-                fd = os.open(
-                    lock_name, flags, 0o600, dir_fd=directory_fd)
+                fd = wincompat.fd_open(
+                    directory_fd, lock_name, flags, 0o600)
             except OSError as exc:
                 raise ManifestError(
                     f"无法安全 openat checkpoint lock {lock_name}: {exc}") from exc
             try:
-                info = os.fstat(fd)
+                info = wincompat.fstat(fd)
                 if (not stat.S_ISREG(info.st_mode) or info.st_nlink != 1
-                        or info.st_uid != os.geteuid()):
+                        or not wincompat.fd_owned_by_current_user(fd)):
                     raise ManifestError(
                         f"checkpoint lock 类型或 owner 不安全: {lock_name}")
-                os.fchmod(fd, 0o600)
-                fcntl.flock(fd, fcntl.LOCK_EX)
+                wincompat.fchmod(fd, 0o600)
+                wincompat.flock(fd, wincompat.LOCK_EX)
                 yield
             finally:
                 try:
-                    fcntl.flock(fd, fcntl.LOCK_UN)
+                    wincompat.flock(fd, wincompat.LOCK_UN)
                 finally:
                     os.close(fd)
 
@@ -1317,19 +1326,19 @@ class CheckpointStore:
                          | getattr(os, "O_CLOEXEC", 0)
                          | getattr(os, "O_NOFOLLOW", 0))
                 try:
-                    fd = os.open(
-                        lock_name, flags, 0o600, dir_fd=directory_fd)
+                    fd = wincompat.fd_open(
+                        directory_fd, lock_name, flags, 0o600)
                 except OSError as exc:
                     raise ManifestError(
                         f"无法安全 openat path lock {lock_name}: {exc}") from exc
                 try:
-                    info = os.fstat(fd)
+                    info = wincompat.fstat(fd)
                     if (not stat.S_ISREG(info.st_mode) or info.st_nlink != 1
-                            or info.st_uid != os.geteuid()):
+                            or not wincompat.fd_owned_by_current_user(fd)):
                         raise ManifestError(
                             f"path lock 类型或 owner 不安全: {lock_name}")
-                    os.fchmod(fd, 0o600)
-                    fcntl.flock(fd, fcntl.LOCK_EX)
+                    wincompat.fchmod(fd, 0o600)
+                    wincompat.flock(fd, wincompat.LOCK_EX)
                 except BaseException:
                     os.close(fd)
                     raise
@@ -1338,10 +1347,10 @@ class CheckpointStore:
         finally:
             for fd in reversed(descriptors):
                 try:
-                    fcntl.flock(fd, fcntl.LOCK_UN)
+                    wincompat.flock(fd, wincompat.LOCK_UN)
                 finally:
                     os.close(fd)
-            os.close(directory_fd)
+            wincompat.close(directory_fd)
 
     def _blob_path(self, digest: str) -> Path:
         if not _SHA256.fullmatch(str(digest)):
@@ -1752,7 +1761,7 @@ class CheckpointStore:
         try:
             _atomic_private_at(directory_fd, name, data)
         finally:
-            os.close(directory_fd)
+            wincompat.close(directory_fd)
         return self.restore_transactions_dir / name
 
     def _read_restore_transaction(self, transaction_id: str) -> dict[str, Any]:
@@ -1762,7 +1771,7 @@ class CheckpointStore:
         try:
             raw = _read_private_at(directory_fd, name)
         finally:
-            os.close(directory_fd)
+            wincompat.close(directory_fd)
         try:
             value = json.loads(raw.decode("utf-8", errors="strict"))
         except (UnicodeDecodeError, json.JSONDecodeError) as exc:
@@ -1779,7 +1788,7 @@ class CheckpointStore:
                 name for name in os.listdir(directory_fd)
                 if name.endswith(".json") and not name.startswith("."))
         finally:
-            os.close(directory_fd)
+            wincompat.close(directory_fd)
         rows = [self._read_restore_transaction(name[:-5]) for name in names]
         rows.sort(
             key=lambda row: (row.get("created_at", ""), row["transaction_id"]),
@@ -1880,9 +1889,7 @@ class CheckpointStore:
             return
         try:
             try:
-                info = os.stat(
-                    path.name, dir_fd=directory_fd,
-                    follow_symlinks=False)
+                info = wincompat.fd_stat_nofollow(directory_fd, path.name)
             except FileNotFoundError:
                 return
             if not stat.S_ISREG(info.st_mode):
@@ -1893,10 +1900,10 @@ class CheckpointStore:
                     or (expected_mode is not None
                         and _mode(stable) != expected_mode)):
                 raise RestoreConflict(f"transaction trash 内容变化: {path}")
-            os.unlink(path.name, dir_fd=directory_fd)
-            os.fsync(directory_fd)
+            wincompat.fd_unlink(directory_fd, path.name)
+            wincompat.fsync(directory_fd)
         finally:
-            os.close(directory_fd)
+            wincompat.close(directory_fd)
 
     @staticmethod
     def _cross_filesystem_temp_name(
@@ -1913,11 +1920,11 @@ class CheckpointStore:
             label: str) -> None:
         """Delete only a journal-owned complete copy or crash prefix."""
         try:
-            info = os.stat(name, dir_fd=directory_fd, follow_symlinks=False)
+            info = wincompat.fd_stat_nofollow(directory_fd, name)
         except FileNotFoundError:
             return
         if (not stat.S_ISREG(info.st_mode) or info.st_nlink != 1
-                or info.st_uid != os.geteuid()):
+                or not wincompat.st_owned_by_current_user(info)):
             raise RestoreConflict(f"{label} temp 类型或 owner 变化: {name}")
         try:
             data, stable = _read_regular_once_at(directory_fd, name, info)
@@ -1931,8 +1938,8 @@ class CheckpointStore:
                 or data != expected_bytes[:len(data)]
                 or _mode(stable) != expected_mode):
             raise RestoreConflict(f"{label} temp 内容或 mode 变化: {name}")
-        os.unlink(name, dir_fd=directory_fd)
-        os.fsync(directory_fd)
+        wincompat.fd_unlink(directory_fd, name)
+        wincompat.fsync(directory_fd)
 
     def _cleanup_cross_filesystem_temps(
             self, row: Mapping[str, Any], identity: PathIdentity) -> None:
@@ -1962,7 +1969,7 @@ class CheckpointStore:
                     expected_mode=mode,
                     label="trash copy")
             finally:
-                os.close(destination_fd)
+                wincompat.close(destination_fd)
 
         source_fd = _open_stable_parent(identity)
         try:
@@ -1973,7 +1980,7 @@ class CheckpointStore:
                 expected_mode=mode,
                 label="trash rollback")
         finally:
-            os.close(source_fd)
+            wincompat.close(source_fd)
 
     def _recover_restore_transaction_locked(
             self, value: dict[str, Any], work: Workspace) -> None:
@@ -2355,8 +2362,8 @@ class CheckpointStore:
                         f"trash 目录组件非法: {component!r}")
                 if create:
                     try:
-                        os.mkdir(component, 0o700, dir_fd=current_fd)
-                        os.fsync(current_fd)
+                        wincompat.fd_mkdir(current_fd, component, 0o700)
+                        wincompat.fsync(current_fd)
                     except FileExistsError:
                         pass
                     except OSError as exc:
@@ -2366,26 +2373,26 @@ class CheckpointStore:
                          | getattr(os, "O_DIRECTORY", 0)
                          | getattr(os, "O_NOFOLLOW", 0))
                 try:
-                    next_fd = os.open(component, flags, dir_fd=current_fd)
+                    next_fd = wincompat.fd_open(current_fd, component, flags)
                 except FileNotFoundError:
                     if not create:
-                        os.close(current_fd)
+                        wincompat.close(current_fd)
                         return None
                     raise
                 except OSError as exc:
                     raise ManifestError(
                         f"无法安全打开 trash 目录 {component}: {exc}") from exc
-                info = os.fstat(next_fd)
+                info = wincompat.fstat(next_fd)
                 if not stat.S_ISDIR(info.st_mode):
                     os.close(next_fd)
                     raise ManifestError(
                         f"trash 路径组件不是目录: {component}")
-                os.fchmod(next_fd, 0o700)
-                os.close(current_fd)
+                wincompat.fchmod(next_fd, 0o700)
+                wincompat.close(current_fd)
                 current_fd = next_fd
             return current_fd
         except BaseException:
-            os.close(current_fd)
+            wincompat.close(current_fd)
             raise
 
     def _move_to_trash(self, action: RestoreAction, destination: Path) -> None:
@@ -2402,19 +2409,15 @@ class CheckpointStore:
                 expected_sha256=action.current_sha256,
                 expected_mode=action.current_mode)
             try:
-                os.stat(
-                    destination_name, dir_fd=destination_fd,
-                    follow_symlinks=False)
+                wincompat.fd_stat_nofollow(destination_fd, destination_name)
             except FileNotFoundError:
                 pass
             else:
                 raise CheckpointError(f"trash 目标已存在: {destination}")
             try:
-                os.replace(
-                    source_name, destination_name,
-                    src_dir_fd=source_fd, dst_dir_fd=destination_fd)
-                os.fsync(source_fd)
-                os.fsync(destination_fd)
+                wincompat.fd_replace(source_fd, source_name, destination_fd, destination_name)
+                wincompat.fsync(source_fd)
+                wincompat.fsync(destination_fd)
                 return
             except OSError as exc:
                 if exc.errno != errno.EXDEV:
@@ -2431,52 +2434,48 @@ class CheckpointStore:
             try:
                 flags = (os.O_RDONLY | getattr(os, "O_CLOEXEC", 0)
                          | getattr(os, "O_NOFOLLOW", 0))
-                incoming_fd = os.open(
-                    source_name, flags, dir_fd=source_fd)
+                incoming_fd = wincompat.fd_open(source_fd, source_name, flags)
                 out_flags = (os.O_WRONLY | os.O_CREAT | os.O_EXCL
                              | getattr(os, "O_CLOEXEC", 0)
                              | getattr(os, "O_NOFOLLOW", 0))
-                outgoing_fd = os.open(
-                    temp_name, out_flags,
+                outgoing_fd = wincompat.fd_open(
+                    destination_fd, temp_name, out_flags,
                     (action.current_mode
-                     if action.current_mode is not None else 0o600),
-                    dir_fd=destination_fd)
+                     if action.current_mode is not None else 0o600))
                 temp_created = True
-                os.fchmod(
+                wincompat.fchmod(
                     outgoing_fd,
                     (action.current_mode
                      if action.current_mode is not None else 0o600))
-                with os.fdopen(incoming_fd, "rb", closefd=True) as incoming, \
-                        os.fdopen(outgoing_fd, "wb", closefd=True) as outgoing:
+                with wincompat.fdopen(incoming_fd, "rb", closefd=True) as incoming, \
+                        wincompat.fdopen(outgoing_fd, "wb", closefd=True) as outgoing:
                     incoming_fd = outgoing_fd = -1
                     shutil.copyfileobj(
                         incoming, outgoing, length=1024 * 1024)
                     outgoing.flush()
                     os.fsync(outgoing.fileno())
-                os.replace(
-                    temp_name, destination_name,
-                    src_dir_fd=destination_fd, dst_dir_fd=destination_fd)
+                wincompat.fd_replace(destination_fd, temp_name, destination_fd, destination_name)
                 temp_created = False
-                os.fsync(destination_fd)
+                wincompat.fsync(destination_fd)
                 _assert_entry_at(
                     source_fd, action.current_identity,
                     expected_sha256=action.current_sha256,
                     expected_mode=action.current_mode)
-                os.unlink(source_name, dir_fd=source_fd)
-                os.fsync(source_fd)
+                wincompat.fd_unlink(source_fd, source_name)
+                wincompat.fsync(source_fd)
             finally:
                 if incoming_fd >= 0:
-                    os.close(incoming_fd)
+                    wincompat.close(incoming_fd)
                 if outgoing_fd >= 0:
-                    os.close(outgoing_fd)
+                    wincompat.close(outgoing_fd)
                 if temp_created:
                     try:
-                        os.unlink(temp_name, dir_fd=destination_fd)
+                        wincompat.fd_unlink(destination_fd, temp_name)
                     except FileNotFoundError:
                         pass
         finally:
-            os.close(destination_fd)
-            os.close(source_fd)
+            wincompat.close(destination_fd)
+            wincompat.close(source_fd)
 
     def _rollback_trashed(self, action: RestoreAction, destination: Path,
                           work: Workspace) -> None:
@@ -2495,7 +2494,7 @@ class CheckpointStore:
         source_fd = _open_stable_parent(action.current_identity)
         destination_fd = self._open_trash_parent(destination, create=False)
         if destination_fd is None:
-            os.close(source_fd)
+            wincompat.close(source_fd)
             raise RestoreConflict(
                 f"补偿 trash 时私有目录不存在: {destination.parent}")
         source_name = Path(action.path).name
@@ -2505,9 +2504,7 @@ class CheckpointStore:
                 source_fd, action.current_identity,
                 expected_sha256=None, expected_mode=None)
             try:
-                destination_stat = os.stat(
-                    destination_name, dir_fd=destination_fd,
-                    follow_symlinks=False)
+                destination_stat = wincompat.fd_stat_nofollow(destination_fd, destination_name)
             except FileNotFoundError as exc:
                 raise RestoreConflict(
                     f"补偿 trash 时文件与 trash 均不存在: {action.path}") from exc
@@ -2520,11 +2517,9 @@ class CheckpointStore:
                 raise RestoreConflict(f"trash 内容已变化: {destination}")
             _assert_parent_identity(action.current_identity)
             try:
-                os.replace(
-                    destination_name, source_name,
-                    src_dir_fd=destination_fd, dst_dir_fd=source_fd)
-                os.fsync(destination_fd)
-                os.fsync(source_fd)
+                wincompat.fd_replace(destination_fd, destination_name, source_fd, source_name)
+                wincompat.fsync(destination_fd)
+                wincompat.fsync(source_fd)
                 return
             except OSError as exc:
                 if exc.errno != errno.EXDEV:
@@ -2538,18 +2533,17 @@ class CheckpointStore:
             try:
                 in_flags = (os.O_RDONLY | getattr(os, "O_CLOEXEC", 0)
                             | getattr(os, "O_NOFOLLOW", 0))
-                incoming_fd = os.open(
-                    destination_name, in_flags, dir_fd=destination_fd)
+                incoming_fd = wincompat.fd_open(
+                    destination_fd, destination_name, in_flags)
                 out_flags = (os.O_WRONLY | os.O_CREAT | os.O_EXCL
                              | getattr(os, "O_CLOEXEC", 0)
                              | getattr(os, "O_NOFOLLOW", 0))
-                outgoing_fd = os.open(
-                    temp_name, out_flags, action.current_mode,
-                    dir_fd=source_fd)
+                outgoing_fd = wincompat.fd_open(
+                    source_fd, temp_name, out_flags, action.current_mode)
                 temp_created = True
-                os.fchmod(outgoing_fd, action.current_mode)
-                with os.fdopen(incoming_fd, "rb", closefd=True) as incoming, \
-                        os.fdopen(outgoing_fd, "wb", closefd=True) as outgoing:
+                wincompat.fchmod(outgoing_fd, action.current_mode)
+                with wincompat.fdopen(incoming_fd, "rb", closefd=True) as incoming, \
+                        wincompat.fdopen(outgoing_fd, "wb", closefd=True) as outgoing:
                     incoming_fd = outgoing_fd = -1
                     shutil.copyfileobj(
                         incoming, outgoing, length=1024 * 1024)
@@ -2559,27 +2553,25 @@ class CheckpointStore:
                 _assert_entry_at(
                     source_fd, action.current_identity,
                     expected_sha256=None, expected_mode=None)
-                os.replace(
-                    temp_name, source_name,
-                    src_dir_fd=source_fd, dst_dir_fd=source_fd)
+                wincompat.fd_replace(source_fd, temp_name, source_fd, source_name)
                 temp_created = False
-                os.fsync(source_fd)
+                wincompat.fsync(source_fd)
                 # Remove trash only after the source copy is durable.
-                os.unlink(destination_name, dir_fd=destination_fd)
-                os.fsync(destination_fd)
+                wincompat.fd_unlink(destination_fd, destination_name)
+                wincompat.fsync(destination_fd)
             finally:
                 if incoming_fd >= 0:
-                    os.close(incoming_fd)
+                    wincompat.close(incoming_fd)
                 if outgoing_fd >= 0:
-                    os.close(outgoing_fd)
+                    wincompat.close(outgoing_fd)
                 if temp_created:
                     try:
-                        os.unlink(temp_name, dir_fd=source_fd)
+                        wincompat.fd_unlink(source_fd, temp_name)
                     except FileNotFoundError:
                         pass
         finally:
-            os.close(destination_fd)
-            os.close(source_fd)
+            wincompat.close(destination_fd)
+            wincompat.close(source_fd)
 
 
 def _write_target(prepared: PreparedWrite) -> None:
