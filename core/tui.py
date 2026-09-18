@@ -4408,6 +4408,41 @@ class _TranscriptEntry:
         self.parts = [str(value)]
 
 
+class ClipboardResult(str):
+    """带显式语义的复制结果；仍是 str 子类，旧调用点照样能用。
+
+    为什么需要：`_copy_text_to_clipboard` 只返回后端名或 None，于是三种完全不同
+    的结局被压成同一句「已复制 N 字符」——
+      · 外部 helper exit 0 → 真的复制成功了
+      · OSC 52            → **只是发出了请求**，协议没有任何回执
+      · clipboard=off     → 一个字都没复制
+    把它们说成同一件事，撞的是 AGENTS.md 第 2 条（用户可见文案必须覆盖全部状态）。
+
+    继承 str 是刻意的：真值语义与原来的 bool API 兼容，想区分「确认」与「已请求」
+    的调用方再去看 `status`。（接口沿用 2026-09-02 那份未合并实现，因为那批测试
+    是照它写的。）
+    """
+
+    SUCCESS_STATUSES = frozenset({"confirmed_external", "requested_osc52"})
+
+    def __new__(cls, status, *, backend=None, char_count=0,
+                truncated=False, reason=""):
+        obj = super().__new__(cls, str(status))
+        obj.status = str(status)
+        obj.backend = None if backend is None else str(backend)
+        obj.char_count = int(char_count or 0)
+        obj.truncated = bool(truncated)
+        obj.reason = str(reason or "")
+        return obj
+
+    @property
+    def result(self):
+        return self.status
+
+    def __bool__(self):
+        return self.status in self.SUCCESS_STATUSES
+
+
 class TerminalRenderer:
     """主线程唯一 stdout writer；输入组件只提交 snapshot。"""
 
@@ -4469,6 +4504,10 @@ class TerminalRenderer:
         self._composer_selection_layout_key = None
         self._composer_notice = ""
         self._last_clipboard_backend = None
+        self._last_clipboard_status = None
+        self._last_clipboard_reason = ""
+        self._last_clipboard_result = None
+        self._last_copy_notice = ""
         self._last_cursor_screen_row = None
         self._last_mouse_query_signature = None
         self._last_mouse_query_at = 0.0
@@ -4551,6 +4590,42 @@ class TerminalRenderer:
     def clipboard_backend(self):
         return self._last_clipboard_backend
 
+    @staticmethod
+    def _clipboard_notice(result):
+        """四种结局四句话 —— 绝不把「已请求」说成「已复制」。"""
+        if result.status == "confirmed_external":
+            text = (f"已复制 {result.char_count:,} 字符 · "
+                    f"{result.backend or 'external'}")
+        elif result.status == "requested_osc52":
+            text = f"已发送复制请求 {result.char_count:,} 字符 · osc52"
+            if result.reason == "external_failed":
+                text += "（本地 helper 全部失败）"
+        elif result.status == "disabled":
+            text = "复制未执行 · clipboard=off"
+        else:
+            text = "复制失败 · 无可用 backend"
+        if result.truncated:
+            text += "（已截断）"
+        return text
+
+    def _copy_result(self, value, *, truncated=False):
+        """复制一段文本并返回带语义的结果。"""
+        value = str(value)
+        self._last_clipboard_status = None
+        self._last_clipboard_reason = ""
+        backend = self._copy_text_to_clipboard(value)
+        status = getattr(self, "_last_clipboard_status", None)
+        if status not in {"confirmed_external", "requested_osc52",
+                          "disabled", "failed"}:
+            status = "failed" if backend is None else "requested_osc52"
+        result = ClipboardResult(
+            status, backend=backend, char_count=len(value),
+            truncated=truncated,
+            reason=getattr(self, "_last_clipboard_reason", ""))
+        self._last_clipboard_result = result
+        self._last_copy_notice = self._clipboard_notice(result)
+        return result
+
     def _copy_text_to_clipboard(self, value):
         """Use an explicit local backend when requested, then OSC 52."""
         value = str(value)
@@ -4558,6 +4633,7 @@ class TerminalRenderer:
         setting = str(paths.env_get("CLIPBOARD", "osc52", environ=environment)).lower()
         if setting in {"0", "false", "no", "off", "none"}:
             self._last_clipboard_backend = None
+            self._last_clipboard_status = "disabled"
             return None
 
         candidates = []
@@ -4589,7 +4665,17 @@ class TerminalRenderer:
                     continue
                 if completed.returncode == 0:
                     self._last_clipboard_backend = command
+                    self._last_clipboard_status = "confirmed_external"
                     return command
+
+        # 显式指定了本地 helper 却全部失败时**不回落** —— 用户要的是 external，
+        # 悄悄改走 OSC 52 会把选中文本写进终端流，那是他没要求的数据路径，
+        # 带隐私含义。只有 `auto` 是刻意允许回落的那一档。
+        if probe_all and candidates:
+            self._last_clipboard_backend = None
+            self._last_clipboard_status = "failed"
+            self._last_clipboard_reason = "external_failed"
+            return None
 
         # OSC 52 is the portable path for SSH/tmux-style TUI sessions.  It is
         # intentionally explicit in the output rather than using a shell.
@@ -4597,6 +4683,10 @@ class TerminalRenderer:
         self._write("\x1b]52;c;" + encoded + "\x07")
         self.flush()
         self._last_clipboard_backend = "osc52"
+        # 走到这里只有两种：本来就只有 OSC 52 可走，或 `auto` 下 helper 失败后
+        # 刻意回落。后者用户该知道 —— 它意味着本地 helper 有问题。
+        self._last_clipboard_status = "requested_osc52"
+        self._last_clipboard_reason = "external_failed" if candidates else ""
         return "osc52"
 
     def _set_mouse_tracking(self, mode):
@@ -5248,14 +5338,10 @@ class TerminalRenderer:
         if len(value) > self.HISTORY_COPY_CHAR_LIMIT:
             value = value[:self.HISTORY_COPY_CHAR_LIMIT]
             truncated = True
-        backend = self._copy_text_to_clipboard(value)
-        if backend is None:
-            suffix = "（剪贴板已关闭）"
-        else:
-            suffix = f" · {backend}"
-        if truncated:
-            suffix += "（已截断）"
-        self._history_notice = f"已复制 {len(value):,} 字符{suffix}"
+        # 返回值语义这一轮刻意不动：falsey 会让调用点关掉历史视图，那是回归。
+        # 先把说谎的文案修对；富结果放在 _last_clipboard_result 里。
+        self._history_notice = self._clipboard_notice(
+            self._copy_result(value, truncated=truncated))
         if self._history_active:
             self._render_history(snapshot or self._last_snapshot)
         return True
@@ -5439,12 +5525,8 @@ class TerminalRenderer:
             suffix = "（已截断）"
         else:
             suffix = ""
-        backend = self._copy_text_to_clipboard(value)
-        if backend is None:
-            suffix += "（剪贴板已关闭）"
-        else:
-            suffix += f" · {backend}"
-        self._composer_notice = f"已复制 {len(value):,} 字符{suffix}"
+        self._composer_notice = self._clipboard_notice(
+            self._copy_result(value, truncated=bool(suffix)))
         if snapshot is not None:
             self.render(snapshot)
         return True

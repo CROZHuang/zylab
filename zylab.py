@@ -358,7 +358,7 @@ _TOOL_DISPLAY = {
 
 
 def tool_call_line(name, args):
-    """Claude Code 形状的工具调用行：`⏺ Read(kc/tools.py)`、`⏺ Bash(ls -la)`。"""
+    """Claude Code 形状的工具调用行：`⏺ Read(core/tools.py)`、`⏺ Bash(ls -la)`。"""
     label = _TOOL_DISPLAY.get(str(name), str(name))
     detail = preview(name, args)
     return f"{BLUE('⏺')} {BOLD(label)}({DIM(detail)})" if detail else f"{BLUE('⏺')} {BOLD(label)}"
