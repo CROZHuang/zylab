@@ -8,6 +8,7 @@ probe 管「支不支持工具」。这些测试钉住它们的交接。
 import os
 import sys
 import tempfile
+import time
 import unittest
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -197,6 +198,23 @@ class SessionRefreshTests(unittest.TestCase):
             session._catalog_checked_at -= zylab.CATALOG_CHECK_SECONDS + 1
             session.maybe_refresh_catalog()
             self.assertEqual(start.call_count, 2)
+
+    def test_a_freshly_booted_machine_still_refreshes_once(self):
+        """`time.monotonic()` 在 Linux 上是**开机以来**的秒数。
+
+        节流原来写成 `now - float(last or 0) < 300`，而 `last` 初值是 0——
+        于是机器开机不到 5 分钟时 `now - 0 < 300`，第一次刷新被**静默跳过**。
+        维护者的机器开了 50 天，这个分支永远走不到；2026-09-21 公开仓库的第一次
+        CI（全新 VM）当场把它红了出来。这不只是用例的事：新装的机器、重启后的
+        容器，头五分钟都拿不到目录刷新。
+        """
+        session, zylab = self.make_session()
+        with (mock.patch.object(time, "monotonic", lambda: 120.0),
+              mock.patch.object(session, "start_catalog_refresh") as start):
+            session.maybe_refresh_catalog()
+            start.assert_called_once()
+            session.maybe_refresh_catalog()       # 节流照样生效
+            start.assert_called_once()
 
     def test_gateway_switch_clears_the_throttle(self):
         session, zylab = self.make_session()

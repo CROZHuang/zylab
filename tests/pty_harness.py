@@ -181,6 +181,7 @@ def _run_conpty_child(body, sends, *, cwd, timeout, prefix, child_env):
         cwd=cwd, env=child_env, cols=1000, rows=50)
     output = bytearray()
     try:
+        armed = False
         for item in sends:
             action = item if isinstance(item, PTYSend) else PTYSend(
                 payload=item[1], delay=item[0])
@@ -188,6 +189,9 @@ def _run_conpty_child(body, sends, *, cwd, timeout, prefix, child_env):
                 _read_until_conpty(
                     child, output, action.after,
                     timeout if action.timeout is None else action.timeout)
+            elif not armed:
+                _await_pump(_read_until_conpty, child, output)
+                armed = True
             if action.delay:
                 time.sleep(action.delay)
             child.write(action.payload)
@@ -203,6 +207,29 @@ def _run_conpty_child(body, sends, *, cwd, timeout, prefix, child_env):
     decoded = output.decode("utf-8", "replace")
     payload = decoded.rsplit("RESULT:", 1)[1].strip().splitlines()[0]
     return decoded, json.loads(payload)
+
+
+# raw_mode 进入时一定会发的括号粘贴开关。拿它当「输入泵已经武装好」的信号。
+PUMP_ARMED = b"\x1b[?2004h"
+
+
+def _await_pump(read_until, *args, budget=5.0):
+    """等 child 真的进了 raw mode，再按秒数发键。
+
+    一部分用例是「睡 0.12 秒再发」这种写法等 child 起来，而那个数是在
+    Python 3.12 + 空闲的 8 核上调出来的。3.10 的解释器启动明显更慢
+    （没有 frozen modules），CI 的 runner 也更慢——于是键发在了 raw mode
+    **之前**，被行规程原样回显掉，pump 一个事件都读不到。
+    2026-09-21 实测：3.10 上 12 条 PTY 用例因此红，child 的输出里能直接看到
+    `^[[Ax` 被回显出来，随后 `RESULT:[]`。
+
+    等一个**一定会出现**的信号，比把睡眠时间调大可靠：调大只是把赌注加码。
+    等不到也不报错——不是每个 child 都会进 raw mode，那些用例原样按老路走。
+    """
+    try:
+        read_until(*args, PUMP_ARMED, budget)
+    except Exception:                                  # noqa: BLE001
+        pass
 
 
 def run_pty_child(body, sends, *, cwd, timeout, prefix=""):
@@ -247,6 +274,7 @@ def run_pty_child(body, sends, *, cwd, timeout, prefix=""):
         os.close(slave)
     output = bytearray()
     try:
+        armed = False
         for item in sends:
             if isinstance(item, PTYSend):
                 action = item
@@ -258,6 +286,10 @@ def run_pty_child(body, sends, *, cwd, timeout, prefix=""):
                     master, proc, output, action.after,
                     timeout if action.timeout is None else action.timeout,
                 )
+            elif not armed:
+                # 只有「纯延时」的第一次发送需要等——带 after 的本来就在等标记。
+                _await_pump(_read_until, master, proc, output)
+                armed = True
             if action.delay:
                 time.sleep(action.delay)
             os.write(master, action.payload)

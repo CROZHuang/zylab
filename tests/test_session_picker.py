@@ -5,7 +5,24 @@ import os
 import sys
 import tempfile
 import unittest
-from contextlib import chdir, contextmanager
+from contextlib import contextmanager
+
+
+@contextmanager
+def chdir(path):
+    """`contextlib.chdir` 是 3.11 才有的，而 README 承诺 3.10+。
+
+    2026-09-21 公开仓库第一次 CI，`py3.10` 那一列这个模块直接 import 不了
+    （`ImportError: cannot import name 'chdir'`）。产品代码没用到它，但测试
+    套件在最低版本上跑不起来，等于最低版本根本没被验证过。
+    """
+    import os
+    before = os.getcwd()
+    os.chdir(path)
+    try:
+        yield
+    finally:
+        os.chdir(before)
 from pathlib import Path
 from unittest import mock
 

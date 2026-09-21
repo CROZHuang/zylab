@@ -69,8 +69,23 @@ jobs:
           rc=${PIPESTATUS[0]}
           set -e
           if [ "$rc" != "0" ]; then
-            grep -E '^(FAIL|ERROR):' /tmp/unit.log | sed 's/^/::error::/' | head -60
-            tail -5 /tmp/unit.log | sed 's/^/::error::尾部 /'
+            # GitHub 每步最多显示 10 条注解，所以别一条一行地刷失败名——
+            # 那样只够看见开头几个名字，看不到**为什么**。打包成三条：
+            # 失败清单、前两个完整 traceback、输出尾部。换行用 %0A 转义。
+            python - <<'PY'
+          import re
+          log = open("/tmp/unit.log", encoding="utf-8", errors="replace").read()
+          def ann(title, text):
+              body = text[:3500].replace("%", "%25").replace("\r", "%0D").replace("\n", "%0A")
+              print(f"::error title={title}::{body}")
+          names = [l for l in log.splitlines() if l.startswith(("FAIL:", "ERROR:"))]
+          if names:
+              ann("失败清单", "\n".join(names[:40]))
+          blocks = re.findall(r"={70}\n(?:FAIL|ERROR):.*?(?=\n={70}|\n-{70})", log, re.S)
+          for i, b in enumerate(blocks[:2], 1):
+              ann(f"traceback {i}", b)
+          ann("尾部", "\n".join(log.splitlines()[-8:]))
+          PY
           fi
           exit "$rc"
 

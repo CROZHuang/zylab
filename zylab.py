@@ -4073,9 +4073,14 @@ class Session:
         """
         # 这是个可选功能：它绝不能让一个 turn 起不来。
         now = time.monotonic()
-        last = getattr(self, "_catalog_checked_at", 0.0)
+        last = float(getattr(self, "_catalog_checked_at", 0.0) or 0.0)
         try:
-            if now - float(last or 0) < CATALOG_CHECK_SECONDS:
+            # `last == 0` 是「还没查过」（也是 /model 切网关后清节流用的值），
+            # **不能**拿它当一个时间戳去减。`time.monotonic()` 在 Linux 上是
+            # 开机以来的秒数：机器刚起来不到 5 分钟时 `now - 0 < 300`，于是
+            # 第一次刷新被静默跳过。维护者的机器开了 50 天，这个分支永远走不到；
+            # 2026-09-21 公开仓库的第一次 CI（全新 VM）当场红了。
+            if last and now - last < CATALOG_CHECK_SECONDS:
                 return None
             self._catalog_checked_at = now
             return self.start_catalog_refresh()
@@ -9883,10 +9888,11 @@ def _render_permission(row):
     }.get(row["source"], row["source"])
     if row.get("project_enforced"):
         source += f"强制（用户层 {row.get('user') or row['default']}）"
+    # 同上：替换字段里不能换行，否则 3.10/3.11 直接 SyntaxError。
+    mark = _PERMISSION_MARK.get(row["effective"], row["effective"])
     return (
         f"{tui.pad_display(row['tool'], 20)} "
-        f"{tui.pad_display(
-            _PERMISSION_MARK.get(row['effective'], row['effective']), 9)}"
+        f"{tui.pad_display(mark, 9)}"
         f" · {source}")
 
 
@@ -14933,7 +14939,9 @@ def cmd_init_cli(a, cfg):
         return 1
 
     # 7. 下一步
-    print(f"\n  下一步：{BOLD('zylab')}（交互）或 {BOLD('zylab -p \"你好\"')}（单次）\n")
+    # 替换字段里不能有反斜杠（同样是 3.12 才放开的 PEP 701），先算出来再插值。
+    one_shot = BOLD('zylab -p "你好"')
+    print(f"\n  下一步：{BOLD('zylab')}（交互）或 {one_shot}（单次）\n")
     return 0
 
 

@@ -264,19 +264,32 @@ def _decode_modified_key(sequence):
 
 
 def _cols(default=100):
-    """终端宽度。拿不到就给个保守值。"""
+    """终端宽度。拿不到就给个保守值。
+
+    **0 也算「拿不到」。** `shutil.get_terminal_size()` 在 Python 3.11 之前不做
+    这个判断：一个没设过 `TIOCSWINSZ` 的 pty 上它原样返回 0，于是原来的
+    `max(20, 0)` 给出 **20 列** —— 界面被压成一条窄缝，每一行都截成「…」。
+    3.11 起标准库自己回落到 (80, 24)，所以这个 bug 只在 3.10 上看得见；
+    2026-09-21 由公开仓库 CI 的 py3.10 那一列抓到（一条折叠行断在
+    `exit 0 · 200 lines · 0.…`，后面的 `/expand` 提示整个没了）。
+    """
     try:
-        return max(20, shutil.get_terminal_size().columns)
+        columns = shutil.get_terminal_size().columns
     except OSError:
         return default
+    return max(20, columns or default)
 
 
 def _lines(default=24):
-    """Terminal height used to keep modal frames inside the visible viewport."""
+    """Terminal height used to keep modal frames inside the visible viewport.
+
+    同 `_cols`：0 表示查不到，不是「高度为 0」。
+    """
     try:
-        return max(5, shutil.get_terminal_size().lines)
+        rows = shutil.get_terminal_size().lines
     except OSError:
         return default
+    return max(5, rows or default)
 
 
 def supported():
@@ -4951,12 +4964,11 @@ class TerminalRenderer:
             name = str(message.get("name")
                        or self._transcript_tool_names.get(call_id)
                        or call_id or "tool")
-            add(
-                "tool",
-                f"⎿  {name} · {self._fold_transcript_result(
-                    text, call_id, name)}",
-                source=name,
-            )
+            # 先算再插值：f-string 的替换字段里换行要 Python 3.12（PEP 701），
+            # 而 README 承诺的是 3.10+ —— 在 3.10/3.11 上这是 SyntaxError，
+            # 整个模块 import 不了。
+            folded = self._fold_transcript_result(text, call_id, name)
+            add("tool", f"⎿  {name} · {folded}", source=name)
         return entries
 
     def _entry_row_count(self, entry, width):

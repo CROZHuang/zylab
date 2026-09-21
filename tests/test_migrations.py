@@ -288,10 +288,30 @@ migrations.migrate_v1_to_new_db(
 
 
     def test_protected_target_is_rejected_before_any_write(self):
-        target = Path("/protected/archive/zylab-forbidden/state.sqlite3")
-        with self.assertRaisesRegex(migrations.MigrationFailed, "/protected/archive"):
-            migrations.migrate_v1_to_new_db(
-                self.sessions, self.usage, target, dry_run=False)
+        """这条以前是**假绿**，而且真的往文件系统根上写过东西。
+
+        setUpModule 打的是 `tools.PROTECTED`（词法守卫），而
+        `migrations._reject_protected_target` 查的是 `paths.protected_paths()`
+        ——两者没有关系，守卫从来没被触发过。于是代码一路往下，在维护者的
+        root 环境里**真的建出了 `/protected/archive/zylab-forbidden/state.sqlite3`**
+        （2026-09-16，196 KB 的 SQLite 库，2026-09-21 才发现并清掉）。
+        此后每次再跑，拦住它的是「target 已存在，拒绝覆盖」——那条消息里也带着
+        `/protected/archive`，正好满足旧断言。CI 的 runner 是非 root、又没有遗留
+        文件，当场 ERROR。
+
+        现在按 migrations 真正读的那个来源声明，并且断言**具体是哪条守卫**
+        以及**什么都没被创建**。
+        """
+        target = Path(self.root) / "forbidden-archive" / "state.sqlite3"
+        with _mock.patch.object(
+                migrations.paths, "protected_paths",
+                return_value=[str(target.parent)]):
+            with self.assertRaisesRegex(
+                    migrations.MigrationFailed, "受保护路径"):
+                migrations.migrate_v1_to_new_db(
+                    self.sessions, self.usage, target, dry_run=False)
+        self.assertFalse(target.parent.exists(),
+                         "名字里写着 before any write，就一个目录都不该留下")
 
 
 
