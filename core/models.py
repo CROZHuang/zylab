@@ -1109,6 +1109,30 @@ class ContextProbeBlocked(RuntimeError):
         self.kind = str(kind)
 
 
+def thinking_off_rejected(gateway, model):
+    """这条 route 是否已知「不许关思考」（关了就 400）。见 note_thinking_off_rejected。"""
+    try:
+        return get(gateway, model).get("thinking_off") == "rejected"
+    except Exception:                                  # noqa: BLE001 - 目录坏了不该挡住请求
+        return False
+
+
+def note_thinking_off_rejected(gateway, model):
+    """记下「这条 route 关思考会被 400」——同样是**零成本测量**：证据是一对真实请求
+    （带 thinking=disabled 被 400，同一 route 不带就成功），不是对报错文案的猜测。
+
+    2026-09-20 实测：glm-5.3@boyue 对 thinking=disabled 一律 400（code 1210「该模型始终
+    思考，不支持关闭思考」），压缩请求在这条用户最常用的 route 上 33 次全部失败、从未成功。
+    学到之后，摘要/ recap 这类旁路请求就不再先白撞一次。
+    """
+    def apply(rec):
+        rec["thinking_off"] = "rejected"
+    try:
+        update_record(gateway, model, apply)
+    except OSError:
+        pass
+
+
 def note_context_ok(gateway, model, prompt_tokens):
     """记录「这个模型确实收下过这么多 token」—— 只涨不跌的已知下界。
 

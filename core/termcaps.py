@@ -6,6 +6,7 @@
 
 `scripts/term_probe.py` 是同一套查询的"人肉版"，用来在新终端上画边界。
 """
+import select
 import json
 import os
 import sys

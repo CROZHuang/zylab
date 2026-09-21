@@ -59,12 +59,12 @@ DEFAULTS = {
     # 平台的模型名单在变（双向：下架的会回来，在册的会消失）。启动时若目录
     # 超过 catalog_ttl_hours 没抓过，就在后台抓一次；只在有变化时才吭声。
     # False 则完全手动，靠 /model refresh 与 /model check。
-    # 交接摘要（resume 时的 recap 素材）。和压缩摘要不是一件事：压缩是为了塞进
-    # 上下文窗口（238K 才触发），交接是为了让 resume 的人知道到哪了。
-    # 实测最近 5 个会话没有一个有摘要，recap 因此长期无米可炊。
+    # away recap（照搬 Claude Code）：终端失焦 recap_away_seconds 秒后，后台让模型
+    # 写一行「目标 + 现状 + 下一步」等你回来；resume 后也现写一条。recap_auto 只管
+    # 这两处自动触发，/recap 随时可用。写 recap 的永远是这个窗口此刻在用的模型——
+    # 没有单独的模型开关（用户 09-20 定，与 CC 一致）。
     "recap_auto": True,
-    "recap_min_tokens": 40_000,
-    "recap_refresh_turns": 15,
+    "recap_away_seconds": 300,
     "catalog_refresh": True,
     "catalog_ttl_hours": 24,
     "model_health": {
@@ -74,7 +74,12 @@ DEFAULTS = {
         "probe_transient_base_ttl": 5 * 60,
         "probe_transient_max_ttl": 60 * 60,
         "circuit_failure_threshold": 3,
-        "circuit_open_ttl": 10 * 60,
+        # circuit_open_ttl 是退避**基数**，不是固定时长：到阈值先开这么久，
+        # 其后每多一次连续失败翻倍，封顶 circuit_open_max_ttl。
+        # 注意这里的值会覆盖 ModelHealthPolicy 的 dataclass 默认值——
+        # model_health_policy() 是从本字典按名取值构造的。
+        "circuit_open_ttl": 30,
+        "circuit_open_max_ttl": 10 * 60,
     },
     "transport": {
         # 明文 HTTP 永不默认信任。用户可持久授权精确 endpoint；项目配置
@@ -149,11 +154,13 @@ DEFAULTS = {
     },
     "memory": {
         # Personal CLI 默认使用本地 memory；两项都可按 chat 覆盖。
-        # ``generate`` 只做确定性 session handoff，不额外调用 provider。
+        # ``generate`` = 轮末自动抽取（一次缓存安全的旁路请求，见 agent.extract_memories）。
+        # 索引里每条只有一行钩子（约 68 token），正文由模型用 memory_read 按需取，
+        # 所以条数可以放宽而预算反而更小（以前是 24 条 × 全文 = 25,000 字符）。
         "use": True,
         "generate": True,
-        "max_index_chars": 25_000,
-        "max_entries": 24,
+        "max_index_chars": 12_000,
+        "max_entries": 60,
         "capsule_chars": 32_000,
     },
     "sandbox": {
@@ -457,7 +464,7 @@ def model_health_policy(cfg):
             for name in (
                 "probe_success_ttl", "probe_transient_base_ttl",
                 "probe_transient_max_ttl", "circuit_failure_threshold",
-                "circuit_open_ttl")
+                "circuit_open_ttl", "circuit_open_max_ttl")
         })
     except (KeyError, TypeError, ValueError) as exc:
         raise SettingsError(f"model_health 配置无效：{exc}") from exc
@@ -469,6 +476,7 @@ def _merge_model_health(current, patch):
     duration_fields = {
         "probe_success_ttl", "probe_transient_base_ttl",
         "probe_transient_max_ttl", "circuit_open_ttl",
+        "circuit_open_max_ttl",
     }
     for name in duration_fields:
         if name not in patch:
@@ -816,18 +824,18 @@ def max_turns_policy(cfg):
 
 
 def recap_policy(cfg):
-    """交接摘要：开关 + 起点 + 刷新间隔。非法值退回默认，不让配置弄崩会话。"""
+    """away recap：开关 + 离开多久才写。非法值退回默认，不让配置弄崩会话。"""
     cfg = cfg or {}
-    def _int(key):
-        try:
-            value = int(cfg.get(key, DEFAULTS[key]))
-        except (TypeError, ValueError):
-            return int(DEFAULTS[key])
-        return value if value > 0 else int(DEFAULTS[key])
+    try:
+        seconds = float(cfg.get("recap_away_seconds",
+                                DEFAULTS["recap_away_seconds"]))
+    except (TypeError, ValueError):
+        seconds = float(DEFAULTS["recap_away_seconds"])
+    if not 0 < seconds < float("inf"):             # 也挡掉 NaN
+        seconds = float(DEFAULTS["recap_away_seconds"])
     return {
         "enabled": bool(cfg.get("recap_auto", DEFAULTS["recap_auto"])),
-        "min_tokens": _int("recap_min_tokens"),
-        "refresh_turns": _int("recap_refresh_turns"),
+        "away_seconds": seconds,
     }
 
 
@@ -850,8 +858,7 @@ def render(cfg, sources):
     for k in ("model", "gateway", "max_tokens", "temperature",
               "compact_at", "auto_approve", "resume_replay", "max_turns",
               "background_task_handoff", "catalog_refresh",
-              "catalog_ttl_hours", "recap_auto", "recap_min_tokens",
-              "recap_refresh_turns"):
+              "catalog_ttl_hours", "recap_auto", "recap_away_seconds"):
         shown = cfg.get(k)
         if k == "max_turns":
             shown = max_turns_policy(cfg) or "不设上限"
@@ -929,7 +936,7 @@ def render(cfg, sources):
     for name in (
             "probe_success_ttl", "probe_transient_base_ttl",
             "probe_transient_max_ttl", "circuit_failure_threshold",
-            "circuit_open_ttl"):
+            "circuit_open_ttl", "circuit_open_max_ttl"):
         out.append(f"      {name:28} {health.get(name)}")
     out.append("    permissions:")
     for t, p in sorted(cfg["permissions"].items()):

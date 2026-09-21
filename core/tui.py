@@ -13,6 +13,7 @@ zylab 的立身之本是开箱即用、零依赖。而我们只需要几件事�
 期间程序根本没在读 stdin，所以 Esc 无人接收（Ctrl-C 能用是因为它是 tty 驱动发的
 **信号**，不是按键）。raw mode 把这三条限制一次性解除。
 """
+import select as _select
 from . import paths
 import base64
 from dataclasses import dataclass, replace as dataclass_replace
@@ -51,6 +52,9 @@ KEYS = {
     "\x0f": "ctrl-o",                    # 展开最近一段折叠输出（SPEC-CC-parity C2）
     "\x12": "ctrl-r",                    # 反向增量搜索历史（SPEC-CC-parity A6）
     "\x1b": "esc",
+    # DEC 1004 焦点上报：CSI I = 获得焦点，CSI O = 失去焦点。注意这是 **CSI** 的
+    # I/O 终止字节，不是上面 SS3 那组 `ESC O x`——前缀不同，互不冲突。
+    "\x1b[I": "focus-in", "\x1b[O": "focus-out",
 }
 
 CSI = "\x1b["
@@ -60,6 +64,21 @@ PASTE_ON = "\x1b[?2004h"
 PASTE_OFF = "\x1b[?2004l"
 PASTE_START = "\x1b[200~"
 PASTE_END = "\x1b[201~"
+
+# DEC 私有模式 1004（焦点上报）。away recap 靠它判断「人离开了」：失焦后计时，
+# 重新聚焦即取消（照搬 Claude Code 的 awaySummary）。终端不认识就静默忽略——
+# 那样永远收不到失焦事件，自动 recap 也就永不触发，/recap 仍可用。
+FOCUS_ON = "\x1b[?1004h"
+FOCUS_OFF = "\x1b[?1004l"
+
+
+def _set_focus_reporting(enable):
+    """开/关 DEC 1004。失败不算错误 —— 终端不支持就当没这回事。"""
+    try:
+        sys.stdout.write(FOCUS_ON if enable else FOCUS_OFF)
+        sys.stdout.flush()
+    except (OSError, ValueError, AttributeError):
+        pass
 # 上限存在的意义是防呆不是防坏：粘贴超过这个量几乎肯定是误操作（比如把整个
 # 文件拖进终端），继续读只会让界面卡住。超限就截断并在 PasteEvent 上标记。
 PASTE_MAX_CHARS = 262144
@@ -261,10 +280,24 @@ def _lines(default=24):
 
 
 def supported():
-    """只有真 tty 才能进 raw mode；管道/重定向下回退到 input()。"""
+    """只有真 tty 才能进 raw mode；管道/重定向下回退到 input()。
+
+    Windows 还要多问一句「是不是 Win32 控制台」。Git Bash / MSYS mintty 的
+    pty 会让 `isatty()` 为真，但它**不是控制台**：`GetConsoleMode` 失败，
+    Python 也没有 termios 可用，raw 模式根本无从设起。只认 isatty 的话，
+    zylab 会一头扎进全屏 TUI 然后在 raw_mode 里崩掉。
+    判否之后走的是既有的 input() 回退路径（功能可用，只是没有整屏 UI）。
+    """
     try:
-        return sys.stdin.isatty() and sys.stdout.isatty()
+        if not (sys.stdin.isatty() and sys.stdout.isatty()):
+            return False
     except (AttributeError, ValueError):
+        return False
+    if not wincompat.IS_WINDOWS:
+        return True
+    try:
+        return wincompat.is_console(sys.stdin.fileno())
+    except (AttributeError, ValueError, OSError):
         return False
 
 
@@ -354,8 +387,10 @@ def _raw_read(n=1, timeout=None, stream=None):
     """
     source = stream or sys.stdin
     fd = source.fileno()
-    if wincompat.IS_WINDOWS:
-        # Windows 控制台不能 os.read（见 wincompat.read_console 文档）。
+    if wincompat.IS_WINDOWS and wincompat.is_console(fd):
+        # Windows **控制台**不能 os.read（见 wincompat.read_console 文档）。
+        # 但只有真控制台才走这条路：Git Bash / MSYS 的 pty 和被重定向的管道
+        # 仍然是普通 fd，必须走下面的 os.read，否则一个字节都读不到。
         raw = wincompat.read_console(n, timeout)
         if not raw:
             return ""
@@ -3467,8 +3502,12 @@ class InputPump:
 
     def __init__(self, *, stream=None, prompt="› ", commands=None,
                  subcommands=None, history=None, key_reader=None, cwd=None,
-                 live_commands=None):
+                 live_commands=None, on_focus=None):
         self.stream = stream or sys.stdin
+        # 焦点变化的订阅者（away recap）。在 pump 线程里直接回调、**不进事件队列**：
+        # 选择器/提示框那几个消费循环会把不认识的事件延后重放，焦点信号一旦被
+        # 延后就失去意义；走回调则没有任何消费循环需要认识它。
+        self.on_focus = on_focus
         self.editor = LineEditor(
             prompt=prompt, commands=commands, subcommands=subcommands,
             live_commands=live_commands,
@@ -3498,6 +3537,9 @@ class InputPump:
         self._raw = raw_mode(
             self.stream, cbreak=True, capture_signals=True)
         self._raw.__enter__()
+        # 只有 pump 消费焦点事件，所以 1004 跟着 pump 的生命周期走，不进
+        # raw_mode 的引用计数（选择器、read_line 那些旧循环不需要它）。
+        _set_focus_reporting(True)
         self._thread = threading.Thread(
             target=self._loop, name="zylab-input", daemon=True)
         with self._lock:
@@ -3511,6 +3553,8 @@ class InputPump:
         self._stop.set()
         if self._thread:
             self._thread.join(timeout=0.3)
+        # 退出时必须复原：否则 shell 里切窗口会冒出 ^[[I / ^[[O。
+        _set_focus_reporting(False)
         if self._raw:
             self._raw.__exit__(*exc)
 
@@ -3546,12 +3590,26 @@ class InputPump:
         return dataclass_replace(
             event, snapshot=self._decorate_snapshot(event.snapshot))
 
+    def _notify_focus(self, focused):
+        callback = self.on_focus
+        if callback is None:
+            return
+        try:
+            callback(bool(focused))
+        except Exception:                                   # noqa: BLE001
+            pass        # 订阅者出错不能弄死 REPL 里唯一的输入线程
+
     def _loop(self):
         try:
             while not self._stop.is_set():
                 key = self._key_reader(
                     timeout=0.05, stream=self.stream)
                 if key is None:
+                    continue
+                if key in ("focus-in", "focus-out"):
+                    # 焦点变化不是按键：先于一切模态分发拦截，选择器/决策门/
+                    # 提示框都不该把它当输入。
+                    self._notify_focus(key == "focus-in")
                     continue
                 with self._lock:
                     if self._mode == "picker":
@@ -4470,6 +4528,9 @@ class TerminalRenderer:
         self._output_source = None
         self._spinner_visible = False
         self._spinner_key = None
+        # 上一帧画出去的行，用来做增量重绘（见 _render_incremental）。
+        # 任何「帧被抹掉/位置不再可信」的地方都要把它清成 None。
+        self._last_lines = None
         self._last_snapshot = None
         self._transcript = []
         self._transcript_chars = 0
@@ -5772,6 +5833,8 @@ class TerminalRenderer:
 
     def clear_input(self):
         self._check_owner()
+        # 帧被抹掉了，缓存的行不再对应屏幕上的东西。
+        self._last_lines = None
         if self._picker_fullscreen:
             self._write(CSI + "?1049l")
             self.flush()
@@ -6219,6 +6282,58 @@ class TerminalRenderer:
         self._last_mouse_query_signature = signature
         self._last_mouse_query_at = now
 
+    # 输入框闪烁的由来（2026-09-18 实测）：每敲一个字符，这里原本都要
+    # 「整帧擦掉再重画」—— clear_input() 发 ESC[J 抹掉整个输入区，再重写边框、
+    # 提示符和输入行，一次约 **960 字节 / 24 条转义序列**。终端会把中间那些
+    # 「已擦掉、还没画上」的状态显示出来，看起来就是输入框在闪。
+    #
+    # 试过标准解法「把整帧包进 DECSET 2026（同步输出）」，**在内联路径上不可用**：
+    # ConPTY（Windows Terminal 走的就是它）收到 2026h 之后会把输出一直扣住到
+    # 2026l，test_mode_cycle_pty / test_tui_pty 的标记等待集体超时（8 个用例）——
+    # 等于拿闪烁换「界面更新被推迟」。结论记在这里，别再试第二遍。
+    #
+    # 采用的办法是**别整帧重画**：帧结构没变（行数一致）时，只重写与上一帧
+    # 不同的那几行。打字时变的只有输入行，边框一个字节都不用动。
+    def _render_incremental(self, lines, cursor_row, cursor_col):
+        """只重写变化的行；做不到就返回 False，让调用方走整帧重画。
+
+        前提条件都是为了「不和别的写入者抢光标」：必须已经画过一帧、行数一致、
+        没有 spinner、没有半行模型输出挂在上面。任何一条不满足就老实重画。
+        """
+        previous = self._last_lines
+        if (not self._drawn or previous is None
+                or len(previous) != len(lines)
+                or self._spinner_visible
+                or self._output_partial_col is not None):
+            return False
+        changed = [i for i, line in enumerate(lines) if line != previous[i]]
+        if not changed:
+            # 只是光标动了（左右移动、点选）：连一行都不用重写。
+            self._move_within_frame(self._rows_before_cursor, cursor_row)
+            self._write("\r" + (f"{CSI}{cursor_col}C" if cursor_col else ""))
+            self.flush()
+            self._rows_before_cursor = cursor_row
+            self._last_lines = list(lines)
+            return True
+        row = self._rows_before_cursor
+        for index in changed:
+            self._move_within_frame(row, index)
+            row = index
+            # ESC[K 只擦这一行的尾巴：比 ESC[J 抹掉整片安静得多。
+            self._write("\r" + lines[index] + CSI + "K")
+        self._move_within_frame(row, cursor_row)
+        self._write("\r" + (f"{CSI}{cursor_col}C" if cursor_col else ""))
+        self.flush()
+        self._rows_before_cursor = cursor_row
+        self._last_lines = list(lines)
+        return True
+
+    def _move_within_frame(self, from_row, to_row):
+        if to_row > from_row:
+            self._write(f"{CSI}{to_row - from_row}B")
+        elif to_row < from_row:
+            self._write(f"{CSI}{from_row - to_row}A")
+
     def render(self, snapshot):
         self._check_owner()
         self._last_snapshot = snapshot
@@ -6229,6 +6344,16 @@ class TerminalRenderer:
             snapshot is not None
             and snapshot.mode == "picker"
             and snapshot.fullscreen)
+        incremental = (
+            not fullscreen and not self._picker_fullscreen
+            and snapshot is not None
+            and not (snapshot.mode == "line" and not snapshot.active))
+        if incremental:
+            width = max(20, _cols() - 1)
+            self._validate_composer_selection(snapshot, width)
+            lines, cursor_row, cursor_col = self._build_frame(snapshot, width)
+            if self._render_incremental(lines, cursor_row, cursor_col):
+                return
         if fullscreen and self._picker_fullscreen:
             # Redraw in place inside the alternate screen. Exiting/re-entering
             # it for every arrow or wheel event causes a visible flash and can
@@ -6241,10 +6366,12 @@ class TerminalRenderer:
         if snapshot is None or (
                 snapshot.mode == "line" and not snapshot.active):
             self._clear_composer_selection()
+            self._last_lines = None
             return
         width = max(20, _cols() - 1)
         self._validate_composer_selection(snapshot, width)
         lines, cursor_row, cursor_col = self._build_frame(snapshot, width)
+        self._last_lines = list(lines)
         if fullscreen:
             if not self._picker_fullscreen:
                 self._write(CSI + "?1049h")

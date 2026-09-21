@@ -5,6 +5,7 @@ from unittest import mock
 
 from core import commands
 from core import tui
+from tests.platform_support import requires_symlinks  # noqa: E402
 
 
 class CustomCommandTests(unittest.TestCase):
@@ -69,6 +70,7 @@ class CustomCommandTests(unittest.TestCase):
         self.assertTrue(any("不支持的 frontmatter" in row
                             for row in catalog.errors))
 
+    @requires_symlinks
     def test_symlink_command_is_rejected(self):
         target = self.root / "outside.md"
         target.write_text("outside", encoding="utf-8")

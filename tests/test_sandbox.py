@@ -10,6 +10,7 @@ from pathlib import Path
 
 from unittest import mock as _mock
 from core import sandbox
+from tests.platform_support import requires_namespace_sandbox  # noqa: E402
 
 
 class Result:
@@ -61,6 +62,7 @@ class FakeRuntime:
         return sandbox.UnshareSandboxAdapter(**values)
 
 
+@requires_namespace_sandbox
 class CapabilityTests(unittest.TestCase):
     def test_available_requires_readonly_and_command_probe(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -272,6 +274,7 @@ class PolicyTests(unittest.TestCase):
             )
 
 
+@requires_namespace_sandbox
 class PrepareAndRunTests(unittest.TestCase):
     def test_prepare_uses_positional_paths_and_command(self):
         with tempfile.TemporaryDirectory() as tmp:

@@ -11,6 +11,7 @@ import hashlib
 import json
 import math
 import re
+import zlib
 from dataclasses import dataclass
 from datetime import datetime, timezone
 
@@ -19,15 +20,28 @@ from . import attachments
 
 SUMMARY_VERSION = 1
 TOKEN_ESTIMATOR = "ascii-chars/4+non-ascii-chars+message-overhead"
-RECENT_LARGE_TOOL_CHARS = 12_000
-RECENT_KEEP_HEAD = 4_000
-RECENT_KEEP_TAIL = 2_000
+# 刚拿到的结果**原样**给模型看。工具在捕获时各自截过一次（tools.MAX_OUT = 30,000 字符），这一档
+# 只给忘了截的工具兜底，**不得比捕获上限更严**。以前是 12,000 → 头 4,000 + 尾 2,000：2026-09-20
+# 在真实会话上量到 90 次 read_file 里 23 次（26%）模型刚读出来的文件只看得到 6K，中间整段不可见，
+# 只能分块重读。
+RECENT_LARGE_TOOL_CHARS = 32_000
+RECENT_KEEP_HEAD = 20_000
+RECENT_KEEP_TAIL = 10_000
 OLD_KEEP_TAIL = 200
-# 工具**参数**也要老化：模型写文件时把整份内容放进 tool_calls.arguments，
-# 实测一个真实会话里这些参数占了 17% 的上下文字符，而且永不老化 —— 工具结果被
-# 收起后它们就成了最大的一块。内容早已落盘，历史里留个头就够。
-ARG_MIN_CHARS = 600
-ARG_KEEP_HEAD = 200
+# 模型自己过去的 tool_call **参数永远原样回放**，老化只动 role=tool 的结果。以前旧轮次的长参数会被
+# 收成「头 200 字 + 占位符」：在 7 个真实会话上重放，它只省 4.3% 的输入 token，却是 5 起模仿事故的
+# 全部来源（结果占位符 525 处、零模仿——那是环境的口吻，不是模型自己的），还是缓存击穿的大头之一
+# （去掉后理想缓存下需重新预填充的 token −20%）。
+
+# 投影占位符的「结构化开头」。生成器在下面（_preview_tool / materialize 的省略块）；工具层的闸
+# （tools.prepare）认的也是这个，别各写一份。「参数投影」的生成器已于 2026-09-20 删除，但正则
+# 继续认它：旧会话的原始记录里留着模型当年照抄的假占位符，模型看得见就可能再抄。
+# 为什么需要闸：占位符曾出现在模型**自己过去的 tool_call 参数**里，等于用它自己的口吻示范
+# 「长参数可以这样收尾」。2026-09-20 实查 5 起模仿（735 次长参数调用的 0.68%）：4 条 bash
+# 命令写到一半吐出走样的假占位符（引号不闭合，全部 exit 2），1 次 write_file 把一份反馈书
+# 的后 2/3 写成了假占位符——模型事后还汇报「五条差距齐了」，磁盘上只有三条。
+PROJECTION_MARKER = re.compile(
+    r"\[(?:参数投影|工具结果投影)\s+(?:field|tier)=|<context-projection-omissions>")
 
 
 def canonical_json(value):
@@ -199,6 +213,36 @@ def _prefix_sha(messages, start, end):
     return sha256(messages[start:end])
 
 
+def _boundaries(units, start, total):
+    """摘要边界可以落在哪些下标上：不切开任何协议单元的位置。
+
+    单元的**起点和终点**都算。只认终点会漏掉「紧跟在残缺 tool 对后面」的位置——残缺对
+    不属于任何单元，它后面那个单元的起点不是任何单元的终点。2026-09-20 实测：边界落在
+    一次被打断的调用之后时，刚写好的摘要会被判成 coverage_splits_conversation_turn，
+    压缩等于白做。
+    """
+    marks = {start, total}
+    for unit in units:
+        marks.add(unit.start)
+        marks.add(unit.end)
+    return marks
+
+
+def _blocking_issues(issues, boundary, total):
+    """残缺的 tool 对里，哪些真的挡得住在 ``boundary`` 处落一个摘要边界。
+
+    只有「可能还没完」的才挡路：它跨着边界，或者它就是整段记录的**最后一个单元**（工具也许
+    还在跑）。埋在历史里的那种——被 Esc 打断、后面早已有别的消息——永远不会再配对；投影层
+    本来就把它剔掉并留一条说明。以前这里是「边界之前有任何残缺对就否决」：2026-09-20 实查，
+    一个 1,079 条消息、约 44.6 万 token 的真实会话因为第 30 条和第 176 条各有一次被打断的
+    工具调用，压缩规划永远返回 None。打断工具调用是家常便饭，这条规则等于判长会话永不压缩。
+    摘要绑定了被覆盖前缀的 sha256，所以「校验时看到的历史残缺对」必然在写摘要时就已经在那里。
+    """
+    return [issue for issue in issues
+            if issue["start"] < boundary
+            and (issue["end"] > boundary or issue["end"] >= total)]
+
+
 def validate_summary(messages, summary, units=None):
     """摘要只有在覆盖边界和原始前缀哈希都仍匹配时才可使用。"""
     if not isinstance(summary, dict) or summary.get("status") != "valid":
@@ -210,16 +254,13 @@ def validate_summary(messages, summary, units=None):
         return False, "invalid_coverage"
     if not (start < covered_to <= len(messages)):
         return False, "coverage_out_of_range"
-    if units is None:
-        protocol_units, issues = build_units(messages, start)
-        units = group_turns(protocol_units)
-    else:
-        _, issues = build_units(messages, start)
-    boundaries = {start}
-    boundaries.update(u.end for u in units)
-    if covered_to not in boundaries:
+    # 边界按**协议单元**校验（用户轮次的边界是它的子集，旧摘要照样有效）。``units``
+    # 参数保留只为兼容调用方；自动压缩可以把边界落在一个超长自治轮次的中间——用户原话
+    # 由投影单独逐字回放，不靠「整轮保留」来保证。
+    protocol_units, issues = build_units(messages, start)
+    if covered_to not in _boundaries(protocol_units, start, len(messages)):
         return False, "coverage_splits_conversation_turn"
-    if any(issue["start"] < covered_to for issue in issues):
+    if _blocking_issues(issues, covered_to, len(messages)):
         return False, "coverage_crosses_incomplete_tool_pair"
     if summary.get("covered_sha256") != _prefix_sha(
             messages, start, covered_to):
@@ -240,6 +281,28 @@ def _call_metadata(assistant):
     return out
 
 
+def tool_result_digest(content):
+    """工具结果在占位符里的短摘要；expand_output 用同一个函数把它找回来。"""
+    if not isinstance(content, str):
+        content = canonical_json(content)
+    return hashlib.sha256(content.encode("utf-8", "replace")).hexdigest()[:16]
+
+
+def find_tool_result(messages, target):
+    """按占位符里的 `sha256:…` 找回原始的 role=tool 消息；找不到返回 None。"""
+    wanted = str(target or "").strip().lower()
+    if wanted.startswith("sha256:"):
+        wanted = wanted[len("sha256:"):]
+    if not re.fullmatch(r"[0-9a-f]{8,64}", wanted):
+        return None
+    for message in reversed(list(messages or ())):
+        if not isinstance(message, dict) or message.get("role") != "tool":
+            continue
+        if tool_result_digest(message.get("content") or "").startswith(wanted[:16]):
+            return message
+    return None
+
+
 def _preview_tool(content, meta, recent, age_min_chars, age_keep_head):
     if not isinstance(content, str):
         content = canonical_json(content)
@@ -253,7 +316,7 @@ def _preview_tool(content, meta, recent, age_min_chars, age_keep_head):
         head_n, tail_n, tier = age_keep_head, OLD_KEEP_TAIL, "aged"
     head = content[:head_n].rstrip()
     tail = content[-tail_n:].lstrip() if len(content) > head_n + tail_n else ""
-    digest = hashlib.sha256(content.encode("utf-8", "replace")).hexdigest()[:16]
+    digest = tool_result_digest(content)
     omitted = max(0, len(content) - len(head) - len(tail))
     exit_match = re.search(r"\[exit\s+(-?\d+)\]\s*$", content)
     if exit_match:
@@ -271,7 +334,10 @@ def _preview_tool(content, meta, recent, age_min_chars, age_keep_head):
     projected = header + "\n" + head
     if tail:
         projected += "\n…\n" + tail
-    projected += "\n[原始结果仍保存在会话事件中；需要时重新读取或调用工具。]"
+    # 指针必须是模型**看得见、抄得走**的：以前这里只说「仍保存在会话事件中」，而 expand_output
+    # 要的 tool_call_id 占位符里根本没有——2,651 个真实工具结果、525 处占位符，调用次数为 0。
+    projected += (f'\n[原文还在：expand_output(target="sha256:{digest}") 按页取回，不必重跑命令；'
+                  "文件内容以磁盘为准，直接重读。]")
     # 中等长度结果若加上可解释 header 反而更大，就保持全文；“老化”不能增肥。
     if len(projected) >= len(content):
         return content, None
@@ -283,49 +349,6 @@ def _preview_tool(content, meta, recent, age_min_chars, age_keep_head):
         "original_chars": len(content),
         "projected_chars": len(projected),
         "saved_chars": max(0, len(content) - len(projected)),
-    }
-
-
-def _preview_arguments(arguments, name):
-    """收起旧轮次里过大的工具参数；**必须保持 JSON 合法**，只换字符串值。"""
-    if not isinstance(arguments, str) or len(arguments) < ARG_MIN_CHARS:
-        return arguments, None
-    try:
-        parsed = json.loads(arguments)
-    except (ValueError, TypeError):
-        return arguments, None            # 参数不是合法 JSON：原样留着
-    if not isinstance(parsed, dict):
-        return arguments, None
-    saved = 0
-    for key, value in list(parsed.items()):
-        if not isinstance(value, str) or len(value) < ARG_MIN_CHARS:
-            continue
-        digest = hashlib.sha256(
-            value.encode("utf-8", "replace")).hexdigest()[:16]
-        head = value[:ARG_KEEP_HEAD]
-        marker = (
-            head + f"\n…[参数投影 field={key} artifact=sha256:{digest} "
-            f"original_chars={len(value):,} "
-            f"omitted_chars={len(value) - len(head):,}"
-            "；原始参数仍在会话事件里，落盘内容重新读文件即可]")
-        if len(marker) >= len(value):
-            continue                      # 投影不能增肥
-        saved += len(value) - len(marker)
-        parsed[key] = marker
-    if not saved:
-        return arguments, None
-    projected = json.dumps(parsed, ensure_ascii=False)
-    if len(projected) >= len(arguments):
-        return arguments, None
-    return projected, {
-        "artifact": "args:sha256:" + hashlib.sha256(
-            arguments.encode("utf-8", "replace")).hexdigest()[:16],
-        "tool": name,
-        "tier": "aged-arguments",
-        "status": "ok-or-unknown",
-        "original_chars": len(arguments),
-        "projected_chars": len(projected),
-        "saved_chars": max(0, len(arguments) - len(projected)),
     }
 
 
@@ -341,17 +364,8 @@ def _project_units(units, age_after_turns, age_min_chars, age_keep_head):
         messages = copy.deepcopy(list(unit.messages))
         previews = []
         if messages and messages[0].get("tool_calls"):
-            metadata = _call_metadata(messages[0])   # 先取原始 args 做表头
+            metadata = _call_metadata(messages[0])
             recent = ranks.get(unit.start, age_after_turns + 1) <= age_after_turns
-            if not recent:
-                for call in messages[0].get("tool_calls") or []:
-                    function = call.get("function") or {}
-                    projected_args, preview = _preview_arguments(
-                        function.get("arguments"),
-                        str(function.get("name") or "tool"))
-                    if preview:
-                        function["arguments"] = projected_args
-                        previews.append(preview)
             for message in messages[1:]:
                 if message.get("role") != "tool":
                     continue
@@ -365,6 +379,40 @@ def _project_units(units, age_after_turns, age_min_chars, age_keep_head):
         projected.append({"unit": unit, "messages": messages,
                           "previews": previews})
     return projected
+
+
+# 压缩后回灌的工作现场。Claude Code 压完会重读最近 5 个文件（各 5,000、共 50,000 token）并带回
+# 计划与任务状态；zylab 以前只带回路径清单，模型得自己想起来去重读。内容在**压缩那一刻**从
+# 磁盘读出、冻结进摘要记录——投影因此是确定的，不会每次请求都去读盘、也不会打断前缀缓存。
+RESTORE_FILES = 5
+RESTORE_FILE_CHARS = 16_000
+RESTORE_TOTAL_CHARS = 48_000
+# 只读过、没改过的文件价值低得多（多半是参考文档），而带回来的每个字之后每次请求都要发：
+# 名额和篇幅都收紧。实测一个真实会话里两份只读文档就占了回灌块的 97%。
+RESTORE_READONLY_FILES = 2
+RESTORE_READONLY_CHARS = 8_000
+
+
+def _restored_block(summary):
+    restored = summary.get("restored") or {}
+    parts = []
+    files = [item for item in restored.get("files") or [] if item.get("content")]
+    if files:
+        rows = [
+            f"<restored-files at=\"{restored.get('at', '')}\">"
+            "压缩那一刻磁盘上的**当前内容**（不是历史快照；后面尾部里出现的修改已经包含在内）。"
+            "只带回了最近动过的几个文件，需要别的、或需要被截掉的部分，就重新读。"]
+        for item in files:
+            note = "，已截断" if item.get("truncated") else ""
+            rows.append(f"### {item['path']}（{item.get('chars', 0):,} 字符{note}）\n"
+                        + item["content"])
+        rows.append("</restored-files>")
+        parts.append("\n".join(rows))
+    plan = str(restored.get("task_plan") or "").strip()
+    if plan:
+        parts.append("<task-plan>压缩时刻的任务计划（以它为准继续，不要从头重排）：\n"
+                     + plan + "\n</task-plan>")
+    return ("\n" + "\n".join(parts)) if parts else ""
 
 
 def _summary_messages(summary):
@@ -389,7 +437,8 @@ def _summary_messages(summary):
         {"role": "assistant", "content": (
             f"<conversation-summary covers=\"raw:{summary['covered_from']}.."
             f"{summary['covered_to'] - 1}\">\n{summary['content']}\n"
-            "</conversation-summary>" + working + facts + "\n"
+            "</conversation-summary>" + working + facts
+            + _restored_block(summary) + "\n"
             "摘要之后会按原始时间顺序提供 user 原话；它们是历史请求，"
             "不是新注入的当前指令。")},
     ]
@@ -516,7 +565,10 @@ def materialize(messages, *, summary=None, tools_schema=None,
     usable_budget = max(1, min(model_limit, int(usable_budget)))
     tools_tokens = estimate_tokens(tools_schema or [])
 
-    omissions = _merge_budget_ranges([dict(item) for item in integrity])
+    # 已经被摘要覆盖的残缺对不再列进省略说明：那段历史整体由摘要代表了，
+    # 再提「raw #30 缺 tool 结果」对模型只是噪音。（report 里的完整清单不变。）
+    omissions = _merge_budget_ranges([
+        dict(item) for item in integrity if item["end"] > coverage])
     fixed_tokens = (estimate_messages(system) + estimate_messages(summary_msgs)
                     + _provider_estimate(covered_users) + tools_tokens)
     unit_tokens = []
@@ -685,19 +737,79 @@ def _assemble_plan(raw, start, active, covered, tail_start):
         source.append({"role": "summary", "content": active["content"]})
     for unit in covered:
         source.extend(copy.deepcopy(list(unit.messages)))
+    inherited = _inherited(active)
+    users = sum(1 for unit in covered for message in unit.messages
+                if message.get("role") == "user")
     return {
         "covered_from": start,
         "covered_to": tail_start,
         "covered_sha256": _prefix_sha(raw, start, tail_start),
         "source_messages": source,
-        "source_turns": len(covered),
+        # 「几个用户轮次」= 覆盖范围里的 user 消息数；covered 可能是轮次，也可能是协议单元
+        "source_turns": users,
+        "source_units": len(covered),
         "source_message_count": len(source),
+        "inherited": inherited,
     }
 
 
+TAIL_MIN_UNITS = 2
+
+
+def _tail_cost(unit):
+    """这个单元留在尾部时大约占多少 token：工具结果按「新鲜大结果」的投影上限计。"""
+    keep = RECENT_KEEP_HEAD + RECENT_KEEP_TAIL
+    total = 0
+    for message in unit.messages:
+        content = message.get("content")
+        if (message.get("role") == "tool" and isinstance(content, str)
+                and len(content) > keep):
+            total += estimate_tokens(content[:keep]) + 4
+        else:
+            total += estimate_tokens(message) + 4
+    return total
+
+
+def _tail_start_by_tokens(units, turns, tail_tokens):
+    """按 token 预算从后往前留尾部，返回尾部第一条消息的下标。
+
+    以前的规则是「留最近 6 个用户轮次」。自治程度越高的会话用户轮次越少：2026-09-20 在
+    真实会话上重放，一个 284 条消息、约 9.8 万 token 的会话只有 6 个用户轮次——**永远
+    压不了**；一个 410 条的会话一段只能覆盖前 4 条。Claude Code 以 API 轮次为单位，Codex
+    压不下就从最旧的条目丢；共同点是压缩在任何时刻都能发生。
+    这里按**协议单元**（一条 assistant 消息连同它的工具结果）量尾部；能落在用户轮次的
+    起点上就落在那里（切口干净），只有单个轮次自己就超过预算时才切进轮次内部。用户原话
+    不受影响：被覆盖的那段里的 user 消息由投影逐字回放。
+    """
+    if not units:
+        return None
+    budget = max(1, int(tail_tokens))
+    used, cut = 0, len(units)
+    for index in range(len(units) - 1, -1, -1):
+        cost = _tail_cost(units[index])
+        if len(units) - index > TAIL_MIN_UNITS and used + cost > budget:
+            break
+        used += cost
+        cut = index
+    unit_cut = units[cut].start
+    # 同一预算内最靠前的用户轮次起点；太靠后（尾部不到预算的 1/4）就不迁就它。
+    costs = {unit.start: _tail_cost(unit) for unit in units[cut:]}
+    for turn in turns:
+        if turn.start < unit_cut:
+            continue
+        kept = sum(cost for start, cost in costs.items() if start >= turn.start)
+        if kept * 4 >= min(budget, used):
+            return turn.start
+        break
+    return unit_cut
+
+
 def plan_compaction(messages, summary=None, keep_tail=6,
-                    max_source_tokens=None):
-    """选择完整轮次边界；返回生成摘要所需的原文，或 ``None``。
+                    max_source_tokens=None, tail_tokens=None):
+    """选择摘要边界；返回生成摘要所需的原文，或 ``None``。
+
+    ``tail_tokens``：按 token 预算留尾部、以协议单元为粒度（自动 / 手动压缩用这个，
+    见 ``_tail_start_by_tokens``）。不给则沿用「留最近 ``keep_tail`` 个用户轮次」。
 
     ``max_source_tokens`` 给摘要请求的**输入**设上限。为什么需要：一次把 143 轮
     压成 138K token 的提示，provider 要跑两三分钟，模型也更容易写偏（实测把
@@ -711,9 +823,22 @@ def plan_compaction(messages, summary=None, keep_tail=6,
     valid, _ = validate_summary(raw, summary, turns)
     active = summary if valid else None
     coverage = active["covered_to"] if active else start
+    if tail_tokens:
+        pending = [u for u in protocol_units if u.start >= coverage]
+        tail_start = _tail_start_by_tokens(
+            pending, [t for t in turns if t.start >= coverage], tail_tokens)
+        if tail_start is None or tail_start <= coverage:
+            return None
+        if _blocking_issues(issues, tail_start, len(raw)):
+            return None
+        covered = [unit for unit in pending if unit.end <= tail_start]
+        if not covered:
+            return None
+        return _bounded_plan(raw, start, active, covered, tail_start,
+                             max_source_tokens)
     remaining = [u for u in turns if u.start >= coverage]
     if keep_tail <= 0:
-        # keep_tail=0 是 recap 用的：它不替换上下文，所以不需要给尾部留原文，
+        # keep_tail=0：调用方不拿摘要替换上下文，所以不需要给尾部留原文，
         # 覆盖到最后一个**完整**轮次为止即可。
         if not remaining:
             return None
@@ -724,21 +849,28 @@ def plan_compaction(messages, summary=None, keep_tail=6,
         tail_start = remaining[-keep_tail].start
     if tail_start <= coverage:
         return None
-    if any(issue["start"] < tail_start for issue in issues):
+    if _blocking_issues(issues, tail_start, len(raw)):
         return None
     covered = [unit for unit in remaining if unit.end <= tail_start]
     if keep_tail <= 0 and covered:
         tail_start = covered[-1].end
     if not covered:
         return None
+    return _bounded_plan(raw, start, active, covered, tail_start,
+                         max_source_tokens)
+
+
+def _bounded_plan(raw, start, active, covered, tail_start, max_source_tokens):
     if not max_source_tokens:
         return _assemble_plan(raw, start, active, covered, tail_start)
 
     # 二分找「渲染后仍不超预算」的最长前缀。渲染而不是估算原文，因为
     # summary_prompt 会把工具结果截到 600 字，两者能差一个数量级。
     def fits(count):
-        plan = _assemble_plan(
-            raw, start, active, covered[:count], covered[count - 1].end)
+        # 这一段的终点 = 下一个单元的起点：中间若夹着残缺 tool 对，边界落在它后面，
+        # 让那段空隙也算进覆盖范围（否则它会永远挂在投影的省略说明里）。
+        end = covered[count].start if count < len(covered) else tail_start
+        plan = _assemble_plan(raw, start, active, covered[:count], end)
         return estimate_tokens(summary_prompt(plan)) <= max_source_tokens, plan
 
     ok, plan = fits(len(covered))
@@ -773,10 +905,9 @@ def plan_compaction_to(messages, covered_to, summary=None):
 
     protocol_units, issues = build_units(raw, start)
     turns = group_turns(protocol_units)
-    if any(issue["start"] < covered_to for issue in issues):
+    if _blocking_issues(issues, covered_to, len(raw)):
         raise ValueError("summary cutoff 跨过不完整 tool call/result")
-    boundaries = {unit.end for unit in turns}
-    if covered_to not in boundaries:
+    if covered_to not in _boundaries(turns, start, len(raw)) - {start}:
         raise ValueError("summary cutoff 会切断完整用户轮次")
 
     valid, _ = validate_summary(raw, summary, turns)
@@ -804,10 +935,88 @@ def plan_compaction_to(messages, covered_to, summary=None):
         "source_messages": source,
         "source_turns": len(selected),
         "source_message_count": len(source),
+        "inherited": _inherited(active),
     }
 
 
-def summary_prompt(plan):
+def _inherited(active):
+    """上一代摘要里**不在正文里**的结构化部分。链式压缩时新摘要的 source 只有旧摘要的
+    正文（一条伪消息），`pinned` 和 `working_set` 是另存的——不显式带过来就在第二代蒸发了
+    （2026-09-20 执行过的测试证实）。阈值、硬约束、否决记录恰恰是最不该随代数衰减的东西。"""
+    if not active:
+        return {}
+    return {"pinned": list(active.get("pinned") or []),
+            "working_set": [dict(item) for item in active.get("working_set") or []]}
+
+
+def plan_anchor_lines(plan):
+    """这一代要逐字带回的值 = 上一代带回来的 + 这一段新出现的，同一套打分与预算。"""
+    inherited = (plan.get("inherited") or {}).get("pinned") or []
+    carried = [{"role": "summary", "content": "\n".join(inherited)}] if inherited else []
+    return anchor_lines(carried + list(plan.get("source_messages") or []))
+
+
+def plan_working_set(plan):
+    """工作集同理：旧的在前、新的在后，同一路径以最后一次为准，「改」压过「读」。"""
+    merged = {}
+    rows = list((plan.get("inherited") or {}).get("working_set") or [])
+    rows += working_set(plan.get("source_messages"))
+    for item in rows:
+        path, verb = item.get("path"), item.get("verb")
+        if not path:
+            continue
+        previous = merged.pop(path, None)
+        merged[path] = "改" if "改" in (previous or "", verb or "") else (verb or previous)
+    return _trim_working_set(merged)
+
+
+SUMMARY_HEADINGS = ("objective", "constraints", "decisions", "files_changed",
+                    "evidence", "pending", "risks")
+_HEADING = re.compile(r"^#{1,3}\s*([a-z_]+)\b", re.I | re.M)
+
+
+def summary_defects(text, finish_reason=None):
+    """这份摘要能不能装上去。返回缺陷代码列表，空 = 可以。
+
+    摘要一旦装上，就**永久替换**了模型眼里的那段历史，所以宁可拒收。以前「只要非空就接受」：
+    2026-09-20 在真实网关上测到一份写满 6000 token 后陷入重复循环的摘要（「见 evidence 段。
+    见 evidence 段。…」，七个标题只有四个，漏掉 15 个锚定值）——它会被原样装上去。
+
+      truncated   输出额度用尽（finish_reason=length）：后半截没写完，多半缺 pending / risks
+      degenerate  陷入重复：尾部 1500 字的压缩比 < 0.06（正常文字约 0.6，规整的要点列表约 0.1，
+                  循环约 0.02），或同一句话在尾部出现 ≥ 10 次
+      structure   规定的七个标题少于 5 个，或没有 objective
+    """
+    text = str(text or "").strip()
+    defects = []
+    if str(finish_reason or "") == "length":
+        defects.append("truncated")
+    tail = text[-1500:]
+    if len(tail) >= 400:
+        raw = tail.encode("utf-8")
+        counts = {}
+        for piece in re.split(r"[。\n]", tail):
+            piece = piece.strip()
+            if len(piece) >= 4:
+                counts[piece] = counts.get(piece, 0) + 1
+        if (len(zlib.compress(raw, 9)) / len(raw) < 0.06
+                or max(counts.values(), default=0) >= 10):
+            defects.append("degenerate")
+    found = {name.lower() for name in _HEADING.findall(text)}
+    present = [name for name in SUMMARY_HEADINGS if name in found]
+    if len(present) < 5 or "objective" not in found:
+        defects.append("structure")
+    return defects
+
+
+DEFECT_TEXT = {
+    "truncated": "输出被额度截断",
+    "degenerate": "正文陷入重复",
+    "structure": "缺少规定的标题",
+}
+
+
+def summary_prompt(plan, instructions=None):
     rows = []
     # Text snapshots are expanded for compaction, otherwise a historical
     # ``@paper.txt`` would collapse to a path token and lose its evidence.
@@ -830,11 +1039,11 @@ def summary_prompt(plan):
             names = [str((c.get("function") or {}).get("name") or "tool")
                      for c in calls]
             content += "\n[tool_calls: " + ", ".join(names) + "]"
-        # 标上轮次号，摘要才能给每条结论留下可回溯的锚点（recap 渲染成 ·t42）
+        # 标上轮次号，摘要才能给每条结论留下可回溯的锚点
         rows.append(f"[t{turn} {role}]\n{content}")
     # 会话在前、指令在后。指令放前面时模型会把「整理摘要」本身当成 objective
     # 写进去（2026-09-07 实测），因为那才是它看到的最后一条要求。
-    pinned = anchor_lines(source_messages)
+    pinned = plan_anchor_lines(plan)
     pinned_block = ""
     if pinned:
         pinned_block = (
@@ -859,6 +1068,11 @@ def summary_prompt(plan):
         "顺序错了会让接手的人拿着过时结论干活。\n"
         "- **被否决的方案也要写进 decisions**，格式 `[rejected] <方案> —— <原因>`。"
         "这类最不能丢：不记否决，接手的人会重新提案已经被否掉的东西。\n"
+        "- pending 里写清**此刻正在做的那一步**和紧接着的下一步：压缩可能发生在一件事"
+        "做到一半的时候，接手的人要能从断点继续，而不是从头再来。\n"
+        "- 要点式、紧凑，不要复述对话过程；写不下就砍细节，别砍标题。\n"
+        + (("- 用户对这次摘要的附加要求：" + str(instructions).strip() + "\n")
+           if str(instructions or "").strip() else "") +
         "- 严格保留以下七个标题，顺序不变：\n"
         "## objective\n## constraints\n## decisions\n## files_changed\n"
         "## evidence\n## pending\n## risks"
@@ -891,8 +1105,21 @@ def working_set(messages):
             # 同一文件既读又写时保留「写/改」——那才是要交接的事实
             previous = seen.pop(path, None)
             seen[path] = "改" if "改" in (previous or "", verb) else verb
-    items = list(seen.items())[-WORKING_SET_LIMIT:]
-    return [{"path": path, "verb": verb} for path, verb in items]
+    return _trim_working_set(seen)
+
+
+def _trim_working_set(seen):
+    """有界清单里**改过 / 写过的文件优先于只读过的**：位置不够时先让出「读」。
+
+    只按「最后碰过」排的话，早先改过的文件会被后面一串只读的路径挤掉——而要交接的
+    事实恰恰是「我动过哪些文件」。输出仍按最后一次出现的顺序（新的在后）。
+    """
+    items = list(seen.items())
+    modified = [path for path, verb in items if verb != "读"][-WORKING_SET_LIMIT:]
+    room = WORKING_SET_LIMIT - len(modified)
+    reads = [path for path, verb in items if verb == "读"]
+    keep = set(modified) | set(reads[-room:] if room > 0 else [])
+    return [{"path": path, "verb": verb} for path, verb in items if path in keep]
 
 
 # --- 高信号内容锚定 ------------------------------------------------------
@@ -1049,10 +1276,10 @@ def missing_anchors(summary_text, pinned):
 
 def make_summary(content, plan, *, model, gateway):
     return {
-        "working_set": working_set(plan.get("source_messages")),
+        "working_set": plan_working_set(plan),
         # 旧摘要没有这个键，读侧一律 .get(...) —— validate_summary 不枚举字段，
         # 所以加字段不必升 SUMMARY_VERSION，旧会话的摘要照样通过校验。
-        "pinned": anchor_lines(plan.get("source_messages")),
+        "pinned": plan_anchor_lines(plan),
         "version": SUMMARY_VERSION,
         "status": "valid",
         "content": str(content).strip(),

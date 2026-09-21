@@ -14,6 +14,7 @@ from unittest import mock
 from unittest import mock as _mock
 from core import agent as agent_module
 from core import agents, client, store, subagent, tools
+from tests.platform_support import requires_symlinks  # noqa: E402
 
 
 def execution():
@@ -384,6 +385,7 @@ class AgentRuntimeTests(unittest.TestCase):
         self.assertIn("RuntimeError: child exploded", record["result"])
         self.assertIn("子代理失败", failed_text)
 
+    @requires_symlinks
     def test_protected_and_symlink_roots_are_rejected(self):
         with _mock.patch.dict(
                 os.environ,

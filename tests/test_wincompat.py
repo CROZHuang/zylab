@@ -9,6 +9,7 @@
 """
 import contextlib
 import os
+import pathlib
 import subprocess
 import sys
 import tempfile
@@ -34,7 +35,13 @@ class FlockContract(unittest.TestCase):
             os.unlink(self.lockpath)
 
     def test_exclusive_lock_blocks_second_process(self):
-        """同一路径的 LOCK_EX 必须跨进程互斥。"""
+        """同一路径的 LOCK_EX 必须跨进程互斥，**且拿不到锁要抛 BlockingIOError**。
+
+        抛而不是返回 False：Python 的 fcntl.flock 就是这个语义（返回 False 是 C 的
+        约定），而 zylab 的调用方全部靠 `except BlockingIOError` 判断「别人占着」。
+        这条用例原本钉的是返回 False —— 与实现一起错。2026-09-21 在 Linux 上实测到
+        后果：graft 的两个 builder 同时开建、worker 吐不出完整 envelope。
+        """
         fd_a = os.open(self.lockpath, os.O_RDWR | os.O_CREAT, 0o600)
         try:
             self.assertTrue(wincompat.flock(fd_a, wincompat.LOCK_EX))
@@ -42,15 +49,19 @@ class FlockContract(unittest.TestCase):
                 "import os, sys; sys.path.insert(0, {root!r}); "
                 "from core import wincompat; "
                 "fd = os.open({path!r}, os.O_RDWR | os.O_CREAT, 0o600); "
-                "print(wincompat.flock(fd, wincompat.LOCK_EX | wincompat.LOCK_NB))"
+                "\ntry:\n"
+                "    wincompat.flock(fd, wincompat.LOCK_EX | wincompat.LOCK_NB)\n"
+                "    print('ACQUIRED')\n"
+                "except BlockingIOError:\n"
+                "    print('BLOCKED')\n"
             ).format(root=ROOT, path=str(self.lockpath))
-            # 子进程对同一文件加非阻塞锁，必须失败（契约：竞争失败
-            # 返回 False，两侧平台统一；拿到锁返回 True）
+            # 子进程对同一文件加非阻塞锁，必须拿不到
             probe = subprocess.run(
                 [sys.executable, "-c", code], capture_output=True, text=True,
                 timeout=10)
             self.assertEqual(probe.returncode, 0, probe.stderr)
-            self.assertIn("False", probe.stdout)
+            self.assertIn("BLOCKED", probe.stdout)
+            self.assertNotIn("ACQUIRED", probe.stdout)
         finally:
             wincompat.flock(fd_a, wincompat.LOCK_UN)
             os.close(fd_a)
@@ -81,19 +92,49 @@ class ProcessGroupContract(unittest.TestCase):
     """进程树终止契约。"""
 
     def test_terminate_process_tree_kills_children(self):
-        proc = subprocess.Popen(
-            ["bash", "-c", "sleep 30 & sleep 30"],
-            start_new_session=True)
-        time.sleep(0.4)
-        try:
-            self.assertTrue(
-                wincompat.terminate_process_tree(proc.pid, grace=1.0))
-            rc = proc.wait(timeout=5)
-            self.assertLess(rc, 0)   # 被信号杀死
-        finally:
-            with contextlib.suppress(Exception):
-                proc.kill()
-                proc.wait(timeout=5)
+        """契约是「**整棵树**都没了」，不是退出码长什么样。
+
+        原来断言 `rc < 0`（POSIX 用负数编码「被信号杀死」）。Windows 上
+        taskkill /F 给的是 1 —— 于是这条在 Windows 上必红，而它真正要证明的
+        「孙子进程也被收掉」两个平台**都没验**。改成直接查两个 pid 的存活。
+        用 python 起子进程而不是 `bash -c 'sleep &'`：Git Bash 的 `$!` 是 MSYS
+        pid，和 Windows pid 不是一回事，拿来查存活没有意义。
+        """
+        with tempfile.TemporaryDirectory() as tmp:
+            pidfile = Path(tmp) / "child.pid"
+            code = (
+                "import subprocess, sys, time;"
+                "child = subprocess.Popen("
+                "[sys.executable, '-c', 'import time; time.sleep(30)']);"
+                "open(sys.argv[1], 'w').write(str(child.pid));"
+                "time.sleep(30)")
+            proc = subprocess.Popen(
+                [sys.executable, "-c", code, str(pidfile)],
+                **wincompat.popen_group_kwargs())
+            try:
+                deadline = time.monotonic() + 10
+                while time.monotonic() < deadline and not pidfile.exists():
+                    time.sleep(0.05)
+                grandchild = int(pidfile.read_text().strip())
+                self.assertTrue(
+                    wincompat.pid_alive(grandchild), "孙子进程应已启动")
+
+                self.assertTrue(
+                    wincompat.terminate_process_tree(proc.pid, grace=1.0))
+                proc.wait(timeout=10)
+
+                deadline = time.monotonic() + 5
+                while (time.monotonic() < deadline
+                       and wincompat.pid_alive(grandchild)):
+                    time.sleep(0.05)
+                self.assertFalse(
+                    wincompat.pid_alive(proc.pid), "leader 应已退出")
+                self.assertFalse(
+                    wincompat.pid_alive(grandchild), "孙子进程也必须被收掉")
+            finally:
+                with contextlib.suppress(Exception):
+                    proc.kill()
+                    proc.wait(timeout=5)
 
 
 class FdAtContract(unittest.TestCase):
@@ -151,13 +192,23 @@ class WindowsImportSimulation(unittest.TestCase):
     import 链上会拉它们，而 Windows 的对应标准库有自己的实现，不受影响。
     """
 
-    # core.wincompat 本身按 sys.platform 分支 import fcntl —— 在 Linux 上跑
-    # 必然走 POSIX 分支，不能纳入这个模拟（它的 Windows 分支要真机验证）。
-    MODULES = (
-        "core.tui", "core.termcaps", "core.apprender",
-        "core.tasks", "core.tools", "core.graft", "core.graft_worker",
-        "core.store", "core.settings", "core.models", "core.checkpoints",
-    )
+    # 名单是**枚举出来的**，不是手写的。手写名单只能防住已经犯过的错：
+    # 2026-09-21 合并时 git 自动合并把 `import fcntl` 还给了四个模块，其中
+    # core.store / core.models 恰好在名单里才被抓到；同一次合并里 zylab.py
+    # 这个真正的入口一直不在名单上。新加一个模块不该需要有人记得来改这里。
+    #
+    # 唯一的例外是 core.wincompat 自己：它按 sys.platform 分支 import fcntl，
+    # 在 Linux 上必然走 POSIX 分支，纳进来只会恒红（它的 Windows 分支要真机验证）。
+    EXCLUDED = frozenset({"core.wincompat"})
+
+    @classmethod
+    def modules(cls):
+        root = pathlib.Path(ROOT)
+        found = ["zylab"]          # 入口本身，10k 行，最不该漏
+        found += sorted(
+            f"core.{path.stem}" for path in (root / "core").glob("*.py")
+            if path.stem != "__init__")
+        return [m for m in found if m not in cls.EXCLUDED]
 
     def _import_with_posix_blocked(self, modname):
         # 说明：无法在 Linux 上完整伪造 Windows（shutil 在 win32 下会拉真
@@ -188,7 +239,9 @@ class WindowsImportSimulation(unittest.TestCase):
             timeout=30)
 
     def test_core_modules_import_without_posix_stdlib(self):
-        for mod in self.MODULES:
+        names = self.modules()
+        self.assertGreater(len(names), 30, f"枚举只找到 {names}，路径不对？")
+        for mod in names:
             with self.subTest(module=mod):
                 r = self._import_with_posix_blocked(mod)
                 self.assertEqual(

@@ -76,15 +76,52 @@ def tearDownModule():
 
 
 class GatewayDefaults(unittest.TestCase):
-    def test_builtin_profiles_ship_no_endpoint_address(self):
-        """闸门：网关地址是部署事实，不能回到代码里。
+    # 这条闸门 2026-09-21 收窄了口径。原规矩是「内置 profile 一律不带地址」，
+    # 初衷是别把维护者的内网端点写进代码。但它顺带挡住了公开厂商——陌生人
+    # clone 下来 `zylab init --gateway openai` 会收到「未知网关」，而要新增网关
+    # 又得先手写 settings.json。厂商官方 endpoint 是公开文档，不是部署事实。
+    # 现在分两类钉：自建网关仍然一个字的地址都不带；公开厂商必须是 https 的
+    # 厂商域名（本机推理例外，只允许 localhost）。
+    SELF_HOSTED = {"deepinfer", "boyue"}
+    LOCAL_ONLY = {"ollama", "lmstudio"}
 
-        内置 profile 只提供名字和 key 变量名；谁想加地址，加进配置。
-        """
+    def test_self_hosted_profiles_still_ship_no_endpoint_address(self):
+        for name in self.SELF_HOSTED:
+            with self.subTest(gateway=name):
+                self.assertIn(name, client.BUILTIN_GATEWAYS)
+                self.assertNotIn("base", client.BUILTIN_GATEWAYS[name])
+
+    def test_every_builtin_profile_names_its_key_variable(self):
         for name, cfg in client.BUILTIN_GATEWAYS.items():
             with self.subTest(gateway=name):
-                self.assertNotIn("base", cfg)
-                self.assertTrue(cfg["keys"])
+                self.assertTrue(cfg["keys"], "没有 key 变量名就没法收 key")
+
+    def test_shipped_vendor_addresses_are_public_https_hosts(self):
+        """防的是「有人把某个内网地址塞回代码」。"""
+        import urllib.parse                               # noqa: PLC0415
+
+        for name, cfg in client.BUILTIN_GATEWAYS.items():
+            base = cfg.get("base")
+            if not base:
+                continue
+            with self.subTest(gateway=name):
+                parts = urllib.parse.urlsplit(base)
+                host = parts.hostname or ""
+                if name in self.LOCAL_ONLY:
+                    self.assertIn(host, ("localhost", "127.0.0.1"),
+                                  "本机推理只允许 localhost")
+                    continue
+                self.assertEqual(parts.scheme, "https", f"{name} 必须是 https")
+                self.assertNotRegex(host, r"^\d+\.\d+\.\d+\.\d+$",
+                                    "裸 IP 是部署事实，不该进代码")
+                self.assertIn(".", host)
+                self.assertFalse(
+                    host.endswith((".local", ".internal", ".lan")),
+                    "内网域名不该进代码")
+
+    def test_a_public_vendor_resolves_without_any_user_config(self):
+        self.assertEqual(client.route_for("openai").base,
+                         "https://api.openai.com/v1")
 
     def test_base_resolves_from_env_then_settings(self):
         with mock.patch.dict(
@@ -874,61 +911,186 @@ class DSMLLeakFilterTests(unittest.TestCase):
     """DeepSeek 偶发把 tool-call 语法写进 content 通道（<｜DSML｜tool_calls>）。
 
     流式过滤必须做到：
-    1. 标记被 chunk 边界劈开时也能剥干净；
-    2. 剥掉的块里若有合法 tool call JSON，回收成真正的 tool 事件；
-    3. 正文其他内容原样保留。
+    1. 标记被 chunk 边界劈在**任何位置**都能剥干净——包括劈在开标签中间；
+    2. 剥掉的块里的调用要回收成真正的 tool 事件，两种参数写法都认；
+    3. 模型在正文里**谈论 / 引用**这个标记时一个字都不能动。
+
+    2026-09-20：第一版在真实网关上 7 次里漏了 3 次。当时的用例把分片切在完整开标签之后
+    （leak[:20]），正好绕开了缺陷；真实的流是按 token 切的。所以下面每个用例都跑一组分片
+    粒度，含逐字符。
     """
 
-    def _events(self, lines):
+    SIZES = (10_000, 20, 7, 3, 1)
+    JSON_FORM = ('<｜DSML｜tool_calls>\n'
+                 '<｜DSML｜invoke name="bash">\n'
+                 '<｜DSML｜parameter name="arguments" string="false">'
+                 '{"command": "ls"}\n'
+                 '</｜DSML｜parameter>\n'
+                 '</｜DSML｜invoke>\n'
+                 '</｜DSML｜tool_calls>')
+    # DeepSeek 原生写法：一个参数一个元素，string= 说明值是裸字符串还是 JSON
+    NAMED_FORM = ('<｜DSML｜tool_calls>\n'
+                  '<｜DSML｜invoke name="expand_output">\n'
+                  '<｜DSML｜parameter name="target" string="true">sha256:9faeb2cd578fadd2'
+                  '</｜DSML｜parameter>\n'
+                  '<｜DSML｜parameter name="page" string="false">2</｜DSML｜parameter>\n'
+                  '</｜DSML｜invoke>\n'
+                  '</｜DSML｜tool_calls>')
+
+    def _run(self, content, size, finish="stop", structured=None):
+        lines = [sse(chunk(content=content[i:i + size]))
+                 for i in range(0, len(content), size)]
+        if structured:
+            lines.append(sse(chunk(tool_calls=structured)))
+        lines += [sse({"choices": [{"delta": {}, "finish_reason": finish}]}),
+                  "data: [DONE]\n"]
         with mock.patch.object(client._OPENER, "open",
                                return_value=FakeResponse(lines)):
-            return list(client.stream_chat(
+            events = list(client.stream_chat(
                 "deepseek-v4-pro", [{"role": "user", "content": "x"}]))
-
-    def test_dsml_leak_split_across_chunks_is_stripped(self):
-        leak = ('<｜DSML｜tool_calls>\n'
-                '<｜DSML｜invoke name="bash">\n'
-                '<｜DSML｜parameter name="arguments" string="false">'
-                '{"command": "ls"}\n'
-                '</｜DSML｜parameter>\n'
-                '</｜DSML｜invoke>\n'
-                '</｜DSML｜tool_calls>')
-        events = self._events([
-            sse(chunk(content="答案前半")),
-            sse(chunk(content=leak[:20])),
-            sse(chunk(content=leak[20:])),
-            sse(chunk(content="答案后半")),
-            sse({"choices": [{"delta": {}, "finish_reason": "stop"}]}),
-            "data: [DONE]\n",
-        ])
         text = "".join(e["v"] for e in events if e["t"] == "text")
-        self.assertIn("答案前半", text)
-        self.assertIn("答案后半", text)
-        self.assertNotIn("DSML", text)
-        self.assertNotIn("tool_calls", text)
+        calls = [(call["function"]["name"], json.loads(call["function"]["arguments"]))
+                 for e in events if e["t"] == "tool" for call in e["v"]]
+        return text, calls, events
 
-    def test_dsml_leak_tool_call_is_recovered(self):
-        leak = ('<｜DSML｜tool_calls>\n'
-                '<｜DSML｜invoke name="bash">\n'
-                '<｜DSML｜parameter name="arguments" string="false">'
-                '{"command": "ls"}\n'
-                '</｜DSML｜parameter>\n'
-                '</｜DSML｜invoke>\n'
-                '</｜DSML｜tool_calls>')
-        events = self._events([
-            sse(chunk(content=leak)),
-            sse({"choices": [{"delta": {}, "finish_reason": "stop"}]}),
-            "data: [DONE]\n",
-        ])
-        tools = [e for e in events if e["t"] == "tool"]
-        self.assertEqual(len(tools), 1)
-        self.assertEqual(tools[0]["v"][0]["function"]["name"], "bash")
+    def _each_size(self, content, want_text, want_calls, **kwargs):
+        for size in self.SIZES:
+            with self.subTest(chunk=size):
+                text, calls, _ = self._run(content, size, **kwargs)
+                self.assertEqual(text, want_text)
+                self.assertEqual(calls, want_calls)
 
-    def test_plain_text_untouched(self):
-        events = self._events([
-            sse(chunk(content="普通正文，没有泄漏")),
-            sse({"choices": [{"delta": {}, "finish_reason": "stop"}]}),
-            "data: [DONE]\n",
-        ])
-        text = "".join(e["v"] for e in events if e["t"] == "text")
-        self.assertEqual(text, "普通正文，没有泄漏")
+    def test_a_leak_is_stripped_and_recovered_however_the_stream_is_chunked(self):
+        self._each_size("让我看看。\n" + self.JSON_FORM, "让我看看。\n",
+                        [("bash", {"command": "ls"})])
+
+    def test_the_native_one_element_per_parameter_form_is_recovered_too(self):
+        """以前这种写法被剥掉后不回收：模型的调用凭空消失，这一轮什么都没干就结束。"""
+        self._each_size("让我看看。\n" + self.NAMED_FORM + "\n", "让我看看。\n",
+                        [("expand_output",
+                          {"target": "sha256:9faeb2cd578fadd2", "page": 2})])
+
+    def test_the_other_outer_tag_name_is_recognised(self):
+        self._each_size(self.JSON_FORM.replace("tool_calls", "function_calls"), "",
+                        [("bash", {"command": "ls"})])
+
+    def test_prose_that_mentions_the_marker_is_left_alone(self):
+        text = "流式分片可能把 `<｜DSML｜tool_calls>` 标记劈在两个 chunk 里；a < b 也没事。"
+        self._each_size(text, text, [])
+
+    def test_a_quoted_block_followed_by_prose_is_not_a_call(self):
+        text = "格式如下：\n" + self.JSON_FORM + "\n以上就是 DeepSeek 的原生写法。"
+        self._each_size(text, text, [])
+
+    def test_a_block_inside_a_code_fence_is_not_a_call(self):
+        text = "示例：\n```\n" + self.JSON_FORM + "\n```\n"
+        self._each_size(text, text, [])
+
+    def test_an_unclosed_block_still_yields_its_complete_invokes(self):
+        cut = self.JSON_FORM[:self.JSON_FORM.index("</｜DSML｜tool_calls>")]
+        self._each_size("查一下。" + cut, "查一下。", [("bash", {"command": "ls"})])
+
+    def test_a_block_truncated_mid_argument_is_dropped_without_showing_markup(self):
+        cut = self.JSON_FORM[:self.JSON_FORM.index('"ls"')]
+        self._each_size("查一下。" + cut, "查一下。", [], finish="length")
+
+    def test_consecutive_blocks_are_parallel_calls_not_a_quote(self):
+        second = self.JSON_FORM.replace('"ls"', '"pwd"')
+        self._each_size("同时查两样。\n" + self.JSON_FORM + "\n" + second + "\n", "同时查两样。\n",
+                        [("bash", {"command": "ls"}), ("bash", {"command": "pwd"})])
+
+    def test_a_real_call_after_a_quoted_block_is_still_recovered(self):
+        quoted = "格式长这样：\n" + self.JSON_FORM + "\n好，现在真的查一下。\n"
+        self._each_size(quoted + self.NAMED_FORM, quoted,
+                        [("expand_output",
+                          {"target": "sha256:9faeb2cd578fadd2", "page": 2})])
+
+    # 2026-09-20 真实网关上抓到的原件（截短）：外层开标签被网关的解析器吃掉了，正文以裸 invoke
+    # 开头，后面是几百个重复的闭标签；同一条响应的结构化字段里另有一个调用。
+    DEGENERATE = ('<｜DSML｜invoke name="bash">\n'
+                  '<｜DSML｜parameter name="command" string="true">sed -n \'9935,9940'
+                  '</｜DSML｜parameter>\n</｜DSML｜invoke>\n</｜DSML｜tool_calls>\n'
+                  '</｜DSML｜invoke>\n</｜DSML｜tool_calls>\n</｜DSML｜>\n</invoke>\n'
+                  '</｜DSML｜_command>\n' + '</invoke>\n' * 40 + 'invoke>\n</invoke>\n</invok')
+
+    def test_a_bare_invoke_with_closing_tag_debris_never_reaches_the_user(self):
+        structured = [{"index": 0, "id": "call_9", "function": {
+            "name": "read_file", "arguments": "{\"path\": \"/repo/x\"}"}}]
+        for size in self.SIZES:
+            with self.subTest(chunk=size):
+                text, calls, _ = self._run(self.DEGENERATE, size, structured=structured)
+                self.assertEqual(text, "")
+                self.assertEqual(calls, [("read_file", {"path": "/repo/x"})])
+
+    def test_orphan_closing_tags_never_reach_the_user(self):
+        """同一天抓到的另外两个原件：网关把调用解析走了，正文里只剩闭标签。"""
+        structured = [{"index": 0, "id": "call_9", "function": {
+            "name": "bash", "arguments": "{\"command\": \"ls\"}"}}]
+        loop = ("</｜DSML｜invoke>\n</｜DSML｜tool_calls>\n</｜DSML｜invoke>\n</invoke>\n"
+                + "</invoke>\n" * 60 + "invoke>\n</｜DSML｜parameter>\n</invok")
+        for content in ("</｜DSML｜tool_calls>", loop):
+            for size in self.SIZES:
+                with self.subTest(chunk=size, content=content[:24]):
+                    text, calls, _ = self._run(content, size, structured=structured)
+                    self.assertEqual(text, "")
+                    self.assertEqual(calls, [("bash", {"command": "ls"})])
+
+    def test_a_quoted_partial_block_in_a_fence_is_left_alone(self):
+        """真实会话里的原件：模型在代码块里引用了半个块（有开标签和 invoke，没有闭标签），
+        后面接着讲解。逐字符分片时 ``` 本身会被劈开，代码块的判断不能依赖它整个到达。"""
+        text = ("你贴的屏幕上是：\n\n```\n<｜DSML｜tool_calls>\n<｜DSML｜invoke name=\"bash\">\n```\n\n"
+                "这是 DSML 格式。但我刚才复现测试里模拟的是 `<tool_calls>`。")
+        self._each_size(text, text, [])
+
+    def test_the_same_partial_quote_outside_a_fence_is_left_alone_too(self):
+        """invoke 里只能是 parameter 元素；跟了别的，就不是调用。"""
+        text = ("格式的开头是 <｜DSML｜tool_calls>\n<｜DSML｜invoke name=\"bash\">\n然后才是参数，"
+                "每个参数一个元素。")
+        self._each_size(text, text, [])
+
+    def test_parameter_values_may_contain_anything(self):
+        body = "echo '```'; echo '</invoke>'; cat <<'EOF'\n<｜DSML｜invoke name=\"x\">\nEOF\n"
+        leak = ('<｜DSML｜tool_calls>\n<｜DSML｜invoke name="bash">\n'
+                '<｜DSML｜parameter name="command" string="true">' + body
+                + '</｜DSML｜parameter>\n</｜DSML｜invoke>\n</｜DSML｜tool_calls>')
+        self._each_size("跑一下。\n" + leak, "跑一下。\n", [("bash", {"command": body})])
+
+    def test_prose_about_the_closing_tag_is_left_alone(self):
+        text = "闭标签 `</｜DSML｜tool_calls>` 之后如果还有正文，就是引用而不是调用。"
+        self._each_size(text, text, [])
+
+    def test_a_bare_invoke_is_recovered_when_nothing_structured_came_with_it(self):
+        self._each_size("看一眼。\n" + self.DEGENERATE, "看一眼。\n",
+                        [("bash", {"command": "sed -n '9935,9940"})])
+
+    def test_structured_tool_calls_win_over_a_leaked_copy(self):
+        """调用方对 tool 事件是整份替换：两边都有时只执行结构化的那份，不重复执行。"""
+        structured = [{"index": 0, "id": "call_1", "function": {
+            "name": "bash", "arguments": "{\"command\": \"pwd\"}"}}]
+        for size in self.SIZES:
+            with self.subTest(chunk=size):
+                text, calls, events = self._run(
+                    self.JSON_FORM, size, structured=structured)
+                self.assertEqual(text, "")
+                self.assertEqual(calls, [("bash", {"command": "pwd"})])
+                self.assertEqual(sum(1 for e in events if e["t"] == "tool"), 1)
+
+    def test_recovered_call_ids_do_not_repeat_across_requests(self):
+        ids = set()
+        for _ in range(20):
+            _, _, events = self._run(self.JSON_FORM, 7)
+            ids.update(call["id"] for e in events if e["t"] == "tool" for call in e["v"])
+        self.assertEqual(len(ids), 20)
+
+    def test_plain_text_and_other_models_are_untouched(self):
+        text = "普通正文，没有泄漏 <b>html</b> 1 < 2"
+        self._each_size(text, text, [])
+        lines = [sse(chunk(content=self.JSON_FORM)),
+                 sse({"choices": [{"delta": {}, "finish_reason": "stop"}]}),
+                 "data: [DONE]\n"]
+        with mock.patch.object(client._OPENER, "open",
+                               return_value=FakeResponse(lines)):
+            events = list(client.stream_chat(
+                "glm-5.3", [{"role": "user", "content": "x"}]))
+        self.assertEqual("".join(e["v"] for e in events if e["t"] == "text"),
+                         self.JSON_FORM, "只对已知会泄漏的模型族启用过滤")

@@ -11,8 +11,12 @@ from tests.pty_harness import PTYSend, run_pty_child
 from tests.test_thinking_pty import HEAD
 
 TAIL = r'''
+from core import away_recap
 def fake_stream(model, messages, **kwargs):
-    calls["n"] += 1
+    # resume 之后会后台现写一行 recap（09-20 起）：那是另一回事，单独计数。
+    # 这条测试钉的是**回放本身**不花任何调用。
+    is_recap = messages[-1].get("content") == away_recap.PROMPT
+    calls["recap" if is_recap else "n"] = calls.get("recap" if is_recap else "n", 0) + 1
     yield {"t": "done", "reason": "stop", "usage": {}}
 client.stream_chat = fake_stream
 agent.session_id = "full-replay"

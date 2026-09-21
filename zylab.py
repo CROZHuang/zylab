@@ -62,14 +62,16 @@ if __name__ == "__main__":
     except OSError as _exc:                       # noqa: BLE001
         sys.stderr.write(f"  ! 状态目录位置核对失败：{_exc}\n")
 from core import (agent as A, agent_events as AGENT_EVENTS, agents as AGENTS,
-                attachments as ATTACHMENTS,
+                attachments as ATTACHMENTS, wincompat,
+                away_recap as AWAY_RECAP,
                 thinking as THINKING,
                 checkpoints as CHECKPOINTS,
                 client, consults as CONSULTS, context as CONTEXT,
                 controller as C, commands as CUSTOM_COMMANDS,
                 graft as GRAFT,
                 graft_component as GRAFT_COMPONENT,
-                memory as MEMORY, model_health as HEALTH, models as M,
+                memory as MEMORY, memory_extract as MEMORY_EXTRACT,
+                model_health as HEALTH, models as M,
                 plans as PLANS, goals as GOALS, recipes as RECIPES, skills as SKILLS,
                 settings as CFG, store, version as VERSION,
                 tasks as TASKS, workflows as WORKFLOWS,
@@ -816,8 +818,21 @@ class Session:
         self._catalog_notices = []
         self._catalog_thread = None
         self._catalog_checked_at = 0.0
-        self._recap_thread = None
-        self._recap_notices = []
+        # away recap：控制器在 bind_interactive 里建（非交互模式没有）。后台线程只往
+        # _away_recap_ready 里放，渲染与落盘都在主循环里做。
+        self.away_recap_ctl = None
+        self._away_recap_lock = threading.Lock()
+        self._away_recap_ready = []
+        # 自动记忆抽取：一轮结束、静置够久就在后台抽一次；写盘与渲染只在主线程做。
+        self._memory_extract_lock = threading.Lock()
+        self._memory_extract_ready = []
+        self._memory_extract_thread = None
+        self._memory_extract_cancel = None
+        self._memory_extract_due = None
+        self._memory_extract_users = 0
+        self._memory_extract_summary = None
+        self._turn_running = False
+        self._resume_recap_pending = False
         self._agent_activity = {}
         self._active_agent_count = 0
         self._workflow_apply_ids = set()
@@ -862,6 +877,7 @@ class Session:
         tools.HOOK_CTX["context_capsule"] = self.build_context_capsule
         tools.HOOK_CTX["workspace_changed"] = self._workspace_changed
         self.ag.checkpoint_prepared = self.checkpoint_prepared
+        self.ag.compaction_state = self._compaction_state
         try:
             self.refresh_memory_context()
         except MEMORY.MemoryError:
@@ -2295,6 +2311,7 @@ class Session:
             self.refresh_command_guidance(publish=False, force=True)
         self.ag.permission_decision = self.permission_decision
         controller = self.reset_controller()
+        self.start_away_recap()
         self.sync_transcript()
         return controller
 
@@ -3184,6 +3201,9 @@ class Session:
             self._pending_route = None
 
     def close(self):
+        recap_controller = getattr(self, "away_recap_ctl", None)
+        if recap_controller is not None:
+            recap_controller.dispose()                # 定时器与在途请求都别拖住退出
         manager = getattr(self, "task_manager", None)
         workflow_manager = getattr(self, "workflow_manager", None)
         workspace = getattr(self, "agent_workspace", None)
@@ -3527,19 +3547,45 @@ class Session:
         }
 
     def expand_output_for_tool(self, payload):
-        """按 tool_call_id / task_id 取回工具输出原文的一页。"""
+        """按占位里的 sha256:… / task_id / tool_call_id 取回工具输出原文的一页。"""
         payload = dict(payload or {})
         target = str(payload.get("target") or "").strip()
         page = int(payload.get("page") or 1)
+        # 占位里**写出来的**是 sha256:…——先拿它在会话原始记录里认人；认得出来就顺着它的
+        # tool_call_id 去找落盘的完整输出（后台 / 前台 bash 都有），没有落盘的再退回原始记录。
+        messages = getattr(getattr(self, "ag", None), "messages", None)
+        message = CONTEXT.find_tool_result(messages, target)
+        hint = str((message or {}).get("tool_call_id") or "") or target
         manager = self.task_manager
         try:
-            view = manager.artifact_page(target, page=page)
+            view = manager.artifact_page(hint, page=page)
         except TASKS.TaskError as exc:
-            return {"target": target, "error": str(exc)}
+            if message is None:
+                return {"target": target, "error": str(exc)}
+            view = None
+        if view is None and message is None:
+            try:
+                message = _tool_message_for_expand(messages, target)
+            except TASKS.TaskError as exc:
+                return {"target": target, "error": str(exc)}
         if view is None:
-            return {"target": target,
-                    "error": "没有这个 artifact；占位行里的 tool_call_id/task_id "
-                             "才是有效 target"}
+            if message is None:
+                return {"target": target,
+                        "error": "没有这个目标；照抄占位行里的 sha256:…，"
+                                 "或给 task_id / tool_call_id"}
+            try:
+                chunk = _fallback_result_page(message, page)
+            except TASKS.TaskError as exc:
+                return {"target": target, "error": str(exc)}
+            return {
+                "target": target,
+                "page": page,
+                "text": chunk["text"],
+                "total_bytes": chunk["total_bytes"],
+                "has_more": bool(chunk["has_more"]),
+                "next_page": page + 1 if chunk["has_more"] else None,
+                "missing_streams": [],
+            }
         # artifact_page 返回按流切分的 sections，拼起来给模型，并说清还有没有下一页
         sections = view.get("sections") or []
         parts = []
@@ -3704,45 +3750,317 @@ class Session:
         self._agent_cache_at.pop(record["id"], None)
         return item
 
-    # ---------------------------------------------------------- 交接摘要
-    def maybe_refresh_session_recap(self):
-        """turn 结束后顺带看看交接摘要是否该更新；在后台跑，不挡任何事。
+    def _compaction_state(self):
+        """压缩时随摘要带回的会话级状态：agent 自己看不到任务计划（它归 Session 管）。"""
+        return {"task_plan": getattr(self, "task_plan", None)}
 
-        为什么在 turn 结束而不是 resume 时生成：resume 时再花两三分钟调模型，
-        人早就开始干活了；而 turn 结束这一刻上下文正好完整。崩溃最多丢
-        recap_refresh_turns 轮。
-        """
+    # ---------------------------------------------------------- away recap
+    # 照搬 Claude Code 的 awaySummary。何时写、何时不打扰在 core/away_recap.py；
+    # 这里只把它接到会话上：状态从哪读、用哪条 route 写、结果怎么交回主循环。
+    def start_away_recap(self):
+        """交互会话才有：订阅终端焦点事件，离开够久就后台写一行 recap 等人回来。"""
+        policy = CFG.recap_policy(getattr(self, "cfg", None))
+        controller = AWAY_RECAP.AwayRecapController(
+            generate=self._generate_away_recap, state=self._away_recap_state,
+            deliver=self._deliver_away_recap, enabled=policy["enabled"],
+            delay=policy["away_seconds"], hint=AWAY_RECAP_HINT,
+            cancel_factory=client.CancellationHandle)
+        self.away_recap_ctl = controller
         try:
-            policy = CFG.recap_policy(getattr(self, "cfg", None))
-            if not policy["enabled"]:
-                return None
-            thread = getattr(self, "_recap_thread", None)
-            if thread is not None and thread.is_alive():
-                return None
-            if not self.ag.recap_is_stale(
-                    min_tokens=policy["min_tokens"],
-                    refresh_turns=policy["refresh_turns"]):
-                return None
-        except Exception:                             # noqa: BLE001
-            return None
+            self.pump.on_focus = controller.focus_changed
+        except AttributeError:                        # 嵌入方自带的 pump 不支持
+            pass
+        return controller
 
-        def work():
-            try:
-                result = self.ag.refresh_session_recap()
-            except Exception:                         # noqa: BLE001
-                return
-            if not result or str(result).startswith("[摘要生成失败"):
-                return
+    def _away_recap_background(self):
+        """还在跑的后台工作。有就不打扰：它们的完成通知更要紧，recap 也马上过时。"""
+        count = 0
+        try:
+            count += int(self._count_active_agents(max_age=5.0))
+        except Exception:                             # noqa: BLE001
+            pass
+        try:
+            manager = getattr(self, "task_manager", None)
+            if manager is not None:
+                count += sum(
+                    1 for task in manager.list()
+                    if task.status not in TASKS.TERMINAL_STATES)
+        except Exception:                             # noqa: BLE001
+            pass
+        return count
+
+    def _away_recap_state(self):
+        editor = getattr(getattr(self, "pump", None), "editor", None)
+        last = getattr(self.ag, "away_recap", None) or {}
+        return {
+            "loading": bool(getattr(self, "_turn_running", False)),
+            "draft": bool(str(getattr(editor, "text", "") or "").strip()),
+            "background": self._away_recap_background(),
+            "messages": list(self.ag.messages or ()),
+            "last_recap_users": last.get("users"),
+        }
+
+    def _generate_away_recap(self, cancel=None):
+        # 工具名单与主循环同源：刚 resume、本进程还没发过主请求时，旁路请求靠它
+        # 拼出和下一次主请求相同的前缀。
+        return self.ag.generate_away_recap(
+            cancel=cancel, allowed_tools=self.allowed_tool_names())
+
+    def _deliver_away_recap(self, text, raw):
+        """后台线程的出口：只入队。写屏和写会话文件都不是线程安全的。"""
+        with self._away_recap_lock:
+            self._away_recap_ready.append((str(text), raw))
+
+    def take_away_recap(self):
+        """仅主线程：取走待显示的 recap 并记进会话。返回要显示的文字或 None。"""
+        with self._away_recap_lock:
+            ready, self._away_recap_ready = self._away_recap_ready, []
+        if not ready:
+            return None
+        text, raw = ready[-1]                         # 同一段对话只留最新的一条
+        if raw is not None:                           # None = 本来就是落盘的那条
+            self.ag.record_away_recap(raw)
             try:
                 self.save()
             except Exception:                         # noqa: BLE001
                 pass
+        return text
 
-        thread = threading.Thread(
-            target=work, name="session-recap", daemon=True)
-        self._recap_thread = thread
-        thread.start()
-        return thread
+    def away_recap_turn(self, running):
+        """一轮的起止。开始：取消定时器、中止在途生成、丢掉没来得及显示的那条
+        （都已过时）；结束：重新按「离开多久」计时。"""
+        self._turn_running = bool(running)
+        controller = getattr(self, "away_recap_ctl", None)
+        if running:
+            lock = getattr(self, "_away_recap_lock", None)
+            if lock is not None:
+                with lock:
+                    self._away_recap_ready.clear()
+            if controller is not None:
+                controller.turn_started()
+        elif controller is not None:
+            controller.turn_ended()
+
+    # ---- 自动记忆抽取 ----------------------------------------------------
+    # 为什么不靠主模型顺手写：2,925 条助手消息里 memory_write 调用 0 次（09-20 实测）。
+    # 触发点是用户 09-21 定的：空闲 / 会话结束 + 压缩时，不是每轮。
+
+    def memory_extract_turn(self, running):
+        """一轮的起止。开始：中止在途抽取（上下文要变了）；结束：重新计时。"""
+        if running:
+            cancel = self._memory_extract_cancel
+            if cancel is not None:
+                cancel.set()
+            self._memory_extract_due = None
+            return
+        self._memory_extract_due = time.monotonic() + MEMORY_EXTRACT.IDLE_SECONDS
+
+    def _memory_extract_ready_to_run(self):
+        """够不够条件抽一次：静置到点、没有别的事在跑、且确实有新东西。"""
+        if not (self.memory_generate and self.memory_use):
+            return False
+        if self._turn_running or self._memory_extract_thread is not None:
+            return False
+        due = self._memory_extract_due
+        if due is None or time.monotonic() < due:
+            return False
+        users = AWAY_RECAP.real_user_messages(self.ag.messages)
+        if users < MEMORY_EXTRACT.MIN_USER_MESSAGES:
+            return False
+        summary = (getattr(self.ag, "context_summary", None) or {}).get(
+            "covered_sha256")
+        # 压缩过一段就一定抽一次：那段细节马上就只剩摘要了。
+        compacted = summary is not None and summary != self._memory_extract_summary
+        if not compacted and users - self._memory_extract_users < (
+                MEMORY_EXTRACT.MIN_NEW_USER_MESSAGES):
+            return False
+        return True
+
+    def memory_extract_tick(self):
+        """仅主线程，空闲时调用：到点就起后台抽取；有结果就落盘并返回一行提示。"""
+        if self._memory_extract_ready_to_run():
+            self._memory_extract_due = None
+            self._memory_extract_users = AWAY_RECAP.real_user_messages(
+                self.ag.messages)
+            self._memory_extract_summary = (
+                getattr(self.ag, "context_summary", None) or {}).get(
+                    "covered_sha256")
+            cancel = client.CancellationHandle()
+            self._memory_extract_cancel = cancel
+            index = (getattr(self, "memory_index", {}) or {}).get("text") or ""
+            thread = threading.Thread(
+                target=self._memory_extract_background, args=(cancel, index),
+                name="memory-extract", daemon=True)
+            self._memory_extract_thread = thread
+            thread.start()
+        with self._memory_extract_lock:
+            ready, self._memory_extract_ready = self._memory_extract_ready, []
+        if not ready:
+            return None
+        saved = []
+        for result in ready:
+            saved.extend(self._store_extracted(result))
+        if not saved:
+            return None
+        return saved
+
+    def _memory_extract_background(self, cancel, index_text):
+        """后台线程：只发请求、只入队。写盘和写屏都不是线程安全的。"""
+        try:
+            result = self.ag.extract_memories(
+                index_text=index_text, cancel=cancel,
+                allowed_tools=self.allowed_tool_names())
+        except Exception as exc:                      # noqa: BLE001 - 抽取不能弄崩会话
+            result = {"kind": "failed", "entries": [], "text": str(exc)}
+        finally:
+            self._memory_extract_thread = None
+            self._memory_extract_cancel = None
+        if result.get("kind") == "ok" and result.get("entries"):
+            with self._memory_extract_lock:
+                self._memory_extract_ready.append(result)
+
+    def _store_extracted(self, result):
+        """仅主线程：把抽出来的条目写进 project memory。
+
+        永远只写 project 域——global 会跨项目注入未来所有会话，那必须由人逐次确认
+        （现有规矩，见 tools._assess_memory_risk）。
+        """
+        saved = []
+        for entry in result.get("entries") or ():
+            stable_key = entry["stable_key"]
+            target = str(entry.get("updates") or "")
+            if target:
+                try:
+                    existing = self.memory_store.get(
+                        target, cwd=self._session_cwd)
+                except MEMORY.MemoryError:
+                    existing = None
+                # 只认「同样是自动抽出来的、且有稳定键」的条目：不去覆盖人写的记忆。
+                if (existing and existing.get("stable_key")
+                        and str(existing.get("kind") or "").startswith("auto")):
+                    stable_key = existing["stable_key"]
+            try:
+                row = self.memory_store.add(
+                    entry["content"], title=entry["name"],
+                    scope=MEMORY.PROJECT, cwd=self._session_cwd,
+                    source_session=self.ag.session_id,
+                    evidence={
+                        "writer": "auto_extract",
+                        "model": result.get("model"),
+                        "gateway": result.get("gateway"),
+                    },
+                    kind="auto_extract", stable_key=stable_key,
+                    entry_type=entry["type"], description=entry["description"])
+            except MEMORY.MemoryError as exc:
+                self._memory_error = str(exc)
+                continue
+            saved.append(row)
+        if saved:
+            try:
+                self.refresh_memory_context()
+            except MEMORY.MemoryError:
+                pass
+            try:
+                self.save()
+            except Exception:                         # noqa: BLE001
+                pass
+        return saved
+
+    def request_resume_recap(self):
+        """resume 之后给一条 recap。上次那条之后没有新提问 → 直接用落盘的（零调用）；
+        否则后台现写。启动时 --resume 那会儿 REPL 还没起来，先记下，起来后补。"""
+        controller = getattr(self, "away_recap_ctl", None)
+        if controller is None or getattr(self, "renderer", None) is None:
+            self._resume_recap_pending = True
+            return "pending"
+        self._resume_recap_pending = False
+        if not CFG.recap_policy(getattr(self, "cfg", None))["enabled"]:
+            return None
+        stored = getattr(self.ag, "away_recap", None) or {}
+        users = AWAY_RECAP.real_user_messages(self.ag.messages)
+        if stored.get("text") and stored.get("users") == users:
+            self._deliver_away_recap(stored["text"], None)
+            return "stored"
+        controller.request()
+        return "generating"
+
+    def generate_recap_now(self):
+        """/recap：后台线程写，主线程盯着 Esc / Ctrl+C。慢网关上一次要一两分钟
+        （09-20 实测 glm-5.3@deepinfer 首字 128s），不能把 REPL 锁死在里面。"""
+        return self._run_side_query("写 recap", self._generate_away_recap,
+                                    {"kind": "failed", "text": ""})
+
+    def extract_memories_now(self):
+        """/memory capture：立刻抽一次跨会话记忆（与自动触发同一条通道）。"""
+        index = (getattr(self, "memory_index", {}) or {}).get("text") or ""
+
+        def work(cancel=None):
+            return self.ag.extract_memories(
+                index_text=index, cancel=cancel,
+                allowed_tools=self.allowed_tool_names())
+
+        result = self._run_side_query("抽记忆", work,
+                                      {"kind": "failed", "entries": []})
+        if result.get("kind") != "ok":
+            return result, []
+        return result, self._store_extracted(result)
+
+    def _run_side_query(self, label, work, failure):
+        """旁路请求的统一外壳：后台线程发，主线程盯着 Esc / Ctrl+C。"""
+        pump = getattr(self, "pump", None)
+        renderer = getattr(self, "renderer", None)
+        if pump is None or renderer is None:
+            with Spinner(label):
+                return work()
+        cancel = client.CancellationHandle()
+        box = {}
+
+        def run():
+            try:
+                box["result"] = work(cancel)
+            except Exception as exc:                  # noqa: BLE001
+                box["result"] = dict(
+                    failure, text=f"{type(exc).__name__}: {exc}")
+
+        worker = threading.Thread(target=run, name="side-query", daemon=True)
+        started = time.monotonic()
+        shown = None
+
+        def show_wait():
+            nonlocal shown
+            elapsed = int(time.monotonic() - started)
+            if elapsed != shown:
+                shown = elapsed
+                renderer.render(self.refresh_composer(
+                    busy=True, prompt=self.composer_prompt(busy=True),
+                    activity=f"{label} {elapsed}s · Esc 取消", publish=False))
+
+        show_wait()                                   # 先说在干什么，再发请求
+        worker.start()
+        try:
+            while worker.is_alive():
+                show_wait()
+                event = pump.get(0.2)
+                if event is None:
+                    self.heartbeat_lease()
+                elif event.kind == "redraw":
+                    renderer.render(event.snapshot)
+                elif event.kind in ("cancel", "interrupt"):
+                    cancel.cancel()
+                elif event.kind == "error":
+                    raise event.value
+                else:
+                    if event.kind == "eof":
+                        cancel.cancel()               # 退出优先，别让人等旁路请求
+                    self._deferred_pump_events.append(event)
+        finally:
+            if worker.is_alive():                     # 只有异常路径会走到这
+                cancel.cancel()
+            renderer.clear_input()
+        worker.join(timeout=5)
+        if cancel.is_set():
+            return dict(failure, kind="aborted")
+        return box.get("result") or dict(failure)
 
     # ---------------------------------------------------------- 模型目录自适应
     def maybe_refresh_catalog(self):
@@ -3988,6 +4306,25 @@ class Session:
             lines.append(f"{label}  {text}")
         return tuple(lines)
 
+    def _chat_history_if_changed(self):
+        """当前 chat 换了（resume / new / clear / fork / 回滚）就返回它的输入历史。
+
+        惰性同步，而不是往各条切换路径里挂钩子：那些都是带回滚分支的事务性
+        长函数，逐个挂既容易漏、又可能干扰回滚。`ag.session_id` 是唯一事实源，
+        每次合成 composer 帧前比对一次即可；没变时只是一次字符串比较。
+        输入目标正指向子代理时先不动（那张历史表属于子代理），回到主输入再同步。
+        """
+        ag = getattr(self, "ag", None)
+        current = str(getattr(ag, "session_id", "") or "")
+        if not current or current == getattr(self, "_input_history_session", None):
+            return None
+        editor = getattr(self.pump, "editor", None)
+        if getattr(editor, "target", None) is not None:
+            return None
+        self._input_history_session = current
+        return _history(
+            session_id=current, messages=getattr(ag, "messages", None))
+
     def refresh_composer(self, *, busy=None, prompt=None, activity=None,
                          publish=True):
         """把会话属性、queue 与 editor 合成一帧；不直接写 stdout。"""
@@ -4014,6 +4351,10 @@ class Session:
             "dock": dock,
             "status": status_line(self),
         }
+        chat_history = self._chat_history_if_changed()
+        if chat_history is not None:
+            # configure() 在持锁状态下整表替换**当前目标**的历史，不切换目标。
+            kwargs["target_history"] = chat_history
         if busy is not None:
             kwargs["busy"] = busy
         if prompt is not None:
@@ -5365,7 +5706,8 @@ class Session:
                     if live_command is not None:
                         _, command_handler, command_rest = (
                             live_command)
-                        store.append_history(event.text)
+                        store.append_history(
+                        event.text, session_id=self.ag.session_id)
                         flush_model(force=True)
                         self.renderer.clear_input()
                         self.renderer.finish_output_line()
@@ -5393,7 +5735,8 @@ class Session:
                             continue
                     if custom is not None:
                         _, expanded = custom
-                        store.append_history(event.text)
+                        store.append_history(
+                        event.text, session_id=self.ag.session_id)
                         action = self.controller.submit(
                             expanded, C.QueueMode.NEXT_TURN)
                         if action is not None:
@@ -5429,7 +5772,8 @@ class Session:
                         self.renderer.render(snapshot)
                         continue
                     mode = input_mode(event)
-                    store.append_history(event.text)
+                    store.append_history(
+                        event.text, session_id=self.ag.session_id)
                     try:
                         action = self.controller.submit(event.text, mode)
                     except C.ControllerError:
@@ -6203,23 +6547,46 @@ class Session:
                     self._title = saved_title
             except (FileNotFoundError, ValueError, KeyError):
                 pass
-        if path is not None and self.memory_generate:
-            try:
-                self.memory_store.capture_session(
-                    self.ag, title=self._title,
-                    cwd=self._session_cwd, task_plan=self.task_plan)
-                self._memory_error = None
-            except Exception as exc:  # memory failure cannot corrupt chat save
-                self._memory_error = f"{type(exc).__name__}: {exc}"
-                store.log(
-                    "memory_capture_failed",
-                    session=self.ag.session_id,
-                    error=self._memory_error)
         return path
 
 
-def _history(limit=200):
-    """给 InputPump 的初始历史；canonical JSONL 优先，旧 readline 文件兜底。"""
+def _history(limit=200, *, session_id=None, messages=None):
+    """给 InputPump 的输入历史。
+
+    传了 `session_id` 就按 chat **分层**（09-20 用户报告：在 chat 里 ↑ 翻到的是
+    整个 zylab 的历史，自己的和别的 chat 的交错在一起）：本 chat 的输入排在
+    最近处，↑ 先走完它们；更早的位置才是别的 chat 的输入。分层而不是隔绝，
+    是因为「冷启动的新 chat 按 ↑ / Ctrl+R 能找回上一个会话的提问」是既有的
+    PTY 契约（test_history_and_browse_pty / parity A6），严格隔绝会废掉它。
+    本 chat 的部分 = 旧段（从它自己的 user 消息重建——打标记之前的输入无法
+    从全局文件归属）+ 带 `session` 标记的记录（含斜杠命令）。
+    不传 `session_id` 时保持原行为：canonical JSONL 优先，旧 readline 文件兜底。
+    """
+    if session_id:
+        tagged = [record["input"] for record in store.read_history(
+            limit=limit, session_id=session_id)]
+        asked = [
+            message["content"] for message in (messages or ())
+            if isinstance(message, dict) and message.get("role") == "user"
+            and isinstance(message.get("content"), str)
+            and message["content"].strip()
+            # "[…]" 开头的是运行时合成的通知（中断、后台任务等），不是用户敲的。
+            and not message["content"].lstrip().startswith("[")]
+        # 消息没有时间戳，无法与带标记的记录按时间对齐；但带标记的提问与消息
+        # 尾部一一对应，消息里多出来的前缀就是打标记之前的旧段。
+        # `/命令` 与 `!shell` 会进历史却不会变成 user 消息，不能算作提问。
+        # （被中断的提问、自定义命令展开仍会让计数略偏——后果只是**旧 chat 的
+        # 旧段**边界差几条，可接受；打标记之后的输入始终是完整的。）
+        prompts = sum(1 for text in tagged if not text.startswith(("/", "!")))
+        legacy = asked[:max(0, len(asked) - prompts)]
+        own = legacy + tagged
+        # 别的 chat 的输入垫在前面（更早的位置）。旧 chat 的提问同时以无标记形式
+        # 躺在全局文件里，按文本去重，免得同一句话在两层各出现一次。
+        mine = set(own)
+        others = [record["input"] for record in store.read_history(limit=limit)
+                  if str(record.get("session") or "") != str(session_id)
+                  and record["input"] not in mine]
+        return (others + own)[-limit:]
     records = store.read_history(limit=limit)
     if records:
         return [record["input"] for record in records]
@@ -6259,8 +6626,13 @@ def status_line(sess):
         bits.append(DIM("仅聊天"))
     context_tokens = getattr(sess, "last_ctx", None)
     if context_tokens is not None:
-        bits.append(
-            f"ctx {context_tokens/1000:.0f}K/{ag.compact_at/1000:.0f}K")
+        usage = f"ctx {context_tokens/1000:.0f}K/{ag.compact_at/1000:.0f}K"
+        breaker = getattr(ag, "compaction_breaker_open", None)
+        if callable(breaker) and breaker():
+            usage = YELLOW(usage + " · 自动压缩暂停")
+        elif ag.compact_at and context_tokens >= 0.85 * ag.compact_at:
+            usage = YELLOW(usage + " · 将压缩")     # 想自己挑时机就现在 /compact
+        bits.append(usage)
     else:
         bits.append(f"ctx {ag.compact_at/1000:.0f}K usable")
     if getattr(sess, "plan_mode", False):
@@ -6657,284 +7029,59 @@ def show_resumed_transcript(sess, messages):
     """Resume into the normal chat surface —— 与实时输出同一条渲染路径。"""
     return replay_transcript(sess, messages)
 
-
-_RECAP_LINE_CHARS = 96
-
-
-def _recap_clip(text):
-    """按**显示列宽**截断，不是字符数：中文一个字占两列，按字符截会让
-    96 个汉字排成 192 列，在终端里换行成两行还常腰斩在关键字上。"""
-    flat = " ".join(str(text or "").split())
-    if tui.display_width(flat) <= _RECAP_LINE_CHARS:
-        return flat
-    # 必须是「按列裁剪」而不是「按列换行取第一行」：换行会在长 token（比如
-    # 一个 session UUID）之前提前断开，剩下的可用宽度全浪费掉。
-    return tui.truncate_display(flat, _RECAP_LINE_CHARS - 1) + "…"
+# ---------------------------------------------------------------- away recap
+# 照搬 Claude Code 的 awaySummary：模型现写的一行「总目标 + 当前任务 + 下一步」。
+# 以前这里是从落盘数据拼出来的多行结构块（目标/已定/已否/计划/未竟），零调用，
+# 但应付不了开放式的会话——没有 task_plan、没撞到压缩阈值的会话它就无话可说。
+AWAY_RECAP_HINT = "（不想要自动 recap：settings.json 里 recap_auto 设为 false）"
 
 
-# 摘要条目的来源锚点与类目：`[t42] 冻结 v4 疾病树` / `[rejected] 方案 X —— 原因`
-_RECAP_TAG = re.compile(r"^\[([^\]]{1,24})\]\s*(.+)$")
+def render_away_recap(text):
+    """一行、整体 dim：recap 是给人扫一眼的路标，不和模型正文抢注意力。"""
+    return DIM(f"  ※ recap · {text}") + "\r\n"
 
 
-def _recap_entry(line):
-    """拆出 (kind, anchor, text)。没有标记的条目照旧当普通决策。"""
-    text = str(line or "").strip()
-    match = _RECAP_TAG.match(text)
-    if not match:
-        return {"kind": "decision", "anchor": None, "text": text}
-    tag, rest = match.group(1).strip().lower(), match.group(2).strip()
-    if tag in {"rejected", "否决", "已否"}:
-        return {"kind": "rejected", "anchor": None, "text": rest}
-    turn = re.fullmatch(r"t(\d{1,6})", tag)
-    if turn:
-        return {"kind": "decision", "anchor": int(turn.group(1)),
-                "text": rest}
-    return {"kind": "decision", "anchor": None, "text": text}
-
-
-def _recap_render_entry(entry):
-    body = _recap_clip(entry["text"])
-    return body + (DIM(f" ·t{entry['anchor']}")
-                   if entry.get("anchor") is not None else "")
-
-
-# 招呼语/续接词不是「最初目标」。实测 297df6609726 的第一条 user 是 `hello`
-# （它自己是从更早的会话 resume 出来的），recap 于是把「目标」写成了 hello。
-_RECAP_TRIVIAL = frozenset({
-    "hello", "hi", "hey", "yo", "go", "ok", "okay", "start", "continue",
-    "test", "ping", "你好", "在吗", "继续", "开始", "嗨", "哈喽",
-})
-
-
-def _recap_first_objective(users):
-    """回落到用户原话时，跳过招呼语，取第一条有实质内容的。"""
-    for message in users:
-        text = " ".join(str(message.get("content") or "").split())
-        if not text:
-            continue
-        if text.casefold().strip("！!。.~") in _RECAP_TRIVIAL:
-            continue
-        return text
-    return None
-
-
-def _recap_normalize(text):
-    """比较用的归一形式：去掉空白与标点，只留内容字符。"""
-    return re.sub(r"[\s\W_]+", "", str(text or "")).casefold()
-
-
-def _recap_drop_duplicate_pending(pendings, plan_items):
-    """task_plan 在盘上就以它为准；摘要里语义等价的 pending 不再重复渲染。
-
-    两份不一致的待办清单比一份不全的更坏 —— 续轮的 agent 不知道该信谁。
-    """
-    known = [_recap_normalize(item.get("content"))
-             for item in plan_items or []]
-    known = [item for item in known if len(item) >= 4]
-    kept = []
-    for pend in pendings:
-        norm = _recap_normalize(pend)
-        if len(norm) >= 4 and any(
-                norm in item or item in norm for item in known):
-            continue
-        kept.append(pend)
-    return kept
-
-
-def _recap_summary_sections(content):
-    """把结构化摘要的 `## section` 正文抠出来；`unknown` 行按空处理。"""
-    sections, current = {}, None
-    for raw in str(content or "").splitlines():
-        line = raw.strip()
-        head = re.match(r"^##\s*([A-Za-z_]+)\s*$", line)
-        if head:
-            current = head.group(1).lower()
-            sections.setdefault(current, [])
-            continue
-        if current and line and line.lower() not in ("unknown", "- unknown"):
-            sections[current].append(line.lstrip("-· ").strip())
-    return {k: v for k, v in sections.items() if v}
-
-
-def format_recap(record, *, replay_limit=20):
-    """Resume 后的自动 recap。零 API 调用，全部来自已落盘数据。
-
-    **只在回放之外还有增量信号时渲染**，否则返回空串不制造噪音：
-      - 会话长于回放窗口 → 回放只剩尾部，补「最初目标」（第一条 user 原话）；
-      - 有未完成的 task_plan → 补进度和当前项；
-      - 有结构化摘要 → 补 objective / decisions / pending。
-    短会话、无计划、无摘要时回放本身已是完整画面，recap 一个字不打。
-    """
-    if not isinstance(record, dict):
-        return ""
-    messages = [m for m in (record.get("messages") or ())
-                if isinstance(m, dict)]
-    users = [
-        m for m in messages
-        if m.get("role") == "user" and not _is_internal_goal_message(m)
-    ]
-    lines = []
-
-    sections = {}
-    context_blob = (record.get("context")
-                    if isinstance(record.get("context"), dict) else {})
-    summary = context_blob.get("summary")
-    recap_source = None
-    if isinstance(summary, dict) and summary.get("status", "valid") == "valid":
-        sections = _recap_summary_sections(summary.get("content"))
-        recap_source = "compact"
-    if not sections:
-        # 压缩摘要只在撞到上下文上限时才有（238K），而大多数会话永远够不到。
-        # 交接摘要就是为这些会话准备的：同样的七节格式，只是不进投影。
-        handoff = context_blob.get("recap")
-        if isinstance(handoff, dict) and handoff.get("content"):
-            sections = _recap_summary_sections(handoff.get("content"))
-            recap_source = "handoff" if sections else None
-
-    visible = [
-        m for m in messages
-        if m.get("role") in ("user", "assistant")
-        and not _is_internal_goal_message(m)
-    ]
-    head_cut = len(visible) > max(0, int(replay_limit))
-    goal = record.get("goal")
-    try:
-        goal = GOALS.normalize_record(goal)
-    except Exception:                                 # noqa: BLE001
-        goal = None
-
-    objective = (sections.get("objective") or [None])[0]
-    if objective is None and head_cut and users and goal is None:
-        # 有 goal 时它的 objective 才是当前目标，别再拿第一条原话冒充
-        objective = _recap_first_objective(users)
-    if objective:
-        lines.append(("目标", _recap_clip(objective)))
-
-    entries = [_recap_entry(row) for row in sections.get("decisions") or []]
-    decided = [row for row in entries if row["kind"] == "decision"]
-    rejected = [row for row in entries if row["kind"] == "rejected"]
-    # 长会话里早期决策常被推翻（v14 作废、v17b 判不能发）。带锚点就按锚点倒序，
-    # 没有锚点才退回摘要给出的顺序 —— 拿着过时结论干活比没有 recap 更糟。
-    if any(row["anchor"] is not None for row in decided):
-        decided.sort(key=lambda row: (row["anchor"] is None,
-                                      -(row["anchor"] or 0)))
-    for row in decided[:2]:
-        lines.append(("已定", _recap_render_entry(row)))
-    # 否决最不能丢：不记否决，续轮会重新提案已经被否掉的方案
-    for row in rejected[:1]:
-        lines.append(("已否", _recap_render_entry(row)))
-
-    plan = record.get("task_plan")
-    try:
-        plan = PLANS.normalize_record(plan)
-    except Exception:
-        plan = PLANS.empty()
-    items = plan.get("items") or []
-    done = sum(1 for i in items if i.get("status") == "completed")
-    plan_open = bool(items) and done < len(items)
-    if plan_open:
-        current = next((i for i in items
-                        if i.get("status") == "in_progress"), None)
-        pending = next((i for i in items
-                        if i.get("status") == "pending"), None)
-        bits = [f"{done}/{len(items)}"]
-        if current:
-            bits.append("◩ " + _recap_clip(current.get("content")))
-        elif pending:
-            bits.append("□ " + _recap_clip(pending.get("content")))
-        lines.append(("待办", " · ".join(bits)))
-
-    if goal is not None:
-        phase = goal["phase"]
-        progress_text = (
-            f"{goal['rounds_started']}/{goal['max_rounds']} rounds · {phase}")
-        if goal.get("last_evidence"):
-            progress_text += " · " + _recap_clip(goal["last_evidence"])
-        lines.append(("Goal", _recap_clip(goal["objective"])))
-        lines.append(("Goal状态", progress_text))
-        # 恢复的人真正要的是「下一步干什么」，不是完成百分比
-        if goal.get("next_step"):
-            lines.append(("Goal下一步", _recap_clip(goal["next_step"])))
-
-    pendings = list(sections.get("pending") or [])
-    if plan_open:
-        # task_plan 在盘上就以它为准：两份不一致的待办比一份不全的更坏
-        pendings = _recap_drop_duplicate_pending(pendings, items)
-    for pend in pendings[:2]:
-        lines.append(("未竟", _recap_clip(pend)))
-
-    if not lines:
-        return ""
-    out = [DIM("  ── Recap ──") + "\r\n"]
-    for label, text in lines:
-        out.append(f"  {DIM(label)}  {text}\r\n")
-    return "".join(out)
+def render_memory_saved(rows):
+    """自动记忆落盘后的一行回执。写了什么必须看得见，否则等于偷偷改行为。"""
+    names = "、".join(str(row.get("title") or row["id"]) for row in rows[:3])
+    more = f" 等 {len(rows)} 条" if len(rows) > 3 else ""
+    return DIM(f"  ※ 记忆 · 记下 {names}{more}（/memory list 查看，/memory forget 撤销）") + "\r\n"
 
 
 def cmd_recap(sess, rest):
-    """看/重建交接摘要 —— resume 时那段 Recap 的素材来源。"""
+    """立刻让模型现写一行 recap（Claude Code 的 /recap）。"""
     action = str(rest or "").strip().lower()
     if action in {"help", "?"}:
-        print(DIM("  /recap            渲染当前 recap，并说明素材来自哪里"))
-        print(DIM("  /recap now        立刻重建交接摘要（一次模型调用）"))
+        print(DIM("  /recap   让模型现写一行：总目标、当前任务、下一步"
+                  "（一次模型调用，Esc 取消）"))
+        print(DIM("  离开终端 5 分钟以上会自动写好等你回来；resume 后也会现写一条。"))
+        print(DIM("  写 recap 的就是这个窗口此刻在用的模型（/model 切了它就跟着变）。"))
+        print(DIM("  settings.json：recap_auto 关掉自动触发 · recap_away_seconds "
+                  "改离开时长"))
         return
-    if action in {"now", "refresh", "rebuild"}:
-        stale = sess.ag.recap_is_stale(min_tokens=0, refresh_turns=1)
-        if not stale:
-            print(DIM("  [交接摘要已经是最新的]"))
-            return
-        with Spinner("整理交接摘要"):
-            result = sess.ag.refresh_session_recap()
-        if not result:
-            print(DIM("  [没有可摘要的完整轮次]"))
-            return
-        if str(result).startswith("[摘要生成失败"):
-            print(YELLOW(f"  {result}"))
-            return
+    if not AWAY_RECAP.real_user_messages(sess.ag.messages):
+        print(DIM("  [还没有可 recap 的内容 —— 先发一条消息]"))
+        return
+    result = sess.generate_recap_now()
+    kind = result.get("kind")
+    if kind == "ok":
+        sys.stdout.write(
+            render_away_recap(result["text"]).replace("\r\n", "\n"))
+        sess.ag.record_away_recap(result["text"])
         sess.save()
-        recap = getattr(sess.ag, "session_recap", None) or {}
-        print(GREEN(
-            f"  [交接摘要已更新 · 覆盖到第 {recap.get('covered_to')} 条 · "
-            f"{len(recap.get('content') or ''):,} 字符]"))
-    record = store.load_session(sess.ag.session_id)
-    block = format_recap(
-        record, replay_limit=(getattr(sess, "cfg", None) or {}).get(
-            "resume_replay", 20))
-    if block:
-        sys.stdout.write(block.replace("\r\n", "\n"))
+    elif kind == "aborted":
+        print(DIM("  [recap 已取消]"))
+    elif kind == "no-turn":
+        print(DIM("  [还没有可 recap 的内容 —— 先发一条消息]"))
     else:
-        print(DIM("  (还没有增量信号可报)"))
-    context_blob = record.get("context") if isinstance(
-        record.get("context"), dict) else {}
-    handoff = context_blob.get("recap") or {}
-    if handoff.get("content"):
-        behind = sum(
-            1 for message in (record.get("messages") or [])[
-                int(handoff.get("covered_to") or 0):]
-            if isinstance(message, dict) and message.get("role") == "user")
-        note = f"  素材：交接摘要（{handoff.get('model')}）"
-        note += f"，落后 {behind} 轮" if behind else "，最新"
-        print(DIM(note + " · /recap now 重建"))
-    elif (context_blob.get("summary") or {}).get("content"):
-        print(DIM("  素材：压缩摘要"))
-    else:
-        print(DIM("  素材：只有 task_plan / goal · /recap now 生成交接摘要"))
+        reason = " ".join(str(result.get("text") or "").split())[:200]
+        print(YELLOW("  [recap 没写出来" + (f"：{reason}" if reason else "：模型返回了空正文") + "]"))
 
 
 def show_recap(sess, record):
-    """在 resume 的回放/横幅之后渲染自动 recap；无增量信号则静默。"""
-    block = format_recap(
-        record, replay_limit=(getattr(sess, "cfg", None) or {}).get(
-            "resume_replay", 20))
-    if not block:
-        return False
-    renderer = getattr(sess, "renderer", None)
-    if renderer is not None:
-        renderer.write_output(block)
-    else:
-        sys.stdout.write(block)
-        sys.stdout.flush()
-    return True
+    """resume 的回放/横幅之后给一条 recap：有现成的直接给，否则后台现写。"""
+    request = getattr(sess, "request_resume_recap", None)
+    return request() if callable(request) else None
 
 
 def _agent_spawn_notice(payload):
@@ -8546,6 +8693,9 @@ def cmd_new(sess, rest):
     checkpoint_callback = getattr(sess, "checkpoint_prepared", None)
     if callable(checkpoint_callback):
         new_agent.checkpoint_prepared = checkpoint_callback
+    state_callback = getattr(sess, "_compaction_state", None)
+    if callable(state_callback):
+        new_agent.compaction_state = state_callback
     acquire = getattr(sess, "acquire_target_lease", None)
     acquired = (
         bool(acquire(new_agent.session_id)) if callable(acquire) else False)
@@ -9375,6 +9525,105 @@ def cmd_config(sess, rest):
               f"\n  全局指令:   {store.USER_MD}"))
 
 
+def _doctor_session_payload(agent_obj):
+    """活动会话的 payload 体检 —— 真正决定请求成败的东西。
+
+    环境全绿而会话已废是可能的：只要历史里有一条 arguments 不是合法 JSON，
+    服务端每轮都会 400，重试与换模型都无效。这一行就是为了让那种情况一眼可见。
+    """
+    import json as _json
+    messages = getattr(agent_obj, "messages", None)
+    if not isinstance(messages, list):
+        return "-"
+    bad, announced, answered = [], set(), set()
+    for index, message in enumerate(messages):
+        if not isinstance(message, dict):
+            continue
+        for call in message.get("tool_calls") or ():
+            fn = (call or {}).get("function") or {}
+            cid = str((call or {}).get("id") or "")
+            if cid:
+                announced.add(cid)
+            try:
+                _json.loads(str(fn.get("arguments") or ""))
+            except (ValueError, TypeError):
+                bad.append((index, str(fn.get("name") or "?")))
+        if message.get("role") == "tool":
+            answered.add(str(message.get("tool_call_id") or ""))
+    parts = [f"{len(messages)} 条消息"]
+    if bad:
+        index, name = bad[0]
+        parts.append(
+            f"ERROR arguments 非法 JSON {len(bad)} 处"
+            f"（首个：第 {index} 条 · {name}）——服务端每轮必 400")
+    pending = len(announced - answered)
+    if pending:
+        # 末尾那一轮的调用可能正当地还没有结果，所以只报数、不判定为错误。
+        parts.append(f"未配对 tool_call {pending}（末轮待执行属正常）")
+    if not bad:
+        parts.append("arguments OK")
+    return " · ".join(parts)
+
+
+def _doctor_recent_failures(limit=200):
+    """最近的 provider 失败 —— 全部读 metrics 已记录的字段，无新增埋点。
+
+    `requests` 表本来就存了 status/http_status/error_kind/error_text，
+    但 doctor 过去只打印一句 `requests=N`，于是「同一个 400 复发 10 次」
+    这种最有用的线索一直躺在它自己打开的库里没被读出来。
+    """
+    try:
+        rows = store.metrics_facade().list_recent_traces(limit=limit)
+    except Exception as exc:  # noqa: BLE001 - 诊断本身不能把会话搞崩
+        return f"ERROR {type(exc).__name__}: {exc}"
+    if not rows:
+        return "无记录"
+    failed = [r for r in rows if str(r.get("status") or "") not in ("ok", "running")]
+    if not failed:
+        return f"最近 {len(rows)} 次请求无失败"
+    tally = {}
+    for row in failed:
+        key = str(row.get("http_status") or row.get("error_kind") or "?")
+        tally[key] = tally.get(key, 0) + 1
+    ranked = sorted(tally.items(), key=lambda kv: (-kv[1], kv[0]))[:5]
+    newest = " ".join(str(failed[0].get("error_text") or "").split())[:88]
+    return (f"最近 {len(rows)} 次中 {len(failed)} 次失败 · "
+            + " ".join(f"{k}×{v}" for k, v in ranked)
+            + (f" · 最新：{newest}" if newest else ""))
+
+
+def _doctor_circuit(gateway, model):
+    """当前路由的熔断状态 —— 环境全绿而请求被**本地**挡住时，这一行说明原因。
+
+    09-20 实测过一次：网关直连三发全 200，zylab 却拒发，因为熔断还剩 8 分钟；
+    而 doctor 当时 14 行全绿，没有任何一行提到熔断。
+    """
+    import datetime as _dt
+    try:
+        record = store.metrics_facade().get_health(str(gateway), str(model))
+    except Exception as exc:  # noqa: BLE001 - 诊断本身不能把会话搞崩
+        return f"ERROR {type(exc).__name__}: {exc}"
+    if not record:
+        return "无记录（该路由还没跑过请求）"
+    fails = record.get("consecutive_failures") or 0
+    kind = record.get("last_error_kind") or "-"
+    tail = (f"连失 {fails} · 最近错误 {kind} · 累计 "
+            f"{record.get('success_count') or 0} 成功/"
+            f"{record.get('failure_count') or 0} 失败")
+    until = record.get("circuit_open_until")
+    if not until:
+        return f"closed · {tail}"
+    try:
+        end = _dt.datetime.fromisoformat(str(until))
+        left = int((end - _dt.datetime.now(_dt.timezone.utc)).total_seconds())
+    except (TypeError, ValueError):
+        return f"ERROR circuit_open_until 无法解析：{until}"
+    if left <= 0:
+        return f"closed（熔断已过期）· {tail}"
+    return (f"ERROR OPEN 还有 {left}s · {tail} · "
+            f"/model 重选（同一个也行）即可立即越过")
+
+
 def cmd_doctor(sess, rest):
     """Read-only runtime diagnosis; never prints credentials or probes archives."""
     action = str(rest or "").strip().lower()
@@ -9428,6 +9677,8 @@ def cmd_doctor(sess, rest):
     artifact_ok = (
         store.ARTIFACTS.is_dir()
         and os.access(store.ARTIFACTS, os.W_OK | os.X_OK))
+    external_tools, external_hints = _external_tools_row()
+    instructions_row, instruction_hints = _instructions_row()
     rows = [
         ("sandbox", sandbox_state.get("marker") or "UNKNOWN"),
         ("sandbox adapter", getattr(
@@ -9456,7 +9707,13 @@ def cmd_doctor(sess, rest):
         ("terminal", (
             f"stdin_tty={sys.stdin.isatty()} stdout_tty={sys.stdout.isatty()} "
             f"tui={tui.supported()}")),
+        ("external tools", external_tools),
+        ("instructions", instructions_row),
         ("sessions", inventory),
+        ("session payload", _doctor_session_payload(getattr(sess, "ag", None))),
+        ("recent failures", _doctor_recent_failures()),
+        ("circuit", _doctor_circuit(
+            route.name, getattr(sess.ag, "model", ""))),
     ]
     print("  Doctor")
     for label, value in rows:
@@ -9465,6 +9722,10 @@ def cmd_doctor(sess, rest):
             or value.startswith("MISSING")
             or "exposure risk" in value or value.startswith("ERROR")) else DIM
         print(f"    {label:<18} {color(value)}")
+    for hint in external_hints:
+        print(RED(hint) if hint.startswith("!") else DIM(hint))
+    for hint in instruction_hints:
+        print(YELLOW(hint))
     if not secure_transport:
         print(RED(
             "  ! 当前 gateway 使用 HTTP；API key 与请求内容可能被链路观察者读取。"))
@@ -9480,6 +9741,85 @@ def cmd_doctor(sess, rest):
             "  ! sandbox 不可用时仅可通过本次 UNSANDBOXED 确认开放网络；"
             "确认前保持阻断。"))
 
+
+
+# /doctor 的指令记忆体检。
+#
+# 指令是**每一次请求都要重发**的固定开销，而它的来源分散在从文件系统根到 cwd
+# 的一串目录里——哪几份被读进来、加起来多大，以前在界面上一个字都看不到。
+# 被拒的 @import（指向工作目录之外、或疑似凭据）尤其要让人看见：静默丢掉的话，
+# 用户只会以为「我写的规则怎么不生效」。
+def _instructions_row():
+    from core import instructions as instruction_memory   # noqa: PLC0415
+    try:
+        bundle = instruction_memory.collect()
+    except Exception as exc:                              # noqa: BLE001
+        return f"ERROR {exc.__class__.__name__}", []
+    if not bundle.blocks:
+        return "（无 AGENTS.md / CLAUDE.md）", []
+    names = ", ".join(
+        f"{os.path.basename(b.path)}@{b.scope}" for b in bundle.blocks)
+    row = f"{len(bundle.blocks)} 份 / {bundle.total_chars} 字符 · {names}"
+    return row, [f"  ! {note}" for note in bundle.notes]
+
+
+# /doctor 的外部工具体检。
+#
+# 为什么值得单独一行：2026-09-18 的真实排查里，用户机器上 Git **是装了的**，
+# 但安装器默认只把 `<Git>\cmd` 加进 PATH，`usr\bin` 不在 —— 于是
+# bash/sed/awk/ssh 全都找不到，Bash 工具整个不可用。这个故障当时是在模型
+# 跑到一半时才以一句「找不到 bash」暴露出来的，而它本该在 /doctor 里一眼看见。
+_DOCTOR_REQUIRED_TOOLS = (
+    # bash：Bash 工具就是 `bash -lc`，没有它这个工具直接不可用。
+    # git ：zylab 自己要用（repomap 的 git ls-files、状态栏、版本号、仓库根）。
+    "bash", "git")
+# 模型写的 bash 命令实际用到的程序，按 2115 条真实历史命令的频次排序。
+# Windows 上它们全部来自 Git for Windows 的 usr\bin —— 少一个就少一片能力，
+# 而且失败形式是「命令 127」，模型多半会反复重试而不是换路子。
+_DOCTOR_SHELL_TOOLS = ("grep", "head", "sed", "tail", "cut", "awk", "sort", "wc")
+
+
+def _external_tools_row():
+    """返回 (行内容, 补救提示行列表)。缺东西时行首是 MISSING，好让上面的着色逻辑标红。"""
+    import shutil                                       # noqa: PLC0415
+    resolved = {}
+    missing_required, missing_shell = [], []
+    for name in _DOCTOR_REQUIRED_TOOLS:
+        path = shutil.which(name)
+        resolved[name] = path
+        if not path:
+            missing_required.append(name)
+    for name in _DOCTOR_SHELL_TOOLS:
+        if not shutil.which(name):
+            missing_shell.append(name)
+
+    hints = []
+    if not missing_required and not missing_shell:
+        return (f"OK · bash={resolved['bash']} · git 与 "
+                f"{len(_DOCTOR_SHELL_TOOLS)} 个常用 shell 工具齐全"), hints
+
+    parts = []
+    if missing_required:
+        parts.append("缺必需：" + ", ".join(missing_required))
+    if missing_shell:
+        parts.append(f"缺 shell 工具 {len(missing_shell)} 个："
+                     + ", ".join(missing_shell))
+    value = "MISSING · " + "；".join(parts)
+
+    if "bash" in missing_required:
+        hints.append("! 没有 bash：Bash 工具不可用（grep 工具是进程内实现，不受影响）。")
+    if "git" in missing_required:
+        hints.append("! 没有 git：repo map、状态栏分支、版本号都会退化。")
+    if sys.platform == "win32":
+        hints.append(
+            "  装 Git for Windows（https://git-scm.com/download/win），"
+            "然后把 <Git>\\usr\\bin 加进 PATH —— "
+            "**安装器默认只加 <Git>\\cmd**，而 bash/grep/sed/ssh 都在 usr\\bin 里。")
+        hints.append(
+            "  PATH 改完只对新进程生效；已开着的终端要重开。")
+    else:
+        hints.append("  用系统包管理器补齐（Debian/Ubuntu: apt install git coreutils）。")
+    return value, hints
 
 
 def _key_row(route):
@@ -9830,7 +10170,9 @@ _ERROR_NEXT_STEPS = {
     "stream_read": "流中途断了 · 再发一次；反复出现就 /model 换一个",
     "stream_eof": "网关提前收流 · 再发一次；反复出现就 /model 换一个",
     "insecure_transport": "改用 https 网关，或非交互模式加 --allow-insecure-http",
-    "circuit_open": "该网关刚连续失败、已暂时熔断 · 稍等再试或 /gateway 换一个",
+    # 「稍等再试」曾是假的：熔断检查发生在请求之前，重试必被挡在同一道门上。
+    # 真正立刻有效的是显式改路由（走 _apply_route → mark_route_explicit）。
+    "circuit_open": "该网关刚连续失败、已暂时熔断 · /model 重选（同一个也行）即可立即越过，或 /gateway 换一个",
     "context_length": "上下文超限 · /compact 压缩，或 /clear 开新会话",
     "capability_temperature": "该模型不接受 temperature · /model 换一个",
     "decision_gate_required": "先让主 agent 发起 decision_gate 再继续",
@@ -10432,6 +10774,7 @@ def cmd_clear(sess, rest):
     sess.ag.last_total = 0
     sess.ag.context_summary = None
     sess.ag.context_invalid_reason = None
+    sess.ag.away_recap = None                # 那一行说的是被清掉的对话
     sess.ag._compact_failed_key = None
     sess.ag._last_age_notice_key = None
     sync_transcript = getattr(sess, "sync_transcript", None)
@@ -10558,8 +10901,9 @@ def cmd_compact(sess, rest):
         before = sess.ag.context_report()["estimated_request_tokens"]
     except Exception:                                 # noqa: BLE001
         before = None
+    instructions = str(rest or "").strip() or None      # /compact 重点保留 X 的决定
     with Spinner("压缩中"):
-        s = sess.ag.force_compact()
+        s = sess.ag.force_compact(instructions=instructions)
     failed = str(s or "").startswith("[摘要生成失败")
     if s:
         store.shadow_event(sess.ag,
@@ -10671,8 +11015,8 @@ def _memory_usage():
         "  /memory remember [project|global] <text>  显式记住\n"
         "  /memory forget <id>                  删除一条派生记忆\n"
         "  /memory use on|off                   当前 chat 是否注入\n"
-        "  /memory generate on|off              当前 chat 是否保存 handoff\n"
-        "  /memory capture                      立刻更新当前会话 handoff\n"
+        "  /memory generate on|off              当前 chat 是否自动抽取\n"
+        "  /memory capture                      立刻抽一次跨会话记忆\n"
         "  /memory refresh                      重新读取并注入索引\n"
         "  /memory capsule                      显示 child 交接元数据"))
 
@@ -11093,8 +11437,8 @@ def cmd_memory(sess, rest):
             if getattr(sess, "_memory_error", None):
                 print(RED(f"    error   {sess._memory_error}"))
             print(DIM(
-                "    自动 generate 不调用 provider；只更新当前 session 的"
-                "确定性 handoff。/memory help 查看命令。"))
+                "    索引里每条只有一行钩子；正文由模型用 memory_read 按需取。"
+                "/memory help 查看命令。"))
             return
         if action == "list":
             rows = sess.memory_store.list(cwd=sess._session_cwd)
@@ -11104,14 +11448,17 @@ def cmd_memory(sess, rest):
             layout = _table_layout((
                 tui.TableColumn(15, min_width=14),
                 tui.TableColumn(9, min_width=7),
-                tui.TableColumn(16, min_width=12),
+                tui.TableColumn(10, min_width=8),
                 tui.TableColumn(60, min_width=20),
             ), indent=2, maximum=106)
-            print(DIM(layout.row(("id", "scope", "kind", "title"))))
+            print(DIM(layout.row(("id", "scope", "type", "title / 钩子"))))
             for row in rows:
+                hook = str(row.get("description") or "").strip()
+                title = row.get("title") or "?"
                 print(layout.row((
-                    row["id"], row["scope"], row.get("kind") or "?",
-                    row.get("title") or "?"), wrap_last=True))
+                    row["id"], row["scope"],
+                    row.get("type") or MEMORY.DEFAULT_TYPE,
+                    f"{title} — {hook}" if hook else title), wrap_last=True))
             return
         if action == "show":
             if not tail or " " in tail:
@@ -11119,6 +11466,7 @@ def cmd_memory(sess, rest):
             row = sess.memory_store.get(tail, cwd=sess._session_cwd)
             print(
                 f"  {BOLD(row['id'])} · {row['scope']} · "
+                f"{row.get('type') or MEMORY.DEFAULT_TYPE} · "
                 f"{row.get('kind') or '?'}")
             print(f"  {row.get('title') or '?'}")
             print(DIM(
@@ -11164,18 +11512,24 @@ def cmd_memory(sess, rest):
                 f"{str(bool(getattr(sess, 'memory_' + action))).lower()}")
             return
         if action == "capture":
-            row = sess.memory_store.capture_session(
-                sess.ag, title=sess._title,
-                cwd=sess._session_cwd, task_plan=sess.task_plan)
-            if row is None:
-                print(DIM("  (当前会话还没有可生成 handoff 的内容)"))
-            else:
-                if sess.memory_use:
-                    sess.refresh_memory_context()
+            result, saved = sess.extract_memories_now()
+            if saved:
+                for row in saved:
+                    print(DIM(
+                        f"  [{row['id']} · {row.get('type')} · "
+                        f"{row.get('title')}] "
+                        + str(row.get("description") or "")))
                 print(DIM(
-                    f"  [已更新 {row['id']} · source "
-                    f"{sess.ag.session_id}@"
-                    f"{str((row.get('evidence') or {}).get('raw_sha256') or '?')[:12]}]"))
+                    f"  [记下 {len(saved)} 条 · {result.get('model')}@"
+                    f"{result.get('gateway')} · {result.get('seconds')}s · "
+                    "/memory forget <id> 撤销]"))
+            elif result.get("kind") == "aborted":
+                print(DIM("  (已取消)"))
+            elif result.get("kind") == "no-turn":
+                print(DIM("  (这次会话还没有值得记的东西)"))
+            else:
+                print(DIM(
+                    f"  (没抽出可用条目：{result.get('text') or result.get('kind')})"))
             return
         if action == "refresh":
             index = sess.refresh_memory_context()
@@ -12988,7 +13342,7 @@ REGISTRY = {
     "rewind": (cmd_rewind, '恢复 checkpoint 的 code/chat 或创建 branch'),
     "rename": (cmd_rename, '给会话命名'),
     "goal": (cmd_goal, '设置/查看跨 turn 完成目标'),
-    "recap": (cmd_recap, '看/重建交接摘要（resume 时那段 Recap 的素材）'),
+    "recap": (cmd_recap, '让模型现写一行 recap：总目标、当前任务、下一步'),
     "plan": (cmd_plan, '计划模式（只读调研）'),
     "hooks": (cmd_hooks, "查看已注册的 hook"),
     "config": (cmd_config, '显示配置'),
@@ -13002,7 +13356,7 @@ REGISTRY = {
     "skills": (cmd_skills, '列出可选知识 skill（prompt-data only）'),
     "commands": (cmd_commands, '管理 prompt-only Markdown 自定义命令'),
     "clear": (cmd_clear, '清空对话'),
-    "compact": (cmd_compact, '压缩上下文'),
+    "compact": (cmd_compact, '压缩上下文（可附要求：/compact 重点保留 X 的决定）'),
     "auto": (cmd_auto, '切换自动批准'),
     "cost": (cmd_cost, '本次用量明细'),
     "context": (cmd_context, '解释当前上下文预算与投影'),
@@ -13087,9 +13441,8 @@ COMMAND_SUBCOMMANDS = {
         ),
     },
     "/recap": {
-        "hint": "不带参数只渲染，不花任何调用",
+        "hint": "一次模型调用；Esc 取消",
         "items": (
-            ("now", "立刻重建交接摘要（一次模型调用）"),
             ("help", "显示 recap 用法"),
         ),
     },
@@ -13874,7 +14227,7 @@ def repl(sess, model):
         return sess.composer_prompt(busy=False)
 
     def record_line(line):
-        store.append_history(line)
+        store.append_history(line, session_id=sess.ag.session_id)
 
     def execute_command(line):
         renderer.clear_input()
@@ -13914,9 +14267,13 @@ def repl(sess, model):
             kind = action.kind
             if kind == C.ActionKind.START_TURN:
                 turn_item = action.item
-                action = sess.turn(turn_item.text, action=action)
-                # turn 刚结束、上下文正完整：这是生成交接摘要最便宜的时刻
-                sess.maybe_refresh_session_recap()
+                sess.away_recap_turn(True)
+                sess.memory_extract_turn(True)
+                try:
+                    action = sess.turn(turn_item.text, action=action)
+                finally:
+                    sess.away_recap_turn(False)
+                    sess.memory_extract_turn(False)
                 goal_notice = sess.goal_turn_finished(
                     turn_item, sess.last_turn_outcome)
                 if goal_notice:
@@ -13978,6 +14335,30 @@ def repl(sess, model):
         sess.sync_composer_selection()
         return True
 
+    def render_away_recap_ready():
+        text = sess.take_away_recap()
+        if not text:
+            return False
+        renderer.clear_input()
+        renderer.write_output(render_away_recap(text), source="status")
+        snapshot = sess.refresh_composer(
+            busy=False, prompt=prompt(), activity="空闲", publish=False)
+        renderer.render(snapshot)
+        sess.sync_composer_selection()
+        return True
+
+    def render_memory_extract_ready():
+        saved = sess.memory_extract_tick()
+        if not saved:
+            return False
+        renderer.clear_input()
+        renderer.write_output(render_memory_saved(saved), source="status")
+        snapshot = sess.refresh_composer(
+            busy=False, prompt=prompt(), activity="空闲", publish=False)
+        renderer.render(snapshot)
+        sess.sync_composer_selection()
+        return True
+
     command_choices = dict(COMMANDS)
     command_choices.update(sess._custom_catalog.completion())
     # 工作中打 `/` 只列当场执行的命令。判据直接复用 resolve_live_command ——
@@ -13989,18 +14370,29 @@ def repl(sess, model):
     pump = tui.InputPump(
             prompt=prompt(), commands=command_choices,
             subcommands=COMMAND_SUBCOMMANDS, live_commands=live_choices,
-            history=_history(), cwd=sess._session_cwd)
+            history=_history(
+                session_id=sess.ag.session_id, messages=sess.ag.messages),
+            cwd=sess._session_cwd)
+    _trace = _startup_tracer()
+    _trace("repl entry")
     sess.bind_interactive(pump, renderer)
+    _trace("bind_interactive")
     sess._set_terminal_title(idle=True)
+    _trace("set_terminal_title")
     sess.refresh_composer(
         busy=False, prompt=prompt(), activity="空闲", publish=False)
+    _trace("post-refresh_composer")
     with pump:
+        _trace("pump entered")
         if app_mode:
             renderer.enter()
+            _trace("renderer.enter")
         pending_replay = getattr(sess, "_replay_pending", None)
         if pending_replay:
             sess._replay_pending = None
             replay_transcript(sess, pending_replay)      # 启动时 --resume：像从没退出过
+        if getattr(sess, "_resume_recap_pending", False):
+            sess.request_resume_recap()
         recovered = sess.controller.dispatch_ready()
         if recovered is not None:
             renderer.write_output(DIM(
@@ -14008,7 +14400,9 @@ def repl(sess, model):
             run_actions(recovered)
 
         try:
+            _trace("main-loop entry")
             renderer.enable_mouse()
+            _trace("enable_mouse")
             while not quit_requested:
                 event = sess._get_pump_event(0.2)
                 if event is None:
@@ -14016,6 +14410,8 @@ def repl(sess, model):
                         renderer.drain_posted()
                     sess.heartbeat_lease()
                     render_async_notices()
+                    render_away_recap_ready()
+                    render_memory_extract_ready()
                     workflow_action = sess.dispatch_workflow_ready()
                     if workflow_action is not None:
                         run_actions(workflow_action)
@@ -14167,10 +14563,13 @@ def repl(sess, model):
                     renderer.clear_input()
                     renderer.write_output("\r\n")
                 elif event.kind == "eof":
+                    _trace("EOF event received")
                     quit_requested = True
                 elif event.kind == "error":
+                    _trace("pump error event")
                     raise event.value
         finally:
+            _trace("repl loop exited")
             if renderer.history_active:
                 renderer.close_history(pump.snapshot())
             pump.set_history_mode(False)
@@ -14287,6 +14686,50 @@ def _init_portable(ok, bad):
     return 0
 
 
+_INIT_MODEL_SKIP = re.compile(
+    r"embed|rerank|ocr|tts|whisper|audio|image|vision|vl\b|guard|moderation",
+    re.I)
+
+
+def _init_pick_candidates(rows, limit=4):
+    """按「像不像能干活的主力模型」排候选：上下文大的优先，明显非对话的排除。
+
+    按目录顺序取第一个会挑出按字母序最靠前的那个（实测挑中 Intern-S2-Preview-397B），
+    对一个编码 agent 不合适。窗口大小是目录里唯一一个对所有网关都可比的信号。
+    """
+    scored = []
+    for row in rows or ():
+        name = str(row.get("id") or "").strip()
+        if not name or _INIT_MODEL_SKIP.search(name):
+            continue
+        scored.append((-(row.get("max_model_len") or 0), name))
+    scored.sort()
+    return [name for _ctx, name in scored[:limit]]
+
+
+def _init_pick_model(route, ids, ok, warn, *, limit=4):
+    """从这把 key 的目录里挑一个真能答话的模型，写进 settings。
+
+    只试前几个：init 是冷启动闸门，不是选型工具；试不出来就如实说、让人手动挑。
+    """
+    for candidate in ids[:limit]:
+        try:
+            list(client.stream_chat(
+                candidate, [{"role": "user", "content": "只回复 ok"}],
+                max_tokens=8, temperature=None, route=route, retries=1,
+                thinking={"type": "disabled"}))
+        except Exception:                                 # noqa: BLE001
+            continue
+        ok(f"改用 {candidate}（出厂默认那个这把 key 用不了）")
+        try:
+            CFG.write_user({"model": candidate, "gateway": route.name})
+            ok(f"已写入 settings：model = {candidate}、gateway = {route.name}")
+        except CFG.SettingsError as exc:
+            warn(f"模型可用，但写入 settings 失败：{exc}")
+        return candidate
+    return None
+
+
 def cmd_init_cli(a, cfg):
     """`zylab init`：冷启动闸门，每步失败都自带下一步动作（BACKLOG-rename-zylab §2.0.2）。
 
@@ -14314,6 +14757,12 @@ def cmd_init_cli(a, cfg):
         # 本进程的 store 常量在 import 时已绑到旧目录：去掉 --portable 重新执行自己，让后面的步骤用新目录
         argv = [os.path.abspath(sys.argv[0])] + [x for x in sys.argv[1:] if x != "--portable"]
         sys.stdout.flush()
+        if wincompat.IS_WINDOWS:
+            # **Windows 没有 exec 语义。** CPython 的 os.execv 在这里是「spawn 一个
+            # 新进程，然后把自己以退出码 0 结束掉」—— 于是接力那一半的退出码
+            # （比如「没有 endpoint → 2」）全部丢失，调用方只看到 0，脚本无法判断
+            # init 到底成没成功。改成同步跑完再把退出码原样传出去。
+            return subprocess.run([sys.executable] + argv).returncode
         os.execv(sys.executable, [sys.executable] + argv)
     # 1. Python（真正的闸门在文件顶部；能跑到这里就是过了）
     ok(f"Python {sys.version_info[0]}.{sys.version_info[1]}（{sys.executable}）")
@@ -14334,13 +14783,31 @@ def cmd_init_cli(a, cfg):
         print(DIM(f"    看权限：namei -l {store.HOME}    或换个家目录：HOME=/some/writable zylab init"))
         return 1
     # 4. 网关 + key
-    name = a.gateway or cfg.get("gateway") or client.GATEWAY
+    name = str(a.gateway or cfg.get("gateway") or client.GATEWAY).lower()
     try:
         route = client.route_for(name)
-    except ValueError as exc:
-        bad(str(exc))
-        return 2
-    # 4a. endpoint。zylab 不预置任何网关地址，所以这是 key 之前的一道闸 ——
+    except ValueError:
+        # 未知网关不是死路：init 本来就是写 settings 的那一步，那就让它把 profile 建出来。
+        # 以前这里直接 return 2，于是「clone 下来 → zylab init --gateway openai」
+        # 第一条命令就撞墙，而要新增网关又得先手写 settings.json。
+        base = str(getattr(a, "base", None) or "").strip()
+        if not base and interactive:
+            print(DIM(f"    没有内置的 {name} profile。给个 OpenAI 兼容的 endpoint "
+                      "就地建一个（形如 https://<host>/v1）"))
+            base = input(f"  {name} 的 endpoint: ").strip()
+        if not base:
+            bad(f"没有内置的 {name} profile，也没给 endpoint")
+            print(DIM(f"    zylab init --gateway {name} --base https://<host>/v1"))
+            print(DIM(f"    内置可选：{', '.join(sorted(client.GATEWAYS))}"))
+            return 2
+        keys = [a.key_env] if a.key_env else [
+            re.sub(r"[^A-Z0-9]+", "_", name.upper()) + "_API_KEY"]
+        CFG.write_user({"gateways": {name: {"base": base, "keys": keys}}})
+        client.GATEWAYS[name] = {"base": base, "keys": tuple(keys),
+                                 "note": "用户自建"}
+        ok(f"已新建网关 profile {name} → {base}（key 变量 {keys[0]}）")
+        route = client.route_for(name)
+    # 4a. endpoint。公开厂商的地址内置、自建网关的不内置，所以这是 key 之前的一道闸 ——
     #     否则第一次提问才以 URLError 的形式暴露，读起来像网络坏了。
     base = str(getattr(a, "base", None) or "").strip() or client.resolve_base(route.name)
     if not base and interactive:
@@ -14348,8 +14815,11 @@ def cmd_init_cli(a, cfg):
                   "不预置也不转发任何网关地址"))
         base = input(f"  {route.name} 的 endpoint: ").strip()
     if not base:
+        # 复用 client 那条提示：它会连「其实你可以直接挑一个地址已内置的网关」一起说。
+        # 两处各写一份的后果实测过——这里只说「自己填地址」，新用户不知道还有别的路。
         bad(f"网关 {route.name} 没有 endpoint 地址")
-        print(DIM(f"    zylab init --gateway {route.name} --base https://<host>/v1"))
+        for line in client.base_missing_hint(route.name).splitlines()[1:]:
+            print(DIM(f"  {line}"))
         return 2
     if base != client.resolve_base(route.name):
         CFG.write_user({"gateways": {route.name: {"base": base}}})
@@ -14387,10 +14857,21 @@ def cmd_init_cli(a, cfg):
     # 5. 一次真实探测：三种失败读起来不一样
     proxies = {k: v for k, v in os.environ.items()
                if k.lower() in ("http_proxy", "https_proxy", "all_proxy") and v}
-    other = "boyue" if route.name == "deepinfer" else "deepinfer"
+    other = next((n for n in sorted(client.GATEWAYS) if n != route.name),
+                 route.name)
     try:
-        n = len(client.list_models(route=route))
+        listing = client.list_models(route=route)
+        n = len(listing)
         ok(f"网关 {route.name} 可达，目录里 {n} 个模型")
+        # 立刻落盘。否则 init 说「可达、15 个模型」，而 models.json 要等到第一个
+        # turn 边界才生成——「填了 key，模型列表就该跟着刷新」是这条命令的本分。
+        try:
+            changed = M.refresh_catalog(route.name)
+            added = len(changed.get("added") or [])
+            ok(f"模型目录已写入本地（新增 {added} 条）"
+               if added else "模型目录已写入本地")
+        except Exception as exc:                          # noqa: BLE001
+            warn(f"目录探测成功，但写入本地失败：{type(exc).__name__}: {exc}")
     except client.MissingKey as exc:
         bad(str(exc))
         return 2
@@ -14408,7 +14889,7 @@ def cmd_init_cli(a, cfg):
     #    每把 key 开放的模型不一样，所以写死的默认值对别人不一定成立；
     #    2026-09-15 实测出厂默认 kimi-k3-256k 已 403，而 init 当时只探测目录，
     #    同事会看到「全部通过」然后第一次提问才失败。
-    want = str(a.model or (cfg or {}).get("model") or A.MODEL)
+    want = str(a.model or (cfg or {}).get("model") or A.default_model(route.name))
     try:
         answered = "".join(
             event["v"] for event in client.stream_chat(
@@ -14435,7 +14916,18 @@ def cmd_init_cli(a, cfg):
         if ids:
             shown = "、".join(ids[:12]) + ("…" if len(ids) > 12 else "")
             print(DIM(f"    这把 key 的目录里有：{shown}"))
-        return 2
+        # 用户没有指定 --model 时，别停在「你自己挑一个」：出厂默认是按维护者的 key
+        # 定的，对别人本来就不成立。这里当场挑一个真能答话的写进 settings —— 这正是
+        # 「下载下来填个 key 就能用」与「填完还得再查一轮文档」的分界。
+        if a.model or not ids:
+            return 2
+        picked = _init_pick_model(
+            route, _init_pick_candidates(listing) or ids, ok, warn)
+        if picked is None:
+            print(DIM("    都没答上来。交互模式 /model 手动挑，"
+                      f"或 zylab init --gateway {route.name} --model <名字> --yes"))
+            return 2
+        want = picked
     except (urllib.error.URLError, OSError, TimeoutError) as exc:
         bad(f"探测默认模型时网关不可达：{exc} —— 与 key 无关")
         return 1
@@ -14487,7 +14979,162 @@ def _warn_if_no_key(gateway=None):
         break
 
 
+def _startup_tracer():
+    """ZYLAB_TRACE_STARTUP=1 时把启动序列执行点打到 stderr（诊断 Windows 退出用）。
+
+    不设环境变量时是零开销 no-op，不影响任何正常路径。"""
+    import os as _os
+    if not _os.environ.get("ZYLAB_TRACE_STARTUP"):
+        return lambda *a, **k: None
+    import sys as _s
+    import time as _t
+
+    def _mark(label):
+        print(f"[startup-trace] {_t.monotonic():.3f} {label}",
+              file=_s.stderr, flush=True)
+    return _mark
+
+
+def _wincheck():
+    """--wincheck：Windows 兼容层逐项自检（也可在 POSIX 上跑，对照行为）。
+
+    每项独立 try/except，一项失败不挡后面；任何 traceback 都完整打印，
+    退出码 = 失败项数。这是 win32 分支的第一手诊断出口——不再依赖「盲修往返」。
+    """
+    from core import wincompat
+    failures = 0
+
+    def check(name, fn):
+        nonlocal failures
+        try:
+            detail = fn()
+            print(f"  ok  {name}" + (f" · {detail}" if detail else ""))
+        except BaseException as exc:  # 诊断模式：全都要打出来
+            failures += 1
+            import traceback
+            print(f"  FAIL {name}: {exc!r}")
+            traceback.print_exc()
+
+    print("wincheck · 平台:", sys.platform)
+
+    def _probe_raw():
+        if not sys.stdin.isatty():
+            return "stdin 非 tty，跳过"
+        if wincompat.IS_WINDOWS and not wincompat.is_console(sys.stdin.fileno()):
+            # Git Bash / MSYS 的 pty：isatty 为真但没有控制台模式可设，
+            # raw_mode 在这里**应该**大声失败（core/tui.supported() 会先判掉）。
+            return "stdin 是终端但非 Win32 控制台，raw 模式不适用，跳过"
+        ctx = wincompat.raw_mode(0, cbreak=True, capture_signals=True)
+        entered = ctx.__enter__()
+        try:
+            assert entered is ctx, "raw_mode __enter__ 未返回自身"
+            return type(ctx).__name__
+        finally:
+            ctx.__exit__(None, None, None)
+
+    check("raw_mode 进出对称", _probe_raw)
+
+    def _probe_console_read():
+        if not wincompat.IS_WINDOWS:
+            return "POSIX 跳过（read_console 仅 win32）"
+        import sys as _s
+        if not wincompat.is_console(_s.stdin.fileno()):
+            return "stdin 不是 Win32 控制台，跳过"
+        # read_console 交的是 **bytes**；原来这里拿它和 str "" 比，
+        # 于是这项自检在任何情况下都报红。
+        timeout_result = wincompat.read_console(1, 0.05)
+        assert timeout_result == b"", f"超时应返回空字节串，得到 {timeout_result!r}"
+        return "超时返回空字节串（符合预期）"
+
+    check("read_console 超时语义", _probe_console_read)
+
+    def _probe_wait_fd():
+        import os as _os
+        r, w = _os.pipe()
+        try:
+            _os.write(w, b"x")
+            assert wincompat.wait_fd(r, 0.5) is True, "有数据应可读"
+            assert _os.read(r, 1) == b"x"
+            assert wincompat.wait_fd(r, 0.05) is False, "读空后应超时 False"
+            _os.close(w)
+            assert wincompat.wait_fd(r, 0.05) is True, "EOF 可读（select 原语义，上层靠空读判 EOF）"
+            assert _os.read(r, 1) == b""
+            return "可读/超时/EOF 判定正确"
+        finally:
+            _os.close(r)
+
+    check("wait_fd 管道语义", _probe_wait_fd)
+
+    def _probe_ismode():
+        if not wincompat.IS_WINDOWS:
+            return "POSIX 跳过"
+        # isatty() 不够：Git Bash / MSYS 的 pty 让它为真，但那不是 Win32 控制台，
+        # GetConsoleMode 必失败。这里问的就是「是不是真控制台」本身。
+        import sys as _s
+        fd = _s.stdin.fileno()
+        if wincompat.is_console(fd):
+            return "stdin 是 Win32 控制台，fd->HANDLE 转换正确"
+        if _s.stdin.isatty():
+            return ("stdin 是终端但不是 Win32 控制台（Git Bash / MSYS pty）："
+                    "整屏 TUI 会回落到行输入模式")
+        return "stdin 非 tty（管道/重定向），跳过"
+
+    check("_is_console fd->HANDLE", _probe_ismode)
+
+    def _probe_pump():
+        from core import tui as _tui
+        if not _tui.supported():
+            return "非交互 tty，跳过"
+        pump = _tui.InputPump(prompt="")
+        with pump:
+            pass
+        return "InputPump 进出（含 raw_mode + 线程启停）"
+
+    check("InputPump 生命周期", _probe_pump)
+
+    def _probe_repl_smoke():
+        from core import tui as _tui
+        if not _tui.supported():
+            return "非交互 tty，跳过"
+        # read_key 空闲 100ms 应返回 None（不抛、不退出）
+        result = _tui.read_key(timeout=0.1)
+        assert result is None or isinstance(result, str), f"read_key 返回 {result!r}"
+        return f"read_key(0.1) -> {result!r}"
+
+    check("read_key 空闲语义", _probe_repl_smoke)
+
+    def _probe_termcaps():
+        from core import termcaps as _ter
+        caps = _ter.detect()
+        return f"termcaps.detect OK · tty={caps.tty} cols={caps.cols} rows={caps.rows}"
+
+    check("termcaps.detect", _probe_termcaps)
+
+    def _probe_renderer():
+        import sys as _s
+        if not _s.stdin.isatty() or not _s.stdout.isatty():
+            return "非交互 tty，跳过"
+        from core import tui as _t
+        r = _t.TerminalRenderer()
+        # 只测渲染器的纯输出路径（with pump: 之后立刻执行的三件事），
+        # render(Snap) 依赖真会话状态，不在探针里伪造。
+        r.write_output("wincheck renderer probe", source="status")
+        r.enable_mouse()
+        return "write_output/enable_mouse OK"
+
+    check("TerminalRenderer", _probe_renderer)
+
+    print(f"wincheck 完成：{'全部通过' if failures == 0 else f'{failures} 项失败'}")
+    return 1 if failures else 0
+
+
 def main():
+    # Windows 两件事必须在任何输出之前做：控制台按 ANSI 解释转义序列
+    # （经典 conhost 默认不开，不开就是满屏可见的 ←[0m），以及把重定向出去的
+    # stdout 改成 UTF-8（本地代码页编不出 ✓/─，会直接 UnicodeEncodeError）。
+    # POSIX 上两个都是 no-op。
+    wincompat.configure_stdio()
+    wincompat.enable_vt_output()
     ap = argparse.ArgumentParser(prog="zylab", add_help=True)
     ap.add_argument("-p", "--print", metavar="PROMPT", help="单次执行后退出")
     ap.add_argument("--max-turns", type=int, default=None, metavar="N",
@@ -14547,6 +15194,8 @@ def main():
                          "要像 Claude Code 那样用终端滚动条翻阅历史，用默认的内联模式")
     ap.add_argument("--terminal-caps", action="store_true",
                     help="强制重新探测终端能力（忽略缓存）并打印结果后退出；排查全屏模式回落/鼠标问题用")
+    ap.add_argument("--wincheck", action="store_true",
+                    help="Windows 兼容自检：逐项检查 raw mode/读键/管道等待，定位 win32 分支问题后退出")
     ap.add_argument("--inline", action="store_true",
                     help="内联模式（默认）：对话在终端自己的 scrollback 里，滚轮/滚动条/复制全是终端原生")
     ap.add_argument("--portable", action="store_true",
@@ -14647,10 +15296,18 @@ def main():
                      m.get("supports_reasoning"), m.get("supports_image_in"))
                     for m in client.list_models()]
             source = None
-        except (client.MissingKey, urllib.error.HTTPError, OSError) as exc:
-            # 没 key、key 无效、网络不通 —— 都该能浏览模型，本地能力表就是
-            # 为此存在的。如实标注来源，别拿缓存冒充实时目录。
-            if isinstance(exc, client.MissingKey):
+        except (client.MissingKey, client.APIError,
+                urllib.error.HTTPError, OSError) as exc:
+            # 没 key、没配 endpoint、key 无效、网络不通 —— 都该能浏览模型，本地能力表
+            # 就是为此存在的。如实标注来源，别拿缓存冒充实时目录。
+            # （`base_not_configured` 以前没被接住：全新安装跑 `zylab --models`
+            #   直接吐 Python traceback，那是陌生人见到的第一屏。）
+            if getattr(exc, "kind", None) == "base_not_configured":
+                # 连 endpoint 都没有 = 这个网关从没配过。本地能力表里那些行是
+                # 出厂 seed（别人机器上的观测），列出来只会让人以为它们可用。
+                print(RED(f"  {exc}"))
+                return 2
+            elif isinstance(exc, client.MissingKey):
                 why = "没有 key"
             elif getattr(exc, "code", None) in (401, 403):
                 st = client.key_status()
@@ -14684,6 +15341,8 @@ def main():
             print(f"  {key}: {value}")
         print("  （已写入缓存；全屏模式需要 tty 与 alt_screen 为 True，鼠标需要 sgr_mouse）")
         return 0
+    if a.wincheck:
+        return _wincheck()
     if a.command == "init":
         return cmd_init_cli(a, cfg)
     store.ensure_home()
@@ -14692,7 +15351,7 @@ def main():
             client.set_gateway(cfg["gateway"])
         except ValueError as e:
             print(RED(f"  配置里的 gateway 无效：{e}"))
-    model = a.model or cfg.get("model") or A.MODEL
+    model = a.model or cfg.get("model") or A.default_model()
     # 必须在 Agent 构造之前 —— 构造会走 set_model → model_limit → list_models，
     # 那是第一处真正需要 key 的地方。放在之后就永远来不及。
     _warn_if_no_key()

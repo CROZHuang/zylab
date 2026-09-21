@@ -1,2 +1,18 @@
 # git archive 出包时把提交标记烤进 core/_build.py，让 tarball 也能 zylab --version。
 core/_build.py export-subst
+
+# 换行统一 LF，两个平台的工作区一模一样。
+#
+# 不这么做的话：Git for Windows 默认 core.autocrlf=true，检出时把 LF 翻成
+# CRLF，`install.sh` 立刻变成 `bash: install.sh: cannot execute`（CRLF 的
+# shebang 带着 \r，内核当成解释器路径的一部分）；Windows CI 与 Linux CI 跑的
+# 也不再是同一份字节。
+#
+# 这跟 zylab **编辑用户文件**时保留原有换行（tests/test_line_endings.py）
+# 是两回事：那是文件的属性，这是本仓库自己的源码约定。
+* text=auto eol=lf
+
+# 例外：批处理。LF 的 .cmd 在 goto / 标签上有已知的解析问题，cmd.exe 那边
+# CRLF 才是原生约定。
+*.cmd text eol=crlf
+*.bat text eol=crlf

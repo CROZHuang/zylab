@@ -15,6 +15,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from unittest import mock as _mock
 from core import checkpoints
+from tests.platform_support import assert_mode, requires_symlinks  # noqa: E402
 
 
 class CheckpointCase(unittest.TestCase):
@@ -57,7 +58,7 @@ store.restore(
 class PreparedWriteTests(CheckpointCase):
     def test_existing_write_preview_is_numbered_unified_diff(self):
         target = self.workspace / "hello.txt"
-        target.write_text("一行\nold\n末行\n", encoding="utf-8")
+        target.write_text("一行\nold\n末行\n", encoding="utf-8", newline="")
         prepared = self.prepare(
             "write_file", {"path": "hello.txt", "content": "一行\nnew\n末行\n"})
 
@@ -145,6 +146,7 @@ class PreparedWriteTests(CheckpointCase):
             self.execute(prepared)
         self.assertEqual(target.read_text(), "external\n")
 
+    @requires_symlinks
     def test_parent_swap_never_creates_temp_in_protected_directory(self):
         parent = self.workspace / "parent"
         parent.mkdir()
@@ -183,7 +185,10 @@ class PreparedWriteTests(CheckpointCase):
 
     def test_prepare_reads_existing_target_exactly_once(self):
         target = self.workspace / "once.txt"
-        target.write_text("before\n")
+        # newline=""：不让 Python 把 \n 翻成平台换行。prepare_write 现在按**字节**
+        # 读原文（Windows 的 os.open 默认文本模式会折 CRLF，已改成二进制），
+        # 不写死换行的话，Windows 上落盘的是 CRLF，与下面的断言对不上。
+        target.write_text("before\n", newline="")
         real_read = checkpoints._read_regular_once
         with mock.patch(
                 "core.checkpoints._read_regular_once", wraps=real_read) as read_mock:
@@ -192,6 +197,7 @@ class PreparedWriteTests(CheckpointCase):
         self.assertEqual(read_mock.call_count, 1)
         self.assertEqual(prepared.before_bytes, b"before\n")
 
+    @requires_symlinks
     def test_symlink_target_and_parent_are_rejected(self):
         outside = self.root / "outside.txt"
         outside.write_text("sentinel")
@@ -228,6 +234,7 @@ class PreparedWriteTests(CheckpointCase):
 
 
 class CheckpointStoreTests(CheckpointCase):
+    @requires_symlinks
     def test_store_rejects_symlink_component_before_creating_root(self):
         outside = self.root / "outside-state"
         outside.mkdir()
@@ -237,6 +244,7 @@ class CheckpointStoreTests(CheckpointCase):
             checkpoints.CheckpointStore(link / "nested")
         self.assertFalse((outside / "nested").exists())
 
+    @requires_symlinks
     def test_checkpoint_lock_symlink_is_rejected_without_chmod_target(self):
         directory = self.store._session_dir("session1")
         victim = self.root / "victim.txt"
@@ -248,8 +256,9 @@ class CheckpointStoreTests(CheckpointCase):
             with self.store._lock("session1", "cp1"):
                 pass
 
-        self.assertEqual(stat.S_IMODE(victim.stat().st_mode), 0o644)
+        assert_mode(self, victim, 0o644)
 
+    @requires_symlinks
     def test_replaced_lock_parents_never_create_in_protected_directory(self):
         protected = self.root / "protected-lock-target"
         protected.mkdir()
@@ -338,14 +347,14 @@ class CheckpointStoreTests(CheckpointCase):
         self.assertEqual(old_row["expected_after_sha256"], p_old.after_sha256)
         self.assertIsNone(old_row["pending_after_sha256"])
         self.assertFalse(new_row["existed_before"])
-        self.assertEqual(stat.S_IMODE(manifest_path.stat().st_mode), 0o600)
+        assert_mode(self, manifest_path, 0o600)
         blob = self.root / "state" / "checkpoint-files" / p_old.before_sha256[:2] / p_old.before_sha256
         self.assertEqual(blob.read_bytes(), b"before")
-        self.assertEqual(stat.S_IMODE(blob.stat().st_mode), 0o600)
+        assert_mode(self, blob, 0o600)
         for directory in (
                 self.root / "state", self.root / "state" / "checkpoints",
                 self.root / "state" / "checkpoint-files", self.root / "state" / "trash"):
-            self.assertEqual(stat.S_IMODE(directory.stat().st_mode), 0o700)
+            assert_mode(self, directory, 0o700)
 
     def test_240_byte_basenames_write_restore_and_trash(self):
         existing_name = "e" * 240
@@ -484,7 +493,7 @@ class CheckpointStoreTests(CheckpointCase):
         result = self.store.restore(
             "session1", "cp1", workspace_root=self.workspace)
         self.assertEqual(existing.read_bytes(), b"before\n")
-        self.assertEqual(stat.S_IMODE(existing.stat().st_mode), 0o750)
+        assert_mode(self, existing, 0o750)
         self.assertFalse((self.workspace / "created.txt").exists())
         self.assertEqual(result.restored, (str(existing),))
         self.assertEqual(result.trashed[0][0], str(self.workspace / "created.txt"))
@@ -635,7 +644,7 @@ class CheckpointStoreTests(CheckpointCase):
                 "session1", "cp1", workspace_root=self.workspace,
                 _after_mutation=abort_after_first)
         self.assertEqual(target.read_text(), "after")
-        self.assertEqual(stat.S_IMODE(target.stat().st_mode), 0)
+        assert_mode(self, target, 0)
 
     def test_recovery_rejects_same_content_with_external_mode(self):
         target = self.workspace / "mode-cas.txt"
@@ -656,7 +665,7 @@ class CheckpointStoreTests(CheckpointCase):
             self.store.recover_incomplete_transactions(
                 workspace_root=self.workspace)
         self.assertEqual(target.read_text(), "before")
-        self.assertEqual(stat.S_IMODE(target.stat().st_mode), 0o777)
+        assert_mode(self, target, 0o777)
         self.assertEqual(
             self.store.list_restore_transactions()[0]["status"],
             "recovery_conflict")
@@ -784,7 +793,7 @@ store.restore('session1', 'cp1', workspace_root=sys.argv[2])
         temps = list(destination.parent.glob(".kct-*.tmp"))
         self.assertEqual(len(temps), 1)
         self.assertEqual(temps[0].read_text(), "secret-created")
-        self.assertEqual(stat.S_IMODE(temps[0].stat().st_mode), 0o666)
+        assert_mode(self, temps[0], 0o666)
         self.assertTrue(created.exists())
         self.assertFalse(destination.exists())
 
@@ -1246,6 +1255,7 @@ store.restore(
         self.assertCountEqual(statuses, ["rolled_back", "committed"])
         self.assertNotIn("recovery_conflict", statuses)
 
+    @requires_symlinks
     def test_restore_rejects_symlink_without_touching_target(self):
         target = self.workspace / "safe.txt"
         target.write_text("before")

@@ -39,6 +39,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 from . import attachments as _attach
+from . import wincompat
 
 MAP_DIRNAME = f"{paths.project_dirname()}/map"
 MANIFEST = "manifest.json"
@@ -170,6 +171,7 @@ def _open_source_fd(root, rel):
         resolved.relative_to(root_path.resolve())
         flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0)
         flags |= getattr(os, "O_NOFOLLOW", 0)
+        flags |= getattr(os, "O_BINARY", 0)   # Windows 默认文本模式，会折 CRLF
         fd = os.open(resolved, flags)
     except (OSError, ValueError) as exc:
         raise RepoMapError(
@@ -288,7 +290,13 @@ def discover_files(root, *, max_files=MAX_FILES):
             for fn in sorted(filenames):
                 if fn.startswith("."):
                     continue
-                rel = os.path.relpath(os.path.join(dirpath, fn), root)
+                # 统一成正斜杠：另一条发现路径（git ls-files）就是正斜杠，
+                # 而下游的前缀判断（.zylab 排除、_scope_for 的 scope 前缀）
+                # 全按 "/" 写。两条路径给出不同分隔符，Windows 上就会
+                # 漏排状态目录、scope 一个都匹配不上。POSIX 上 os.sep 就是 "/"，
+                # 这行是恒等变换。
+                rel = os.path.relpath(
+                    os.path.join(dirpath, fn), root).replace(os.sep, "/")
                 if not _is_texty(rel):
                     continue
                 files.append(rel)
@@ -754,6 +762,7 @@ def _read_bounded_file(path, *, maximum, label, missing_ok=False):
         raise RepoMapError(f"{label} authority 不得是 symlink")
     flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0)
     flags |= getattr(os, "O_NOFOLLOW", 0)
+    flags |= getattr(os, "O_BINARY", 0)   # Windows 默认文本模式，会折 CRLF
     try:
         fd = os.open(path, flags)
     except FileNotFoundError:
@@ -1158,6 +1167,9 @@ def architecture_node_dir(root, manifest=None):
 
 
 def _proc_start(pid):
+    if wincompat.IS_WINDOWS:
+        # Windows 没有 /proc；等价物是 GetProcessTimes 的创建时间。
+        return wincompat.proc_start(pid) or None
     try:
         fields = Path(f"/proc/{int(pid)}/stat").read_text(
             encoding="utf-8").split()
@@ -1171,12 +1183,18 @@ def _owner_is_live(owner):
         pid = int(owner.get("pid"))
     except (TypeError, ValueError, AttributeError):
         return False
-    try:
-        os.kill(pid, 0)
-    except ProcessLookupError:
-        return False
-    except PermissionError:
-        return True
+    if wincompat.IS_WINDOWS:
+        # os.kill(pid, 0) 在 Windows 上是 CTRL_C_EVENT，不是存活探测
+        # （见 wincompat.pid_alive）。POSIX 分支保持原样，一字未动。
+        if not wincompat.pid_alive(pid, denied_is_alive=True):
+            return False
+    else:
+        try:
+            os.kill(pid, 0)
+        except ProcessLookupError:
+            return False
+        except PermissionError:
+            return True
     expected = owner.get("proc_start")
     observed = _proc_start(pid)
     return not expected or not observed or str(expected) == str(observed)

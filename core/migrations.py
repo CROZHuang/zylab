@@ -8,6 +8,7 @@
 """
 from __future__ import annotations
 from . import paths
+from . import wincompat
 
 import argparse
 import json
@@ -266,11 +267,20 @@ def _reject_protected_target(path):
 
 
 def _fsync_file(path):
-    with open(path, "rb") as handle:
+    # Windows 的 os.fsync 走 _commit()，只读句柄会 EBADF；必须以可写方式打开。
+    # POSIX 保持只读 fsync（对只读文件也能刷），行为不变。
+    mode = "rb+" if wincompat.IS_WINDOWS else "rb"
+    with open(path, mode) as handle:
         os.fsync(handle.fileno())
 
 
 def _fsync_dir(path):
+    if wincompat.IS_WINDOWS:
+        # Windows 打不开目录句柄，也没有目录 fsync 的对应物；NTFS 元数据日志
+        # 保证 rename 的可见顺序（与 core/store.py 的同名处理一致）。
+        if not os.path.isdir(os.fspath(path)):
+            raise NotADirectoryError(str(path))
+        return
     flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0)
     fd = os.open(path, flags)
     try:

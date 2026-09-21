@@ -135,8 +135,13 @@ class PreparedBashTests(unittest.TestCase):
         with mock.patch.object(
                 tools, "_run_bash_direct", return_value=completed) as run:
             result = tools.run("bash", approved)
+        # 非沙箱直跑这一路以前写死字面量 "bash"，沙箱那一路早就是
+        # `shutil.which("bash")` 的绝对路径。Windows 移植把两边统一到
+        # tools.bash_executable()——那里还要跳过 System32 的 WSL 垫片，
+        # 所以它**必须**是解析后的路径，不能是裸名字。
         run.assert_called_once_with(
-            ["bash", "-lc", "echo ok"], cwd=os.getcwd(), timeout=120)
+            [tools.bash_executable(), "-lc", "echo ok"],
+            cwd=os.getcwd(), timeout=120)
         self.assertEqual(result, "[UNSANDBOXED][NET OPEN]\nok")
 
     def test_disabled_mode_is_explicitly_unsandboxed(self):

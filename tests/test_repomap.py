@@ -24,6 +24,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from core import repomap, settings
 from tests.pty_harness import run_pty_child
 import zylab as CLI
+from tests.platform_support import requires_symlinks  # noqa: E402
 
 
 def fake_complete_factory(calls, nodes_json=None):
@@ -316,6 +317,7 @@ class ArchitectureGenerations(unittest.TestCase):
                 repomap.RepoMapError, "nodes"):
             repomap.load_architecture_manifest(self.root)
 
+    @requires_symlinks
     def test_current_nodes_symlink_cannot_escape_generation(self):
         manifest = self.build()
         nodes = repomap.architecture_node_dir(self.root, manifest)
@@ -692,6 +694,7 @@ class DeterministicMap(unittest.TestCase):
             cwd=self.root, capture_output=True, text=True, check=True)
         self.assertEqual(status.stdout, "")
 
+    @requires_symlinks
     def test_local_exclude_symlink_cannot_escape_git_directory(self):
         subprocess.run(
             ["git", "init", "-q"], cwd=self.root, check=True)
@@ -730,6 +733,7 @@ class DeterministicMap(unittest.TestCase):
                 repomap.RepoMapError, "nodes"):
             repomap.load_map(self.root)
 
+    @requires_symlinks
     def test_visualization_export_replaces_symlink_not_target(self):
         repomap.build_map(self.root)
         outside = Path(self.tmp.name).parent / (
@@ -1053,6 +1057,7 @@ class PhaseASecurity(unittest.TestCase):
             "ZYLAB-INTERNAL-SENTINEL", "\n".join(seen))
         self.assertNotIn(".zylab/settings.json", manifest["files"])
 
+    @requires_symlinks
     def test_symlink_source_never_reaches_provider(self):
         outside = Path(self.tmp.name).parent / (
             Path(self.tmp.name).name + "-outside.py")
@@ -1072,6 +1077,7 @@ class PhaseASecurity(unittest.TestCase):
         finally:
             outside.unlink(missing_ok=True)
 
+    @requires_symlinks
     def test_map_authority_symlink_escape_is_rejected(self):
         outside = Path(self.tmp.name).parent / (
             Path(self.tmp.name).name + "-map-outside")

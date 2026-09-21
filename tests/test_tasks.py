@@ -11,7 +11,8 @@ from pathlib import Path
 from unittest import mock
 
 from unittest import mock as _mock
-from core import tasks, tools
+from core import tasks, tools, wincompat
+from tests.platform_support import assert_mode  # noqa: E402
 
 
 def fake_runner(name, args, *, on_note=None, context=None, task=None):
@@ -100,7 +101,7 @@ class TaskLifecycleTests(unittest.TestCase):
             path = Path(task["stdout_path"])
 
             self.assertEqual(path.read_text(encoding="utf-8"), "OK")
-            self.assertEqual(stat.S_IMODE(path.stat().st_mode), 0o600)
+            assert_mode(self, path, 0o600)
             self.assertEqual(task["stdout_bytes"], 2)
             self.assertEqual(
                 task["stdout_sha256"],
@@ -125,8 +126,7 @@ class TaskLifecycleTests(unittest.TestCase):
             index = json.loads(index_path.read_text(encoding="utf-8"))
             entry = manager.artifact_entry("call-page-0001")
 
-            self.assertEqual(
-                stat.S_IMODE(index_path.stat().st_mode), 0o600)
+            assert_mode(self, index_path, 0o600)
             self.assertEqual(index["version"], tasks.ARTIFACT_INDEX_VERSION)
             self.assertEqual(entry["task_id"], "page0001")
             self.assertEqual(
@@ -181,9 +181,11 @@ class TaskLifecycleTests(unittest.TestCase):
             session_dir = root / "legacy-session"
             session_dir.mkdir(parents=True)
             artifact = session_dir / "legacy01.stdout.log"
+            # newline=""：artifact 是按字节回读的，不写死换行的话
+            # Windows 上落盘会变成 CRLF，与下面的断言对不上。
             artifact.write_text(
                 "legacy line one\nlegacy line two\n",
-                encoding="utf-8")
+                encoding="utf-8", newline="")
             rows = [{
                 "id": "tool-run-legacy",
                 "tool_call_id": "call-legacy-1",
@@ -722,11 +724,11 @@ class BashTaskTests(unittest.TestCase):
 
     @staticmethod
     def wait_group_gone(pgid, timeout=1.0):
+        # os.killpg 是 POSIX 专属；Windows 上「进程组」由 Job Object 承担，
+        # 存活探测统一走 wincompat.group_exists（两个平台各有实现）。
         deadline = time.monotonic() + timeout
         while time.monotonic() < deadline:
-            try:
-                os.killpg(pgid, 0)
-            except ProcessLookupError:
+            if not wincompat.group_exists(pgid):
                 return True
             time.sleep(0.01)
         return False
@@ -762,7 +764,7 @@ class BashTaskTests(unittest.TestCase):
             self.assertEqual(terminal["t"], "completed")
             self.assertEqual(task["stdout_bytes"], 200000)
             self.assertEqual(artifact.stat().st_size, 200000)
-            self.assertEqual(stat.S_IMODE(artifact.stat().st_mode), 0o600)
+            assert_mode(self, artifact, 0o600)
             self.assertTrue(task["truncated"])
             self.assertGreater(task["ui_dropped_bytes"], 0)
             self.assertIn("完整输出 artifact", terminal["v"])
@@ -797,7 +799,7 @@ class BashTaskTests(unittest.TestCase):
             self.assertEqual(terminal["t"], "cancelled")
             self.assertLess(elapsed, 1.0)
             self.assertTrue(self.wait_group_gone(pgid))
-            self.assertEqual(terminal["task"]["signal"], signal.SIGKILL)
+            self.assertEqual(terminal["task"]["signal"], wincompat.SIGKILL)
             self.assertIn("用户中断", terminal["v"])
 
     def test_timeout_is_distinct_from_user_cancel(self):
@@ -960,7 +962,7 @@ class BashTaskTests(unittest.TestCase):
                           if item.id == snapshot.id)
 
             self.assertEqual(target.status, tasks.TaskStatus.CANCELLED)
-            self.assertEqual(target.signal, signal.SIGKILL)
+            self.assertEqual(target.signal, wincompat.SIGKILL)
             self.assertTrue(self.wait_group_gone(pgid))
             terminal = [event for event in manager.drain_background()
                         if event["t"] == "cancelled"]

@@ -16,6 +16,7 @@ from unittest import mock
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from unittest import mock as _mock
 from core import agent, settings as S, tools
+from tests.platform_support import assert_mode, requires_symlinks  # noqa: E402
 
 
 class GuardFileLayer(unittest.TestCase):
@@ -31,6 +32,7 @@ class GuardFileLayer(unittest.TestCase):
             with self.subTest(path=p):
                 tools._guard(p)          # 不抛就算过
 
+    @requires_symlinks
     def test_symlink_cannot_bypass(self):
         link = os.path.join(tempfile.gettempdir(), "zylab_test_protected_link")
         if os.path.lexists(link):
@@ -358,14 +360,20 @@ class WorkspacePreservation(unittest.TestCase):
                 (small / f"{index}.txt").write_text(
                     "x", encoding="utf-8")
 
+            # 嵌进 bash 命令串的路径要用正斜杠：反斜杠在 bash（以及守卫切词用的
+            # shlex posix 模式）里是转义符，Windows 路径会被吃掉分隔符，
+            # 于是测的就不是守卫本身了。POSIX 上 sh() 是恒等变换。
+            def sh(path):
+                return str(path).replace(chr(92), "/")
+
             large_risk = tools._guard_bash(
-                f"rm -rf {large}", cwd=root)
+                f"rm -rf {sh(large)}", cwd=root)
             glob_risk = tools._guard_bash(
-                f"rm -rf {loose}/*.txt", cwd=root)
+                f"rm -rf {sh(loose)}/*.txt", cwd=root)
             dynamic_risk = tools._guard_bash(
                 'rm -rf "$HOME"', cwd=root)
             small_risk = tools._guard_bash(
-                f"rm -rf {small}", cwd=root)
+                f"rm -rf {sh(small)}", cwd=root)
 
         self.assertIn("bulk_rm_rf", large_risk.kinds)
         self.assertIn("bulk_rm_rf", glob_risk.kinds)
@@ -417,6 +425,7 @@ class ReadBoundary(unittest.TestCase):
                 self.assertNotIn("keys.env", output)
                 self.assertNotIn("not-a-real-secret", output)
 
+    @requires_symlinks
     def test_realpath_blocks_symlink_and_dotdot_escape(self):
         with tempfile.TemporaryDirectory() as d:
             parent = Path(d)
@@ -810,7 +819,7 @@ class SettingsWrites(unittest.TestCase):
             self.assertEqual(value["model"], "m1")
             self.assertEqual(value["permissions"], {
                 "bash": "ask", "write_file": "deny"})
-            self.assertEqual(stat.S_IMODE(path.stat().st_mode), 0o600)
+            assert_mode(self, path, 0o600)
             self.assertEqual(
                 list(path.parent.glob(".settings.json.*.tmp")), [])
 
@@ -857,6 +866,7 @@ class SettingsWrites(unittest.TestCase):
                     S.update_user_permission("bash", "allow")
             self.assertEqual(path.read_bytes(), original)
 
+    @requires_symlinks
     def test_dangling_symlink_user_config_is_rejected(self):
         with tempfile.TemporaryDirectory() as tmp:
             path = Path(tmp) / "settings.json"

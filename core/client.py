@@ -61,11 +61,55 @@ KEYS = os.path.expanduser(
 # 两个内置 profile 的实测差异（2026-08-21，供选型参考）：deepinfer 首 token 快，
 # 但**不上报缓存命中**（prompt_tokens_details 为 null）；boyue **如实上报**
 # （重复请求实测 hit=3584/3606）。
+#
+# **公开厂商的 base 预置，私有端点不预置。** 这两件事以前被混成一条规矩（「不预置任何
+# 网关地址」），代价是陌生人 clone 下来第一条命令就撞墙：`zylab init --gateway openai`
+# 回「未知网关 openai，可选：deepinfer, boyue」，而要新增网关又得先手写 settings.json
+# —— 可 init 本来就该是写它的那一步。厂商官方 endpoint 是公开文档，不是谁的私有信息；
+# 预置它才谈得上「下载下来填个 key 就能用」。内部网关（deepinfer / boyue）仍然只给
+# key 变量名，地址由使用者自己填。
+#
+# 唯一的硬条件是 **OpenAI 兼容**：zylab 只发 `{base}/chat/completions`、只读
+# `{base}/models`。下面每一条都按厂商公开文档填；对不对不靠这张表打包票，靠
+# `zylab init` 那次真实探测（列目录 + 调一次默认模型）当场验。
 BUILTIN_GATEWAYS = {
+    # 内部 / 自建：只给 key 名，地址自己填
     "deepinfer": {"keys": ("DEEPINFER_API_KEY",),
-                  "note": "首 token 快 · 不报缓存命中"},
+                  "note": "自建/内部网关 · 需自填 endpoint"},
     "boyue": {"keys": ("BOYUE_API_KEY",),
-              "note": "报缓存命中"},
+              "note": "自建/内部网关 · 需自填 endpoint"},
+    # 公开厂商（OpenAI 兼容口）
+    "openai": {"base": "https://api.openai.com/v1",
+               "keys": ("OPENAI_API_KEY",), "note": "OpenAI 官方"},
+    "anthropic": {"base": "https://api.anthropic.com/v1",
+                  "keys": ("ANTHROPIC_API_KEY",),
+                  "note": "Anthropic 的 OpenAI 兼容口"},
+    "openrouter": {"base": "https://openrouter.ai/api/v1",
+                   "keys": ("OPENROUTER_API_KEY",),
+                   "note": "聚合上百家 · 目录不需要 key 就能列"},
+    "deepseek": {"base": "https://api.deepseek.com/v1",
+                 "keys": ("DEEPSEEK_API_KEY",), "note": "DeepSeek 官方"},
+    "moonshot": {"base": "https://api.moonshot.cn/v1",
+                 "keys": ("MOONSHOT_API_KEY",), "note": "月之暗面 Kimi"},
+    "zhipu": {"base": "https://open.bigmodel.cn/api/paas/v4",
+              "keys": ("ZHIPU_API_KEY", "GLM_API_KEY"), "note": "智谱 GLM"},
+    "dashscope": {"base": "https://dashscope.aliyuncs.com/compatible-mode/v1",
+                  "keys": ("DASHSCOPE_API_KEY",), "note": "阿里百炼 Qwen"},
+    "siliconflow": {"base": "https://api.siliconflow.cn/v1",
+                    "keys": ("SILICONFLOW_API_KEY",), "note": "硅基流动"},
+    "groq": {"base": "https://api.groq.com/openai/v1",
+             "keys": ("GROQ_API_KEY",), "note": "Groq"},
+    "xai": {"base": "https://api.x.ai/v1",
+            "keys": ("XAI_API_KEY",), "note": "xAI Grok"},
+    "mistral": {"base": "https://api.mistral.ai/v1",
+                "keys": ("MISTRAL_API_KEY",), "note": "Mistral"},
+    "together": {"base": "https://api.together.xyz/v1",
+                 "keys": ("TOGETHER_API_KEY",), "note": "Together"},
+    # 本机推理：明文 HTTP，走 --allow-insecure-http 或那次确认
+    "ollama": {"base": "http://localhost:11434/v1",
+               "keys": ("OLLAMA_API_KEY",), "note": "本机 Ollama · 明文 HTTP"},
+    "lmstudio": {"base": "http://localhost:1234/v1",
+                 "keys": ("LMSTUDIO_API_KEY",), "note": "本机 LM Studio · 明文 HTTP"},
 }
 
 
@@ -102,7 +146,12 @@ def _merged_gateways():
 
 
 GATEWAYS = _merged_gateways()
-GATEWAY = paths.env_get("GATEWAY", "deepinfer").lower()
+# 出厂常量。陌生人第一次跑 zylab 时**没选过任何网关**，落到的就是它——
+# 于是第一屏会说「网关 deepinfer 还没有 endpoint」，一个他从没听说过的名字。
+# 名字本身留着（换成别家等于替用户做一个可能要花钱的选择），但提示得认出
+# 「这是出厂值不是你选的」，见 base_missing_hint。
+FACTORY_GATEWAY = "deepinfer"
+GATEWAY = paths.env_get("GATEWAY", FACTORY_GATEWAY).lower()
 if GATEWAY not in GATEWAYS:
     sys.exit(f"未知网关 {GATEWAY}，可选：{', '.join(GATEWAYS)}")
 _INITIAL_GATEWAY = GATEWAY
@@ -120,15 +169,41 @@ def resolve_base(name):
     return str((GATEWAYS.get(name) or {}).get("base") or "").strip()
 
 
+def is_unchosen_default(name):
+    """`name` 是不是「谁也没选过的出厂常量」。
+
+    三条同时成立才算：它就是出厂常量、环境变量没指定过、而且这个网关在本机
+    根本没有地址（维护者自己把 deepinfer 配好了地址，那是**选过**，不该走这条）。
+    """
+    return (str(name).lower() == FACTORY_GATEWAY
+            and not paths.env_get("GATEWAY")
+            and not (GATEWAYS.get(FACTORY_GATEWAY) or {}).get("base"))
+
+
 def base_missing_hint(name):
-    """没配 endpoint 时的补救。说清配哪里，并给一条能直接粘的命令。"""
+    """没配 endpoint 时的补救。说清配哪里，并给一条能直接粘的命令。
+
+    公开厂商的地址是内置的（见 BUILTIN_GATEWAYS），所以走到这里的只有两种：
+    自建/内部网关，或用户自己起的名字。两种都得由使用者填地址——顺带把
+    「其实你可以直接挑一个内置的」说出来，否则新用户不知道有这条路。
+    """
+    ready = sorted(n for n, cfg in GATEWAYS.items() if cfg.get("base"))
+    if is_unchosen_default(name):
+        # 全新安装、什么都没配。别拿出厂常量的名字开场——他没选过 deepinfer，
+        # 看到这个名字只会先问「这是什么、zylab 凭什么要连它」。
+        return (
+            "还没选网关。挑一个内置的厂商，填上自己的 key 就能用：\n"
+            f"  zylab init --gateway <名字> --key-env <环境变量名>\n"
+            f"    可选：{', '.join(ready) if ready else '（无）'}\n"
+            "自建 / 公司内部网关则自己给地址：\n"
+            "  zylab init --gateway mycorp --base https://<host>/v1 "
+            "--key-env MYCORP_API_KEY")
     return (
-        f"网关 {name} 还没有 endpoint 地址 —— zylab 不预置任何网关地址，"
-        "它只是客户端。三选一：\n"
-        f"  zylab init --gateway {name}\n"
+        f"网关 {name} 还没有 endpoint 地址（自建/内部网关的地址不随仓库分发）。三选一：\n"
+        f"  zylab init --gateway {name} --base https://<host>/v1\n"
         f"  export {paths.env_name('BASE_' + str(name).upper())}='https://<host>/v1'\n"
-        f"  或在 {paths.state_home() / 'settings.json'} 里写 "
-        f'{{"gateways": {{"{name}": {{"base": "https://<host>/v1"}}}}}}')
+        f"  或换一个地址已内置的网关：zylab init --gateway <名字>\n"
+        f"    可选：{', '.join(ready) if ready else '（无）'}")
 
 
 BASE = resolve_base(GATEWAY)
@@ -630,13 +705,28 @@ class _PhaseChain:
             sink.mark(phase, attempt)
 
 
-# DeepSeek 偶发把 tool-call 语法写进 content 通道（实测 09-16 会话）。
-# 标记形如 <｜DSML｜tool_calls>…</｜DSML｜tool_calls>；GLM 走结构化
-# tool_calls 字段，从不泄漏。只对已知泄漏的模型族启用缓冲过滤，
-# 其他模型零开销直通。
-_DSML_TOOL_CALL_RE = re.compile(
-    r"<｜DSML｜tool_calls>.*?</｜DSML｜tool_calls>", re.DOTALL)
-_DSML_OPEN_RE = re.compile(r"<｜DSML｜tool_calls>")
+# DeepSeek 偶发把 tool-call 语法写进 content 通道（实测 09-16 会话）。原生格式：
+#   <｜DSML｜tool_calls>
+#   <｜DSML｜invoke name="bash">
+#   <｜DSML｜parameter name="command" string="true">ls</｜DSML｜parameter>
+#   </｜DSML｜invoke>
+#   </｜DSML｜tool_calls>
+# GLM 走结构化 tool_calls 字段，从不泄漏。只对已知泄漏的模型族启用过滤，其他模型零开销直通。
+#
+# 2026-09-20 重写。第一版（09-17）在真实网关上 7 次里漏了 3 次，离线复现出三个缺陷：
+#   1. 开标签被流式分片劈开就整段漏给用户——「先扣住半截 <」的那几行紧接着就被后面的放行
+#      逻辑冲掉了，而单测恰好把分片切在完整开标签之后；
+#   2. 回收只认 name="arguments" 包一整个 JSON 的写法，DeepSeek 原生的「一个参数一个元素」
+#      被剥掉后**不回收**，模型的调用凭空消失，这一轮什么都没干就结束了；
+#   3. 模型在正文里**谈论**这个标记时（开发 zylab 自己的会话里有 29 条）会被当成泄漏，
+#      后面的正文被扣住、甚至丢掉。
+_DSML_OUTER = ("tool_calls", "function_calls")
+_DSML_OPENS = tuple(f"<｜DSML｜{name}>" for name in _DSML_OUTER)
+_DSML_INVOKE_PREFIX = '<｜DSML｜invoke name="'
+_DSML_INVOKE_RE = re.compile(
+    r'<｜DSML｜invoke name="([^"]+)">(.*?)</｜DSML｜invoke>', re.DOTALL)
+_DSML_PARAM_RE = re.compile(
+    r'<｜DSML｜parameter name="([^"]+)"([^>]*)>(.*?)</｜DSML｜parameter>', re.DOTALL)
 
 
 def dsml_may_leak(route, model):
@@ -644,37 +734,174 @@ def dsml_may_leak(route, model):
     return "deepseek" in str(model or "").lower()
 
 
-def _strip_dsml_tool_calls(text):
-    """剥掉 DSML tool_calls 块；尝试回收里面的合法 tool call。
-
-    返回 (剩余正文, 回收出的 calls)。回收失败（JSON 不合法）时整块
-    丢弃——宁可丢一次调用也不能把语法泄漏给用户。
-    """
+def _dsml_recover(block):
+    """从一段 DSML 里回收**完整的** invoke；两种参数写法都认。回收不出来的那一个就丢。"""
     calls = []
-    for match in _DSML_TOOL_CALL_RE.finditer(text):
-        block = match.group(0)
-        for invoke in re.finditer(
-                r'<｜DSML｜invoke name="([^"]+)">(.*?)</｜DSML｜invoke>',
-                block, re.DOTALL):
-            name, body = invoke.group(1), invoke.group(2)
-            arg_match = re.search(
-                r'<｜DSML｜parameter name="arguments"[^>]*>(.*?)'
-                r'</｜DSML｜parameter>', body, re.DOTALL)
-            if not arg_match:
-                continue
+    for name, body in _DSML_INVOKE_RE.findall(block):
+        params = _DSML_PARAM_RE.findall(body)
+        if not params:
+            continue
+        args = None
+        if len(params) == 1 and params[0][0] == "arguments":
             try:
-                args = json.loads(arg_match.group(1))
+                parsed = json.loads(params[0][2])
             except (ValueError, TypeError):
+                parsed = None
+            if isinstance(parsed, dict):
+                args = parsed                         # 旧写法：整个参数对象是一段 JSON
+        if args is None:
+            args = {}
+            for key, attrs, raw in params:
+                value = raw
+                if 'string="true"' not in attrs:      # string="false"：数字 / 布尔 / 对象
+                    try:
+                        value = json.loads(raw)
+                    except (ValueError, TypeError):
+                        value = raw
+                args[key] = value
+        calls.append({
+            # id 要在整个会话里唯一：以前是 dsml-0 / dsml-1，同一个会话里每次泄漏都从 0 编起。
+            "id": "dsml-" + os.urandom(4).hex(),
+            "type": "function",
+            "function": {"name": name,
+                         "arguments": json.dumps(args, ensure_ascii=False)},
+        })
+    return calls
+
+
+class _DsmlFilter:
+    """流式正文里的 DSML 泄漏过滤。feed() 返回此刻可以放行的正文；finish() 返回收尾的
+    (正文, 回收出的 tool calls)。结果与流怎么分片无关。
+
+    判定「这是泄漏而不是引用」要同时满足：不在 ``` 代码块里；从开头标记起，内容在**结构上**
+    一直是调用——外层标签、invoke、invoke 里只有 parameter 元素（参数的**值**随便写什么都行，
+    元素之间只能是空白）；调用之后再没有正文，模型吐完调用就停下等结果。调用之后允许再跟调用
+    （并行），也允许跟一串闭标签碎屑。真实网关上抓到过三种残缺形状，都是网关自己的解析器吃掉了
+    一部分标记：正文以裸 invoke 开头；正文只剩一个孤零零的 `</｜DSML｜tool_calls>`；正文是几百个
+    重复的 `</｜DSML｜invoke>` / `</invoke>`（模型退化成循环）。所以裸 invoke 和孤儿闭标签也算
+    开头。任何一条不满足，扣住的内容原样还给正文，一个字不丢。
+    """
+
+    _ORPHAN_CLOSE = "</｜DSML｜"
+    _OPENERS = _DSML_OPENS + (_DSML_INVOKE_PREFIX, _ORPHAN_CLOSE)
+    _INVOKE_CLOSE = "</｜DSML｜invoke>"
+    _PARAM_PREFIX = '<｜DSML｜parameter name="'
+    _PARAM_CLOSE = "</｜DSML｜parameter>"
+    _HEADER_MAX = 300                 # `<｜DSML｜invoke name="…">` 这一截最长能有多长
+    _DEBRIS = re.compile(r"</[^<>\n]{0,40}>|[A-Za-z_｜]{1,20}>")
+    _PARTIAL_DEBRIS = re.compile(r"</?[^<>\n]{0,40}|[A-Za-z_｜]{1,20}")
+
+    def __init__(self):
+        self.held = ""              # 还没决定去向的内容
+        self.in_block = False       # held 以某个开头标记起始
+        self.fences = 0             # 已放行正文里 ``` 的个数
+        self._ticks = 0             # 已放行正文末尾连续的 ` 个数（``` 会被分片劈开）
+
+    def _emit(self, text):
+        if self._ticks or "`" in text:
+            for char in text:
+                if char != "`":
+                    self._ticks = 0
+                    continue
+                self._ticks += 1
+                if self._ticks == 3:
+                    self.fences += 1
+                    self._ticks = 0
+        return text
+
+    def feed(self, chunk):
+        self.held += chunk
+        out = ""
+        while self.held:
+            if not self.in_block:
+                hits = [self.held.find(tag) for tag in self._OPENERS if tag in self.held]
+                if hits:
+                    at = min(hits)
+                    out += self._emit(self.held[:at])
+                    self.held = self.held[at:]
+                    if self.fences % 2:
+                        # 代码块里的标记是模型在引用：放掉开头那个 "<"，继续往后找
+                        out += self._emit(self.held[:1])
+                        self.held = self.held[1:]
+                        continue
+                    self.in_block = True
+                    continue
+                # 没有完整的开头标记：只扣住「可能是它的开头」的那截尾巴
+                keep = 0
+                for tag in self._OPENERS:
+                    for size in range(min(len(tag) - 1, len(self.held)), keep, -1):
+                        if self.held.endswith(tag[:size]):
+                            keep = size
+                            break
+                out += self._emit(self.held[:len(self.held) - keep])
+                self.held = self.held[len(self.held) - keep:]
+                break
+            if self._judge() == "wait":
+                break
+            # 不是调用：正文里提了一下这个标记，或者引用完一整块之后接着讲解。原样放行——
+            # 先放掉开头那个 "<"，剩下的回到普通模式继续扫（后面也许还有真的调用）。
+            self.in_block = False
+            out += self._emit(self.held[:1])
+            self.held = self.held[1:]
+        return out
+
+    def _partial(self, rest, *tags):
+        return any(tag.startswith(rest) for tag in tags)
+
+    def _judge(self):
+        """held 以开头标记起始。它在结构上还像不像「一串调用，后面除了碎屑什么都没有」？"""
+        text, pos, size = self.held, 0, len(self.held)
+        tags = _DSML_OPENS + tuple("</" + tag[1:] for tag in _DSML_OPENS)
+        while True:
+            while pos < size and text[pos].isspace():
+                pos += 1
+            if pos >= size:
+                return "wait"                          # 到目前为止都像调用，等流结束再定
+            outer = next((tag for tag in tags if text.startswith(tag, pos)), None)
+            if outer is not None:
+                pos += len(outer)                      # 外层的开 / 闭标签只是包装，跳过
                 continue
-            calls.append({
-                "id": f"dsml-{len(calls)}",
-                "type": "function",
-                "function": {
-                    "name": name,
-                    "arguments": json.dumps(args, ensure_ascii=False),
-                },
-            })
-    return _DSML_TOOL_CALL_RE.sub("", text), calls
+            if text.startswith(_DSML_INVOKE_PREFIX, pos):
+                header = text.find('">', pos, pos + self._HEADER_MAX)
+                if header < 0:
+                    return "wait" if size - pos < self._HEADER_MAX else "quote"
+                pos = header + 2
+                while True:                            # invoke 里只能是 parameter 元素
+                    while pos < size and text[pos].isspace():
+                        pos += 1
+                    if pos >= size:
+                        return "wait"
+                    if text.startswith(self._INVOKE_CLOSE, pos):
+                        pos += len(self._INVOKE_CLOSE)
+                        break
+                    if text.startswith(self._PARAM_PREFIX, pos):
+                        close = text.find(self._PARAM_CLOSE, pos)
+                        if close < 0:
+                            return "wait"              # 参数的值还没收完，里面写什么都行
+                        pos = close + len(self._PARAM_CLOSE)
+                        continue
+                    if self._partial(text[pos:], self._INVOKE_CLOSE, self._PARAM_PREFIX):
+                        return "wait"
+                    return "quote"
+                continue
+            rest = text[pos:]
+            if self._partial(rest, *self._OPENERS, *tags):
+                return "wait"                          # 也许是下一个调用的开头
+            debris = self._DEBRIS.match(text, pos)
+            if debris:
+                pos = debris.end()
+                continue
+            if len(rest) <= 45 and self._PARTIAL_DEBRIS.fullmatch(rest):
+                return "wait"                          # 半个闭标签，还没收完
+            return "quote"
+
+    def finish(self):
+        held, self.held = self.held, ""
+        if not self.in_block:
+            return self._emit(held), []
+        self.in_block = False
+        # 没有一个完整的 invoke（多半是被 max_tokens 截断）：语法不给用户看，也没有可执行的调用。
+        return "", _dsml_recover(held)
 
 
 def stream_chat_background(*args, poll_interval=0.025, queue_size=256,
@@ -1085,6 +1312,67 @@ def _http_error(e, route, model):
         retryable=retryable)
 
 
+def _tool_args_ok(call):
+    """这个 tool call 的 arguments 是不是合法 JSON。"""
+    try:
+        json.loads(str(((call or {}).get("function") or {}).get("arguments") or ""))
+    except (ValueError, TypeError):
+        return False
+    return True
+
+
+def repair_truncated_tool_calls(calls):
+    """把流式截断产生的残缺 tool arguments 换成合法占位 JSON。
+
+    这是**唯一**的规范实现：`core.agent._repair_truncated_calls` 与出站净化
+    都委托到这里，避免两处逻辑漂移（09-20 事故的根因之一就是修复只发生在
+    一条路径上）。占位形如 `{"_truncated": "<原始前 120 字符>"}`：JSON 合法、
+    原始片段可追溯，模型看到占位会自行重发调用。`id` 保持不变，所以
+    tool_call_id 与 tool 结果的配对不受影响。
+    """
+    repaired = []
+    for call in calls or ():
+        if _tool_args_ok(call):
+            repaired.append(call)
+            continue
+        fn = dict((call or {}).get("function") or {})
+        raw_args = str(fn.get("arguments") or "")
+        fn["arguments"] = json.dumps(
+            {"_truncated": raw_args[:120]}, ensure_ascii=False)
+        call = dict(call or {})
+        call["function"] = fn
+        repaired.append(call)
+    return repaired
+
+
+def _sanitize_outgoing_messages(messages):
+    """净化**发出去的那份副本**里残缺的 tool arguments。
+
+    为什么必须在出站这一层再做一次：服务端每轮都重新解析整个 `messages`，
+    所以历史里只要躺着一条未闭合的 arguments，此后**每一次**请求都会 400
+    （实测 DeepInfer：`Unterminated string starting at: line 1 column 13`），
+    重试与换模型都无效——因为历史没变。已经落盘的会话也靠这里自愈。
+
+    只替换出问题的那几条消息，其余对象原样复用；**不修改调用方传进来的
+    列表**，会话文件里的原始字节保持不变，便于事后取证。
+    """
+    if not messages:
+        return messages
+    out = None
+    for index, message in enumerate(messages):
+        if not isinstance(message, dict):
+            continue
+        calls = message.get("tool_calls")
+        if not calls or all(_tool_args_ok(call) for call in calls):
+            continue
+        if out is None:
+            out = list(messages)
+        fixed = dict(message)
+        fixed["tool_calls"] = repair_truncated_tool_calls(calls)
+        out[index] = fixed
+    return messages if out is None else out
+
+
 def stream_chat(model, messages, tools=None, max_tokens=8192, temperature=0.3,
                 timeout=600, cancel=None, retries=3, phases=None,
                 gateway=None, route=None, temperature_fallback=True,
@@ -1127,6 +1415,10 @@ def stream_chat(model, messages, tools=None, max_tokens=8192, temperature=0.3,
                 route_warning(decision.warning)
             else:
                 warnings.warn(decision.warning, RuntimeWarning, stacklevel=2)
+
+    # 历史里可能躺着流式截断留下的未闭合 tool arguments。放在重试循环**之上**
+    # 只做一次：每次 attempt 都用这份净化过的副本，且不会重复扫描。
+    messages = _sanitize_outgoing_messages(messages)
 
     delay = 0.6
     max_attempts = max(1, int(retries))
@@ -1355,51 +1647,8 @@ def _stream_once(model, messages, tools=None, max_tokens=8192, temperature=0.3,
                  "Content-Type": "application/json", "Accept": "text/event-stream"})
 
     acc = {}          # index -> {id, name, args}
-    # DeepSeek 偶发把 tool-call 语法（<｜DSML｜tool_calls>…）写进 content 通道。
-    # 过滤必须在累积缓冲上做：标记可能被 chunk 边界劈开，单 chunk 过滤会漏。
-    # 缓冲策略：正文先攒着，确认不含未闭合标记才放行；流结束时丢弃残余。
-    dsml_buf = ""
-    dsml_active = False
-
-    def _flush_dsml_buffer():
-        """把缓冲里确认干净的正文放行；返回 (text, recovered_tool_calls)。"""
-        nonlocal dsml_buf, dsml_active
-        text, dsml_buf = dsml_buf, ""
-        calls = []
-        if not dsml_active and _DSML_OPEN_RE.search(text):
-            # 有未闭合标记：只放行标记起点之前的安全前缀
-            safe = text.find("<｜DSML｜")
-            if safe > 0:
-                dsml_buf = text[safe:]
-                text = text[:safe]
-            else:
-                dsml_buf = text
-                text = ""
-            dsml_active = True
-        elif dsml_active:
-            # 上一轮扣住的半截标记，这轮拼上再看
-            if "</｜DSML｜tool_calls>" in text:
-                stripped, recovered = _strip_dsml_tool_calls(text)
-                calls = recovered
-                text = stripped
-                dsml_active = False
-            else:
-                # 还没闭合：继续扣住，不放行
-                dsml_buf = text
-                text = ""
-        else:
-            # 无未闭合标记：尾部可能有半截 '<'，先扣住
-            tail = text.rfind("<")
-            if tail >= 0:
-                dsml_buf = text[tail:]
-                text = text[:tail]
-        if dsml_buf and not dsml_active:
-            stripped, recovered = _strip_dsml_tool_calls(dsml_buf)
-            calls = recovered
-            if stripped:
-                text += stripped
-            dsml_buf = ""
-        return text, calls
+    # DSML 泄漏过滤必须在累积缓冲上做：标记会被 chunk 边界劈开。见 _DsmlFilter。
+    dsml = _DsmlFilter() if dsml_may_leak(route, model) else None
     usage = {}
     reason = None
     terminal = False
@@ -1469,13 +1718,10 @@ def _stream_once(model, messages, tools=None, max_tokens=8192, temperature=0.3,
                     if d.get("reasoning_content"):
                         yield {"t": "reasoning", "v": d["reasoning_content"]}
                     if d.get("content"):
-                        if dsml_may_leak(route, model):
-                            dsml_buf += d["content"]
-                            safe_text, recovered = _flush_dsml_buffer()
+                        if dsml is not None:
+                            safe_text = dsml.feed(d["content"])
                             if safe_text:
                                 yield {"t": "text", "v": safe_text}
-                            for call in recovered:
-                                yield {"t": "tool", "v": [call]}
                         else:
                             yield {"t": "text", "v": d["content"]}
                     for tc in d.get("tool_calls") or []:
@@ -1505,13 +1751,12 @@ def _stream_once(model, messages, tools=None, max_tokens=8192, temperature=0.3,
         if callable(releaser):
             releaser(resp)
         _mark_phase(phases, "ended", attempt)
-    # 流结束：把 DSML 缓冲里扣住的残余正文放行（含未闭合标记时丢弃残余）。
-    if dsml_may_leak(route, model) and dsml_buf:
-        tail_text, tail_calls = _flush_dsml_buffer()
+    # 流结束：扣住的内容此刻才能定性——是泄漏就回收成真正的 tool 事件，不是就原样放行。
+    leaked_calls = []
+    if dsml is not None:
+        tail_text, leaked_calls = dsml.finish()
         if tail_text:
             yield {"t": "text", "v": tail_text}
-        for recovered in tail_calls:
-            yield {"t": "tool", "v": [recovered]}
 
     if not terminal:
         if _cancelled(cancel):
@@ -1529,6 +1774,10 @@ def _stream_once(model, messages, tools=None, max_tokens=8192, temperature=0.3,
                           "type": "function",
                           "function": {"name": s["name"], "arguments": s["args"] or "{}"}})
         yield {"t": "tool", "v": calls}
+    elif leaked_calls:
+        # 调用方拿到 tool 事件是「整份替换」而不是追加：结构化字段里有调用时以它为准，
+        # 正文里漏出来的那份只剥掉、不再执行一遍。
+        yield {"t": "tool", "v": leaked_calls}
     yield {"t": "done", "reason": reason, "usage": usage}
 
 

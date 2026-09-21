@@ -4,9 +4,30 @@
 用 Python 标准库实现：零第三方依赖，克隆即用，不需要 node、pip 或 venv。
 借的是架构，不是代码。
 
-**不预置任何网关地址和 key。** zylab 只是客户端：你自己的 endpoint 填进配置，
-它就跑起来。厂商官方 API、公司内部网关、本地 vLLM / Ollama 都行，只要提供
-`/v1/chat/completions` 并支持 tool calling。
+**自带公开厂商的地址，不预置任何 key，也不预置任何私有端点。**
+下载下来填一把自己的 key 就能用：
+
+```bash
+git clone https://github.com/CROZHuang/zylab && cd zylab
+export OPENAI_API_KEY='sk-…'                 # 或别家的 key
+./zylab init --gateway openai --key-env OPENAI_API_KEY --yes
+./zylab                                       # 开工
+```
+
+`init` 会做四件事：写 endpoint → 收 key（`0600`，不回显）→ 拉一次模型目录并落盘 →
+调一次默认模型验明正身；**默认模型这把 key 用不了就当场换一个能用的**并写进配置。
+
+内置 profile（地址来自厂商公开文档，对不对由 `init` 那次真实探测当场验）：
+`openai` `anthropic` `openrouter` `deepseek` `moonshot` `zhipu` `dashscope`
+`siliconflow` `groq` `xai` `mistral` `together`，本机推理 `ollama` `lmstudio`。
+自建 / 公司内部网关只给 key 变量名、地址自己填：
+
+```bash
+./zylab init --gateway mycorp --base https://<host>/v1 --key-env MYCORP_API_KEY --yes
+```
+
+唯一的硬条件是 **OpenAI 兼容**：提供 `/v1/chat/completions` 与 `/v1/models`，并支持
+tool calling。
 
 ```bash
 zylab                          # 交互会话
@@ -24,46 +45,6 @@ zylab --usage <session前缀>     # 单个会话
 zylab --yolo                   # 仅批准普通 ask；hard/deny 仍拒绝（慎用）
 ```
 
-## 平台
-
-| 平台 | 状态 |
-|---|---|
-| **Linux** | 主平台。全部测试在这里跑绿，OS 级沙箱（mount + network namespace）可用。 |
-| **macOS** | 应当可用，**未在真机验证**。差别只有一处：OS 级沙箱依赖 Linux 的 `unshare`/`mount`/`setpriv`，macOS 没有。 |
-| **Windows** | 有专门的兼容层，**但只做到「设计完整 + import 安全」，Windows 分支未在真机执行过**。 |
-
-这三行是**声明，不是营销**。下面写清每一条的依据和代价。
-
-**macOS**：POSIX 原语（`termios`/`fcntl`/`select`/`killpg`）都在，所以终端交互、文件锁、
-进程树终止、检查点的 `openat` 防替换链都走原生路径。唯一的差别是沙箱能力探测会返回
-不可用（缺 `unshare`/`mount`/`setpriv`），此时：`ask-unsandboxed`（默认）下每次 Bash
-都要你**逐次确认**；`strict` 下直接拒绝执行。**受保护路径的词法守卫不受影响** ——
-它在工具层，和沙箱是两道独立的门。
-
-**Windows**：`core/wincompat.py` 是所有平台差异的唯一入口，零三方依赖（只用 stdlib +
-系统 DLL 的 ctypes）：
-
-| POSIX 原语 | Windows 等价物 |
-|---|---|
-| `fcntl.flock` | `msvcrt.locking` 字节范围锁 |
-| `termios`/`tty` raw 模式 | `SetConsoleMode` |
-| `select.select` | 控制台 `msvcrt.kbhit`；管道 `PeekNamedPipe` |
-| `os.killpg` | `taskkill /T /F` |
-| `os.open(..., dir_fd=)` | 退化为绝对路径 + 身份比对 |
-| `st_uid == geteuid()` | 退化为 NTFS ACL 下的常规文件检查 |
-
-**已知的语义代价（不假装没有）**：`msvcrt` 锁的是字节范围而非整个 fd，并发写方必须也走
-这一层才互斥；检查点的 TOCTOU 防替换从 `openat` 级退化到路径解析级；`taskkill /F` 是强杀，
-没有 POSIX 那个 `TERM → 宽限 → KILL` 的序列；没有 `SIGWINCH`，窗口尺寸改用轮询。
-
-**验证到哪一步**：测试钉住了两件事 —— POSIX 包装与原语同义（跨进程 flock 互斥、进程树
-终止、`fd_*` 的 at 语义、raw 模式进出对称），以及**11 个核心模块在 `fcntl`/`termios`/`tty`
-缺失时仍能 import**（那正是 Windows 上撞到的第一个错误）。**没有**钉住的是 `msvcrt`/`ctypes`
-那些分支本身 —— 在 Linux 上无法伪造（`sys.platform` 一改，标准库就去找 Windows 专属的
-`_winapi`），只能真机跑。所以在 Windows 上第一次用请当作 beta。
-
-Windows 上用 `python zylab.py`（不是 `./zylab`）。
-
 ## 安装
 
 不需要 pip / venv，纯标准库，Python 3.10+。
@@ -75,6 +56,36 @@ git clone https://github.com/CROZHuang/zylab.git && cd zylab
 ```
 
 `init` 的每一步失败都自带下一步动作，而不是只丢一个错误码。
+
+### Windows
+
+一样是克隆即用，只是入口换成 `zylab.cmd`（`./zylab` 没有扩展名，cmd 和
+PowerShell 不认 shebang）：
+
+```bat
+git clone https://github.com/CROZHuang/zylab.git
+cd zylab
+set OPENAI_API_KEY=sk-…
+zylab init --gateway openai --key-env OPENAI_API_KEY --yes
+zylab
+```
+
+两个 Windows 专属的准备：
+
+- **Python 3.10+**。`zylab.cmd` 会先试 `py -3` 再试 `python`，两个都会先做一次
+  真实的版本探测 —— 因为没装 Python 时 PATH 上**仍然有** `python.exe`：那是
+  微软商店的应用执行别名，运行它只会静默弹出商店页面。
+- **一个真 bash**，给 Bash 工具用：装 [Git for Windows](https://git-scm.com/download/win)，
+  确保 `<Git>\usr\bin` 在 PATH 里。注意 `C:\Windows\System32\bash.exe`
+  **不算** —— 那是 WSL 启动器，它会把命令送进另一个文件系统命名空间，
+  zylab 的路径守卫在那边一条也对不上，所以 zylab 会拒绝用它并告诉你装什么。
+
+终端建议用 Windows Terminal（VT 序列、真彩、鼠标上报都齐）。传统的
+`conhost.exe` 也能跑，zylab 会探测能力后自己降级。
+
+Windows 上多出来的几条本地规矩，zylab 会在系统提示里直接告诉模型，
+也会在工具层拦住：`NUL`/`CON`/`AUX`/`COM1`–`COM9`/`LPT1`–`LPT9` 是**设备名
+不是文件名**（`aux.txt` 也算），结尾的点或空格会被 Win32 静默剥掉。
 
 **你要自备一个 OpenAI 兼容的 endpoint 和 key。** zylab 不预置、不代理、不转发任何
 网关地址 —— 它只是客户端。任何提供 `/v1/chat/completions` 的服务都能接：厂商官方
@@ -134,7 +145,7 @@ cd <你的 zylab 目录> && git pull
 | `HTTP 5xx`、超时、「不可达」 | 网关自己挂了或网络不通，**与 key 无关** | 稍后重试或换网关：`zylab init --gateway boyue` |
 | `-p` 半天没动静 | 网关首字慢（kimi-k3-256k 实测过 100s） | stderr 每隔一阵会报「等 … 已 Ns 没有响应」；Ctrl+C 放弃或换模型 |
 | 「已拒绝明文 HTTP provider 传输」 | Boyue 只有内网明文 HTTP | 按提示显式授权（交互逐 session，或 CLI 危险开关） |
-| 启动就说「网关 … 还没有 endpoint 地址」 | 没配 endpoint | `zylab init --gateway <名字> --base https://<host>/v1`；zylab 不预置任何网关地址 |
+| 启动就说「网关 … 还没有 endpoint 地址」 | 用的是自建网关，地址不随仓库分发 | `zylab init --gateway <名字> --base https://<host>/v1`；或直接换一个地址已内置的公开厂商 |
 | `git clone` 报 `Permission denied (publickey)`，但 key 已加、指纹也对 | `ssh` 读的是 passwd 里的家目录，而 `HOME` 被重映射到了别处（容器里常见），于是钥匙生成在哪、ssh 就是找不到 | `git config --global core.sshCommand "ssh -i $HOME/.ssh/id_ed25519 -o IdentitiesOnly=yes"` 再 clone；`git` 认 `HOME`，`ssh` 不认 |
 | 「需要 Python 3.10+」 | 解释器太旧 | `which -a python3` 选一个 3.10+ 的：`python3.12 zylab.py` |
 
@@ -413,7 +424,11 @@ isolation 或替换 sandbox executable，等于给任意仓库在本机静默执
 `UNSANDBOXED`；项目配置不能把更严格的用户设置降级。旧的 `sandbox.network` 仍能读取，
 但规范字段是 `network_isolation`。
 
-`model_health` 默认连续 3 次 transient failure 后打开 10 分钟 circuit；probe 成功缓存
+`model_health` 默认连续 3 次 transient failure 后打开 circuit，**时长按指数退避**：
+首次 30 秒，其后每多一次连续失败翻倍，封顶 10 分钟（`circuit_open_ttl` 是基数，
+`circuit_open_max_ttl` 是上限）。一次成功即清零。计入 circuit 的只有可重试的瞬时
+故障——认证、权限、参数、上下文超限这类不会因重试而改变的错误一律不计。
+circuit 打开时，**显式指定模型/网关仍可带 warning 越过**。probe 成功缓存
 24 小时，瞬时失败按 5 分钟起始、最多 1 小时退避。这些值均可配置，并在 cwd-safe
 resume 时随目标项目原子切换；切换失败会恢复旧策略。
 
@@ -487,20 +502,37 @@ PostToolUse 还有 `result`），常用字段也以 `ZYLAB_TOOL_COMMAND`、
 /goal clear                        # 清除目标及尚未 dispatch 的内部续轮
 ```
 
-**摘要有两件不同的工作，触发点必须分开。** 压缩摘要是为了**塞进上下文窗口**，`模型上限 − 余量`
-（默认模型 238k）才触发，会替换掉投影里的原文；交接摘要是为了**让 resume 的人知道到哪了**，
-原文超过 `recap_min_tokens`（默认 40k）就该有，**绝不进 provider 投影**——这个会话还有大把预算，
-用摘要替换原文是白丢细节。实测最近 5 个会话没有一个有压缩摘要（4 个测得的里 3 个原文只有
-58k–217k，永远够不到阈值），recap 因此长期只能靠 `task_plan` 和第一条用户原话。
+**recap：离开期间写好的一行路标。** 行为与机制照搬 Claude Code 的 away summary——模型现写的
+**一行**「总目标 + 当前任务 + 下一步」，不是从落盘数据拼出来的多行结构块（旧的零调用 recap
+应付不了开放式的会话：没有 `task_plan`、没撞到压缩阈值，它就无话可说）。
 
-交接摘要在 **turn 结束**（不是 resume 时）后台生成：那一刻上下文正完整，而 resume 时再花一两
-分钟调模型，人早开始干活了。每 `recap_refresh_turns`（默认 15）个用户轮次推进一次，崩溃最多
-丢这么多轮。`/recap` 看当前素材来源与落后轮数，`/recap now` 立刻重建。`recap_auto: false` 关掉。
-实测：一个 698 条消息、179,974 token 的真实会话，88 秒生成 2,725 字符摘要，覆盖全部 698 条。
+- **什么时候写**：终端**失焦**（DEC 1004 焦点上报；xterm.js / VS Code、iTerm2、kitty、WezTerm
+  等都支持）满 `recap_away_seconds`（默认 300s，下限 30s）且没有轮次在跑 → 后台生成，写好等你
+  回来；**重新聚焦即取消定时器并中止在途请求**（shutdown socket，不等网关回话）。终端不支持
+  焦点上报就永不自动触发，`/recap` 照常可用。`resume` 之后也给一条：上次那条之后没有新提问就
+  直接用落盘的（零调用），否则后台现写。
+- **什么时候不打扰**：输入框里有草稿 / 有子代理或后台任务在跑 / 已在生成 / 本轮连续失败 3 次 /
+  真实提问不足 3 条 / 距上次 recap 新增提问不足 2 条 / 写完发现新一轮已开始（丢弃）。
+  `[…]` 运行时通知与 goal 自动续轮的内部提示**不算**提问。
+- **怎么写**：上下文 = 主请求的那份投影 + 末尾追加 CC 的提示词（原文照搬，补了一句中文字数
+  约束和一句「别调工具」）；单轮；截到 400 字符。**请求的前缀与主循环逐字节一致**——同一份
+  system、同一套工具定义（工具照发，只是不许用：回复里出现工具调用即算失败、绝不执行）——
+  这样才吃得到主循环攒下的 prompt cache。结果存进会话记录的 `context.away_recap`，**绝不进
+  `messages`**——模型下一轮不会看到一条自己没见过的「用户提问」。前 3 次附一句怎么关。
+- **用哪个模型**：**就是这个窗口此刻在用的模型**（`/model` 切了它就跟着变），没有单独的开关，
+  与 CC 一致。失败时也不换别家来写——压缩在主模型不行时会借席位池里另一家，recap 不会：那等于
+  在没人要求的情况下把会话内容发给你没给这个窗口选的 provider；recap 只是个方便，写不出来就
+  安静地失败（一轮最多试三次）。同一个模型最多问两次：先关思考，只有「思考吃光了额度」或
+  网关拒收关思考（400）时才按模型默认方式、给足额度再问一次。
+  快慢取决于缓存热不热（2026-09-20 实测，6.5 万 token 的真实会话）：与主循环同前缀时网关回报
+  命中 65,280/65,356 token，首字 **0.4–0.5s**；不命中 4.6s；换了前缀的冷请求在 `glm-5.3@deepinfer`
+  上测到过首字 127.9s。主循环本身 91.8%（Boyue）/ 52.9%（DeepInfer）的输入 token 来自缓存——
+  所以「就用窗口当前的模型」不只是一致性，也是最快的选择。DeepInfer 是多副本，偶尔落到没缓存的
+  副本上会慢一次。`/recap` 显示已等秒数，Esc 可取消。
+- `/recap` 立刻现写一条（Esc / Ctrl+C 取消）。`recap_auto: false` 只关自动触发。
 
-**resume 后的 recap** 只用落盘数据渲染，零 API 调用：目标、最近两条决策（带 `·t42` 来源锚点，
-按锚点倒序 —— 早期结论常被推翻）、一条否决记录、待办进度、Goal 状态与**下一步**、未竟事项
-（与 `task_plan` 语义重复的不再渲染）。没有增量信号就一个字不打。
+**压缩摘要**是另一件事：为了**塞进上下文窗口**，`模型上限 − 余量`（默认模型 238k）才触发，
+会替换掉投影里的原文；recap 不替换任何东西。
 
 **armed 到底意味着什么**：会话空闲时（200 ms 无输入）自动开始下一轮，不需要你再输入，
 直到目标 complete、blocked 或用满轮数。这一点必须说清楚，因为它是这个功能的**全部价值**，
@@ -736,38 +768,88 @@ owner/ACL/xattr；新文件父目录必须已存在。conversation rewind 会创
 
 三级，先廉价后昂贵，而且都只改变本次 provider 投影，不改 raw：
 
-**工具结果老化**（本地、免费）——最近 3 个 assistant 轮次的小工具结果保留全文；
-更早或过大的结果投影成带工具名、参数摘要、状态、首尾 preview 和 SHA-256 的记录。
-实测一个 104 条消息的会话中，工具结果占 **60%** 的上下文字符，投影老化后节省
-**44%**。原始 tool message 仍逐字留在 session/event journal，完整协议对也不会被
-拆开。
+**工具结果老化**（本地、免费）——最近几个 assistant 轮次的工具结果**原样**保留（工具在
+捕获时各自截过一次，上限 30,000 字符；`read_file` 按整行分页并给出接着读的 offset，不在
+文件中间挖洞）；更早的长结果投影成带工具名、参数摘要、状态、首尾 preview 和 SHA-256 的
+记录，末尾写着取回原文的办法：`expand_output(target="sha256:…")`——target 照抄即可。
+原始 tool message 仍逐字留在 session/event journal，完整协议对也不会被拆开。老化的窗口
+与力度随模型上限放宽（256K：3 轮 / 400 字符；1M：11–12 轮 / 约 1,500 字符）。
 
-**工具参数老化**（本地、免费）——模型写文件时把整份内容放进 `tool_calls.arguments`，
-这些参数以前永不老化，工具结果被收起后它们就成了最大的一块（实测占一个真实会话
-17% 的字符）。旧轮次里过大的字符串参数同样收成带 SHA-256 的占位，**JSON 结构不动**，
-只换字符串值。
+**模型自己的工具参数从不改写。** 早先旧轮次的长参数也会被收成「头 200 字 + 占位符」。
+2026-09-20 在 7 个真实会话（2,925 次请求）上重放：它只省 4.3% 的输入 token，却是 5 起
+「模型模仿占位符」事故的全部来源——占位符出现在模型自己的口吻里，它就学着写（一份文档
+因此丢了 2/3）；结果占位符是环境的口吻，525 处零模仿。工具层的闸仍在：有副作用的工具
+（`write_file` / `edit_file` / `bash` / `memory_write` …）拒绝带投影占位符的参数，并告诉模型
+「这不是内容，把完整的真实内容写出来」；只读搜索类不拦。
 
-**自动压缩**（需要一次 API 请求）——老化后仍超过可用预算才摘要较早的完整用户
-轮次，最近 6 个完整用户轮次受保护。默认可用预算是
-`模型上限 - min(64k, 上限×15%)`，并随模型切换，不再使用 180k 硬上限。
+**为什么保留滚动老化、不改成「捕获时截一次、此后不动历史」**（Claude Code / Codex 的
+做法）：同一次重放里，不老化会让输入 token 多 27.5%（1M 档）/ 14.1%（256K 档），换来的
+只是每次请求少重新预填充约 2,000 token——按实测首字回归，在 Boyue 上约 0.07 s（而上下文
+变大反而多 0.5 s），在 DeepInfer 上约 0.6 s；按「缓存价 = 原价 10%」折算，老化仍便宜 6–12%
+（256K 档 / 1M 档）。攒到高水位再成批老化两头不讨好（token +13.6%，预填充只少 18%）。
+
+**自动压缩**（需要一次 API 请求）——老化后仍超过可用预算才摘要较早的历史。尾部按
+**token 预算**保留（阈值的 1/8，夹在 4K–40K 之间），粒度是**模型轮次**，能落在用户轮次起点
+就落在那里——自治程度再高、用户轮次再少的会话也压得动；user 原话无论在不在尾部都逐字
+回放。默认可用预算是 `模型上限 - min(64k, 上限×15%)`，并随模型切换，不再使用 180k 硬上限。
+`/compact <要求>` 可以告诉摘要器这次要特别留住什么。
 
 单次摘要请求的**输入**有上限（`COMPACT_SOURCE_TOKENS`，默认 60k），超出就二分切到
 完整轮次边界，剩下的靠摘要链在下一段接着压（上一段摘要是下一段 source 的第一条），
-一次最多连压 `COMPACT_MAX_PASSES` 段。摘要请求本身按三步降级：**关思考**（
+一次最多连压 `COMPACT_MAX_PASSES` 段。**一旦开始压就压到阈值的一半以下**
+（`COMPACT_DEEP_FRACTION`）而不是「刚装得下就停」：长会话一段压不完，停在阈值边上等于
+几万 token 之后再压一次，而每次压缩都要把整个尾部重发一遍。触发点不变，仍是阈值本身
+——压得更深不等于压得更早。摘要请求本身按三步降级：**关思考**（
 `thinking: {"type": "disabled"}`，reasoning 模型会把思考也算进 `max_tokens`，额度小
 时正文一个字都出不来）→ **大额度**（网关忽略 thinking 时）→ **换席位池里另一个模型
-代写**。压缩落地时界面直接报 `215,315 → 31,931 tokens`，代写的话注明是谁写的。
+代写**。不许关思考的模型（如 glm-5.3@boyue）被 400 拒过一次就记住，此后直接从默认思考 +
+大额度起步。压缩落地时界面直接报 `215,315 → 31,931 tokens`，代写的话注明是谁写的。
 
-摘要里还带回一段 `<working-set>`：被摘要那段读过/改过的文件路径清单（只有路径，
-没有内容——内容会过期，路径不会）。
+**摘要要过验收才装得上去**：被截断的、陷入重复循环的（压缩比判据）、七节结构残缺的一律
+拒收并走下一级降级——以前只要非空就接受。连续失败 3 次后自动压缩歇 30 分钟（换模型或
+手动 `/compact` 立即恢复；状态栏显示「自动压缩暂停」），同一份计划失败后只歇 5 分钟，
+不再是「失败一次永不重试」。
+
+摘要随身带回三样东西：`<working-set>`（被摘要那段读过 / 改过的文件清单）、
+`<pinned-facts>`（阈值、硬约束、否决记录的**逐字原文**，跨代继承并做确定性保真自检），
+以及压缩那一刻采下的**工作现场**——最近动过的至多 5 个文件的当前内容（改过的优先，
+过与 `read_file` 相同的读闸，单文件 16K、合计 48K 字符）和未完成的任务计划。内容冻结在
+摘要记录里，投影因此是确定的，不会每次请求都去读盘。
 
 摘要失败时保留上一份有效摘要；没有有效摘要时按完整轮次生成明确的 deterministic
 omission projection。raw 正文和所有 user 原话都不删除、不截断；若不可裁剪部分本身
 仍超预算则 fail-closed，并让用户缩短输入、手动 compact 或换更大窗口模型。
 
 **分层长期 memory**（本地、带来源）——canonical transcript 仍是事实权威；memory
-保存用户显式 `/memory remember`、模型按严格长期价值判据调用 `memory_write` 写下的
-`explicit` 条目，以及每个 session 的确定性 handoff。project 写入默认允许并在 UI 留痕；
+保存用户显式 `/memory remember`、模型调用 `memory_write` 写下的 `explicit` 条目，
+以及**轮末自动抽取**的 `auto_extract` 条目。条目分四类（`type`）：
+`user`（用户是谁与长期偏好）、`feedback`（对工作方式的要求）、`project`（在做的事与约束）、
+`reference`（外部资源指针）——与 Claude Code 同一套口径。
+
+**索引是钩子，正文按需取。** 注入 system 的 `<memory-index>` 每条只有一行（id · 类型 ·
+scope · 标题 — 一行钩子，约 68 token），模型觉得相关就用 `memory_read` 取正文（单条
+4,096 字节封顶）。以前是把每条**正文**全量塞进 system 而模型没有取回的手段：实测 7 条
+自动 handoff 就占掉 4,339 token。钩子里必须带上以后会用来找它的词（中文任务写中文）——
+2026-09-20 在一份 59 条的真实记忆库上量过：按钩子检索 top-3 命中 16/18，按正文只有 11/18。
+
+**轮末自动抽取**（`memory.generate`，默认开）——一轮结束、静置 60 秒且确有新内容时，
+在后台发**一次与主循环共用前缀的旁路请求**（同 recap 的缓存安全形状：同 system、同工具
+定义，工具照发但不许用），让模型把这次会话里值得跨会话保留的东西写成条目。压缩过一段
+则必抽一次——那段细节马上就只剩摘要了。
+
+为什么不指望主模型顺手写：`memory_write` 一直都在、系统提示也写清了该记什么，2026-09-20
+统计 7 个真实会话——2,925 条助手消息里调用 **0 次**。Claude Code / Codex / ZCode 也都是
+另起一个抽取通道。实测（deepseek-v4-flash@deepinfer，真实会话）3.5–24 s、约 700 输出
+token，写出来的是「Triton 练习环境在哪、无 GPU 怎么验证、ptxas 不在 PATH、跨 program
+归约会互相覆盖（实测 err 29.4）」这类东西——对照被它取代的确定性 handoff 写出来的
+「用户目标：好的」。
+
+抽取的输出一律当成**可能残缺**的：实测有模型在最后一个 `}` 之前停住、也有模型写成散文并
+撞满额度。解析是「逐个对象抢救」，救回几条算几条；一条都救不回来就安静地什么都不写——
+记错比没有更糟。落盘只进 **project 域**（global 会跨项目注入未来所有会话，必须人逐次确认），
+`kind=auto_extract` 留痕，界面回执一行，`/memory forget <id>` 撤销，`/memory capture`
+可以立刻抽一次。同名条目靠 `stable_key` 原地更新，不会攒出近似副本；模型点名要更新的
+条目若是人写的，一律不覆盖。project 写入默认允许并在 UI 留痕；
 global 写入与所有 `memory_forget` 使用逐次 hard confirmation，且 auto/yolo/allow/session
 grant 均不能绕过。global 与当前 repo/cwd project 隔离，
 同一 `stable_key` 原地更新，

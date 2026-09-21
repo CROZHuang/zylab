@@ -15,6 +15,7 @@ from unittest import mock
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from core import store
+from tests.platform_support import requires_symlinks  # noqa: E402
 
 
 def _store_paths(root):
@@ -414,6 +415,7 @@ class SessionStoreTests(unittest.TestCase):
         with self.assertRaises(store.SessionCorruptError):
             store.load_session("corrupt001")
 
+    @requires_symlinks
     def test_symlink_record_is_rejected_without_writing_target(self):
         session_id = "symlink001"
         target = self.root / "outside.json"

@@ -17,6 +17,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from unittest import mock as _mock
 from core import agent as agent_mod
 from core import client, state, store
+from tests.platform_support import requires_symlinks  # noqa: E402
 
 
 def session_rec(session_id="s1", **overrides):
@@ -54,6 +55,7 @@ class StateStoreTests(unittest.TestCase):
                  "legacy_imports": 0, "migration_errors": 0})
         self.assertEqual(stat.S_IMODE(self.db_path.stat().st_mode), 0o600)
 
+    @requires_symlinks
     def test_rejects_symlink_database_without_touching_target(self):
         target = Path(self.tmp.name) / "target.bin"
         target.write_bytes(b"sentinel")

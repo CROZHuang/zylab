@@ -1,0 +1,73 @@
+# zylab 的跨平台门禁。
+#
+# 为什么要有 Windows 这一列：Windows 兼容层是 2026-09 移植进来的，而移植
+# 本身在 Linux 上验不出来 —— 它引进的三个真 bug（graft_worker 当脚本跑时
+# 找不到包、拿不到锁返回 False 而不是抛 BlockingIOError、模块级 import
+# fcntl）全是靠人肉在两个平台各跑一遍才发现的。没有 Windows CI 的话，
+# 下一次合并会再把同样的东西带回来（实测：git 自动合并已经带回来过一次）。
+#
+# 零三方依赖、纯标准库，所以这里没有任何安装步骤 —— 装依赖的那一步不存在，
+# 就不会有「CI 装得上、用户装不上」这类问题。
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    name: ${{ matrix.os }} · py${{ matrix.python }}
+    runs-on: ${{ matrix.os }}
+    # macOS 从未有人实跑过，先作为探路列：红了要看，但不挡 Windows/Linux。
+    continue-on-error: ${{ matrix.os == 'macos-latest' }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - {os: ubuntu-latest, python: "3.10"}     # README 承诺的最低版本
+          - {os: ubuntu-latest, python: "3.13"}
+          - {os: windows-latest, python: "3.10"}
+          - {os: windows-latest, python: "3.13"}
+          - {os: macos-latest, python: "3.13"}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python }}
+
+      # AGENTS.md §3：测试不得写进真实状态目录。CI 上没有"真实用户"，
+      # 但把它钉死能让这条规则在每次跑的时候都被执行一遍，而不只是写在文档里。
+      - name: 把状态目录改道到 runner 的临时盘
+        shell: bash
+        run: echo "ZYLAB_HOME=$RUNNER_TEMP/zylab-home" >> "$GITHUB_ENV"
+
+      - name: 单元测试
+        run: python -m unittest discover -s tests -q
+
+      # CC 交互契约记分板。它会在真 PTY（Windows 上是 ConPTY）里跑，
+      # 所以这一步同时也是 tests/conpty.py 的冒烟。
+      - name: 交互契约记分板
+        run: python scripts/cc_parity.py
+
+      # AGENTS.md §3 的硬断言只有一条：**别写进真实状态目录**。
+      # "改道目录里有东西"只是旁证（哪个用例碰到它是偶然的），所以只打印不判死。
+      - name: 状态目录守卫没被绕过
+        shell: bash
+        run: |
+          if [ -d "$RUNNER_TEMP/zylab-home" ]; then
+            echo "改道生效，落在：$RUNNER_TEMP/zylab-home"
+          else
+            echo "（本轮没有用例碰过改道后的状态目录）"
+          fi
+          for stray in "$HOME/.zylab" "${USERPROFILE:-}/.zylab"; do
+            case "$stray" in /.zylab) continue ;; esac
+            if [ -e "$stray" ]; then
+              echo "测试写进了真实状态目录：$stray"; exit 1
+            fi
+          done

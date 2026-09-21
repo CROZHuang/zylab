@@ -78,12 +78,7 @@ class PathsTests(unittest.TestCase):
         早先这里断言必须含某个具体挂载点，前提是「同事的机器长得一样」。
         那个前提是错的：同一个集群的机器挂载也不同。
         """
-        # 必须同时隔开**两个**来源：环境变量和用户 settings。protected_paths()
-        # 取的是两者的并集，所以只清环境变量的话，在配过受保护路径的机器上
-        # 这条会红、在干净 clone 上会绿 —— 断言一个依机器而变的值，正是这个
-        # 文件反复在防的毛病。把 ZYLAB_HOME 指到空目录，settings 那一半也就没了。
-        with tempfile.TemporaryDirectory() as tmp, \
-                mock.patch.dict(os.environ, {"ZYLAB_HOME": tmp}, clear=False):
+        with mock.patch.dict(os.environ, {}, clear=False):
             os.environ.pop("ZYLAB_PROTECTED_PATHS", None)
             os.environ.pop("ZYLAB_PROTECTED_REMOTES", None)
             self.assertEqual(paths.protected_paths(), [])
@@ -91,8 +86,7 @@ class PathsTests(unittest.TestCase):
             self.assertFalse(paths.is_protected("/anywhere"))
 
     def test_declared_protected_paths_take_effect(self):
-        with tempfile.TemporaryDirectory() as tmp, mock.patch.dict(os.environ, {
-                "ZYLAB_HOME": tmp,          # 隔开用户 settings 那一半来源
+        with mock.patch.dict(os.environ, {
                 "ZYLAB_PROTECTED_PATHS": os.pathsep.join(
                     ["/data/archive", "/mnt/readonly/"]),
                 "ZYLAB_PROTECTED_REMOTES": "arch:bucket,other:x"}):

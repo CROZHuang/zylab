@@ -18,6 +18,11 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from core import client, model_health, state, store
 
+# ignore_cleanup_errors：Windows 上打开着的文件删不掉（这是平台语义，
+# 不是缺陷）。这些用例把 sqlite 库开在临时目录里、不显式关闭，
+# POSIX 上照样能删，Windows 上会在 tearDown 抛 WinError 32，
+# 把一个通过的断言变成 ERROR。
+
 
 class FakeResponse:
     def __init__(self, lines):
@@ -99,7 +104,7 @@ class RuntimeTraceTests(unittest.TestCase):
     def setUp(self):
         self.transport_policy = client.configure_transport_policy(
             allow_insecure_http=True)
-        self.tmp = tempfile.TemporaryDirectory()
+        self.tmp = tempfile.TemporaryDirectory(ignore_cleanup_errors=True)
         self.db_path = Path(self.tmp.name) / "state.sqlite3"
         self.route = client.GatewayRoute(
             "test", "http://example.invalid/v1", ("TEST_KEY",))
@@ -465,7 +470,7 @@ class HealthAndQueryTests(unittest.TestCase):
     def setUp(self):
         self.transport_policy = client.configure_transport_policy(
             allow_insecure_http=True)
-        self.tmp = tempfile.TemporaryDirectory()
+        self.tmp = tempfile.TemporaryDirectory(ignore_cleanup_errors=True)
         self.db_path = Path(self.tmp.name) / "state.sqlite3"
         self.metrics = state.MetricsFacade(self.db_path)
 
@@ -911,7 +916,7 @@ class StoreFacadeTests(unittest.TestCase):
         store.reset_metrics_configuration()
 
     def test_metrics_is_always_on_and_separate_from_shadow_migration_target(self):
-        with tempfile.TemporaryDirectory() as tmp, \
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as tmp, \
              mock.patch.object(store, "HOME", Path(tmp)):
             store.reset_shadow_configuration()
             store.reset_metrics_configuration()
@@ -949,7 +954,7 @@ class StoreFacadeTests(unittest.TestCase):
                     db.get_model_health("g", "m")["success_count"], 2)
 
     def test_legacy_tool_artifact_lookup_is_read_only_and_session_scoped(self):
-        with tempfile.TemporaryDirectory() as tmp, \
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as tmp, \
              mock.patch.object(store, "HOME", Path(tmp)):
             store.reset_metrics_configuration()
             metrics = store.metrics_facade()

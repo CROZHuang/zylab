@@ -248,7 +248,10 @@ def _boot_id():
 
 
 def _proc_start(pid):
-    """Linux process start ticks; distinguishes a reused pid in this boot."""
+    """Process start token; distinguishes a reused pid in this boot."""
+    if wincompat.IS_WINDOWS:
+        # Windows 没有 /proc；等价物是 GetProcessTimes 的创建时间。
+        return wincompat.proc_start(pid)
     try:
         raw = Path(f"/proc/{int(pid)}/stat").read_text(encoding="ascii")
         tail = raw[raw.rfind(")") + 2:].split()
@@ -331,11 +334,10 @@ def _lease_is_live(record, *, stale_after=SESSION_LEASE_STALE_SECONDS):
         current_start = _proc_start(pid)
         if saved_start:
             return bool(current_start and current_start == saved_start)
-        try:
-            os.kill(int(pid), 0)
-            return True
-        except (OSError, TypeError, ValueError):
-            return False
+        # 老 lease 没记 proc_start（或平台拿不到）：退回纯存活探测。
+        # 这里**不能**用 os.kill(pid, 0)——Windows 上那是 CTRL_C_EVENT，
+        # 既误判存活又会向进程组发 Ctrl+C（见 wincompat.pid_alive）。
+        return wincompat.pid_alive(pid)
     return _timestamp_age(record.get("heartbeat_at")) <= float(stale_after)
 
 
@@ -843,7 +845,16 @@ def backup_file(path, *, content=None):
         _private(BACKUPS, 0o700)
         # 时间戳必须带亚秒：同一秒内连改两次会互相覆盖，中间那版就没了。
         stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S_%f")
-        flat = str(src).lstrip("/").replace("/", "%")[-120:]
+        if wincompat.IS_WINDOWS:
+            # Windows 的路径里有反斜杠和盘符冒号，两者都不能出现在文件名里。
+            # 原来只 replace("/", "%")，对它们全无作用：拼出来的 dst 成了一个
+            # 带目录、且含非法字符 `:` 的路径，write_bytes 抛 OSError，被下面的
+            # except 吞掉 —— 于是「改文件前存一份原文」这道网在 Windows 上
+            # **静默失效**（2026-09-17 实测：两次修改留下 0 份备份）。
+            flat = str(src).replace("\\", "/").replace(":", "%")
+            flat = flat.lstrip("/").replace("/", "%")[-120:]
+        else:
+            flat = str(src).lstrip("/").replace("/", "%")[-120:]
         dst = BACKUPS / f"{stamp}__{flat}"
         dst.write_bytes(data)
         _private(dst)
@@ -888,17 +899,23 @@ def _jsonable(obj):
     raise TypeError(f"Object of type {type(obj).__name__} is not JSON serializable")
 
 
-def append_history(line, cwd=None):
-    """追加一条输入历史到 history.jsonl（带 cwd 和时间戳）。
+def append_history(line, cwd=None, session_id=None):
+    """追加一条输入历史到 history.jsonl（带 cwd、时间戳和所属 chat）。
 
     readline 的 ~/.zylab/history 只在进程正常退出时由 atexit 落盘，
     进程被 kill 就丢整段会话的输入。这里每条输入立即 append，
     崩溃也最多丢当前这一行。写历史不该弄崩会话，异常一律吞掉。
+
+    `session` 键是 09-20 加的：此前条目只有 {ts, cwd, input}，于是 ↑ 翻到的
+    是**整个 zylab** 的输入而不是当前 chat 的——不是读取端的 bug，是数据里
+    压根没记「这条属于谁」。
     """
     try:
         HOME.mkdir(parents=True, exist_ok=True, mode=0o700)
         _private(HOME, 0o700)
         rec = {"ts": _now(), "cwd": cwd or os.getcwd(), "input": line}
+        if session_id:
+            rec["session"] = str(session_id)
         with _exclusive_file_lock(HISTORY):
             with open(HISTORY, "a", encoding="utf-8") as f:
                 f.write(json.dumps(rec, ensure_ascii=False) + "\n")
@@ -908,21 +925,31 @@ def append_history(line, cwd=None):
         pass
 
 
-def read_history(limit=200):
-    """读取最近的 canonical 输入历史；损坏半行不影响其他记录。"""
+def read_history(limit=200, session_id=None):
+    """读取最近的 canonical 输入历史；损坏半行不影响其他记录。
+
+    给了 `session_id` 就只返回那个 chat 的条目。按会话过滤时必须**先扫全文件
+    再取末尾 limit 条**：只看最后 limit 行的话，一个安静了很久的 chat 会因为
+    别的 chat 刷过了窗口而读成空。
+    """
     if not HISTORY.is_file():
         return []
     with _exclusive_file_lock(HISTORY):
         lines = HISTORY.read_text(encoding="utf-8").splitlines()
+    limit = max(0, int(limit))
+    wanted = str(session_id) if session_id else None
     out = []
-    for line in lines[-max(0, int(limit)):]:
+    for line in (lines if wanted else lines[-limit:]):
         try:
             record = json.loads(line)
         except json.JSONDecodeError:
             continue
-        if isinstance(record, dict) and isinstance(record.get("input"), str):
-            out.append(record)
-    return out
+        if not (isinstance(record, dict) and isinstance(record.get("input"), str)):
+            continue
+        if wanted and str(record.get("session") or "") != wanted:
+            continue
+        out.append(record)
+    return out[-limit:] if limit else []
 
 
 def new_id():

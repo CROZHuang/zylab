@@ -10,10 +10,10 @@ and external processes remain outside checkpoint coverage.
 
 from __future__ import annotations
 from . import paths
+from . import wincompat
 
 import difflib
 import errno
-from . import wincompat
 import hashlib
 import json
 import os
@@ -190,7 +190,7 @@ class _Snapshot:
 
 
 def _read_regular_once(path: str, first_lstat: os.stat_result) -> tuple[bytes, os.stat_result]:
-    flags = os.O_RDONLY
+    flags = os.O_RDONLY | getattr(os, "O_BINARY", 0)
     if hasattr(os, "O_CLOEXEC"):
         flags |= os.O_CLOEXEC
     if hasattr(os, "O_NOFOLLOW"):
@@ -215,7 +215,7 @@ def _read_regular_once(path: str, first_lstat: os.stat_result) -> tuple[bytes, o
             raise ExternalChangeError(f"读取期间目标文件发生变化: {path}")
         return b"".join(chunks), after
     finally:
-        os.close(fd)
+        wincompat.close(fd)
 
 
 def _snapshot(path: str, workspace: Workspace,
@@ -384,6 +384,17 @@ def prepare_write(tool_name: str, arguments: Mapping[str, Any], *,
             raise PreparationError(
                 f"{tool_name} P0 只支持 UTF-8 文本: {path}") from exc
 
+    # 换行风格是文件的属性，不是平台的属性。模型写的 old/new 一律用 `\n`，
+    # 所以匹配前把 CRLF 归一化；写回时再按原样式还原，字节级保持不变。
+    # 不归一化的话，CRLF 文件上的 edit_file 永远「匹配 0 处」——
+    # Windows 上新建的文件基本都是 CRLF，等于 edit 工具直接不可用。
+    newline = "\n"
+    if before_text is not None and "\r\n" in before_text:
+        crlf = before_text.count("\r\n")
+        if crlf > before_text.count("\n") - crlf:
+            newline = "\r\n"
+        before_text = before_text.replace("\r\n", "\n")
+
     match_count: Optional[int] = None
     locations: tuple[MatchLocation, ...] = ()
     replace_all = False
@@ -420,7 +431,11 @@ def prepare_write(tool_name: str, arguments: Mapping[str, Any], *,
                 old, new, -1 if replace_all else 1)
 
     try:
-        after_bytes = after_text.encode("utf-8", errors="strict")
+        # 还原成文件本来的换行风格再落字节：编辑一个词不该把整份文件的
+        # 换行改掉（git 里是全文件 diff，CRLF 的 `#!/bin/sh` 还会跑不起来）。
+        after_bytes = (
+            after_text if newline == "\n" else after_text.replace("\n", newline)
+        ).encode("utf-8", errors="strict")
     except UnicodeEncodeError as exc:
         raise PreparationError(f"输出不能编码为 UTF-8: {path}") from exc
     draft = PreparedWrite(
@@ -587,7 +602,7 @@ def _open_stable_parent(identity: PathIdentity) -> int:
             raise ExternalChangeError(f"目标父目录身份已变化: {parent}")
         return fd
     except BaseException:
-        os.close(fd)
+        wincompat.close(fd)
         raise
 
 
@@ -620,7 +635,7 @@ def _read_regular_once_at(parent_fd: int, name: str,
             raise ExternalChangeError(f"读取期间目标文件发生变化: {name}")
         return b"".join(chunks), after
     finally:
-        os.close(fd)
+        wincompat.close(fd)
 
 
 def _assert_entry_at(parent_fd: int, identity: PathIdentity, *,
@@ -785,7 +800,7 @@ def _fsync_dir(path: os.PathLike[str] | str) -> None:
     try:
         os.fsync(fd)
     finally:
-        os.close(fd)
+        wincompat.close(fd)
 
 
 def _open_verified_directory(path: Path) -> int:
@@ -813,7 +828,7 @@ def _open_verified_directory(path: Path) -> int:
             raise CheckpointError(f"目录身份已变化: {path}")
         return fd
     except BaseException:
-        os.close(fd)
+        wincompat.close(fd)
         raise
 
 
@@ -839,7 +854,7 @@ def _capture_directory_anchor(path: Path,
             inode=info.st_ino,
         )
     finally:
-        os.close(fd)
+        wincompat.close(fd)
 
 
 def _open_directory_anchor(anchor: _DirectoryAnchor,
@@ -871,7 +886,7 @@ def _open_directory_anchor(anchor: _DirectoryAnchor,
             raise ManifestError(f"目录身份已被替换: {anchor.path}")
         return fd
     except BaseException:
-        os.close(fd)
+        wincompat.close(fd)
         raise
 
 
@@ -896,7 +911,7 @@ def _read_private_at(directory_fd: int, name: str) -> bytes:
             chunks.append(chunk)
         return b"".join(chunks)
     finally:
-        os.close(fd)
+        wincompat.close(fd)
 
 
 def _atomic_private_at(directory_fd: int, name: str, data: bytes) -> None:
@@ -925,7 +940,6 @@ def _atomic_private_at(directory_fd: int, name: str, data: bytes) -> None:
             fd = -1
             handle.write(data)
             handle.flush()
-            handle.flush()
             wincompat.fsync(handle.fileno())
         wincompat.fd_replace(directory_fd, temp_name, directory_fd, name)
         created = False
@@ -934,7 +948,7 @@ def _atomic_private_at(directory_fd: int, name: str, data: bytes) -> None:
         raise ManifestError(f"无法持久化私有文件 {name}: {exc}") from exc
     finally:
         if fd >= 0:
-            os.close(fd)
+            wincompat.close(fd)
         if created:
             try:
                 wincompat.fd_unlink(directory_fd, temp_name)
@@ -994,7 +1008,8 @@ def _read_private(path: Path) -> bytes:
         raise ManifestError(f"无法读取 checkpoint 文件 {path}: {exc}") from exc
     if stat.S_ISLNK(lst.st_mode) or not stat.S_ISREG(lst.st_mode):
         raise ManifestError(f"checkpoint 文件类型不安全: {path}")
-    flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
+    flags = (os.O_RDONLY | getattr(os, "O_CLOEXEC", 0)
+             | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_BINARY", 0))
     try:
         fd = os.open(path, flags)
         with os.fdopen(fd, "rb", closefd=True) as handle:
@@ -1107,7 +1122,7 @@ def _atomic_private(path: Path, data: bytes) -> None:
         raise ManifestError(f"无法持久化 checkpoint 文件 {path}: {exc}") from exc
     finally:
         if fd >= 0:
-            os.close(fd)
+            wincompat.close(fd)
         if temp_name is not None:
             try:
                 os.unlink(temp_name)
@@ -1310,7 +1325,7 @@ class CheckpointStore:
                 try:
                     wincompat.flock(fd, wincompat.LOCK_UN)
                 finally:
-                    os.close(fd)
+                    wincompat.close(fd)
 
     @contextmanager
     def _path_locks(self, paths: Iterable[str]):
@@ -1340,7 +1355,7 @@ class CheckpointStore:
                     wincompat.fchmod(fd, 0o600)
                     wincompat.flock(fd, wincompat.LOCK_EX)
                 except BaseException:
-                    os.close(fd)
+                    wincompat.close(fd)
                     raise
                 descriptors.append(fd)
             yield
@@ -1349,7 +1364,7 @@ class CheckpointStore:
                 try:
                     wincompat.flock(fd, wincompat.LOCK_UN)
                 finally:
-                    os.close(fd)
+                    wincompat.close(fd)
             wincompat.close(directory_fd)
 
     def _blob_path(self, digest: str) -> Path:
@@ -1785,7 +1800,7 @@ class CheckpointStore:
             self._restore_transactions_anchor, self.protected_paths)
         try:
             names = sorted(
-                name for name in os.listdir(directory_fd)
+                name for name in wincompat.listdir(directory_fd)
                 if name.endswith(".json") and not name.startswith("."))
         finally:
             wincompat.close(directory_fd)
@@ -2384,7 +2399,7 @@ class CheckpointStore:
                         f"无法安全打开 trash 目录 {component}: {exc}") from exc
                 info = wincompat.fstat(next_fd)
                 if not stat.S_ISDIR(info.st_mode):
-                    os.close(next_fd)
+                    wincompat.close(next_fd)
                     raise ManifestError(
                         f"trash 路径组件不是目录: {component}")
                 wincompat.fchmod(next_fd, 0o700)

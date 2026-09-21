@@ -9,6 +9,11 @@ from pathlib import Path
 from unittest import mock as _mock
 from core import agents, workflows
 
+# ignore_cleanup_errors：Windows 上打开着的文件删不掉（这是平台语义，
+# 不是缺陷）。这些用例把 sqlite 库开在临时目录里、不显式关闭，
+# POSIX 上照样能删，Windows 上会在 tearDown 抛 WinError 32，
+# 把一个通过的断言变成 ERROR。
+
 
 def lineup():
     return [
@@ -222,7 +227,7 @@ class WorkflowManagerTests(unittest.TestCase):
     def test_node_transitions_emit_workflow_node_events_with_timestamps(self):
         # J7：节点 running/completed 各发一个 workflow_node 事件，带 started_at/ended_at，
         # TUI 据此打完成行、刷名册，不重读文件
-        with tempfile.TemporaryDirectory() as tmp:
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as tmp:
             root = Path(tmp)
             manager, workspace = self.make_manager(root)
             started = manager.start_plan(
@@ -245,7 +250,7 @@ class WorkflowManagerTests(unittest.TestCase):
             workspace.close()
 
     def test_review_and_synthesis_become_dag_nodes_and_synthesis_is_the_result(self):
-        with tempfile.TemporaryDirectory() as tmp:
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as tmp:
             root = Path(tmp)
             manager, workspace = self.make_manager(root)
             started = manager.start_plan(
@@ -299,7 +304,7 @@ class WorkflowManagerTests(unittest.TestCase):
             for instance in WorkflowAgent.instances))
 
     def test_start_plan_defaults_and_empty_modes_fail_closed_to_review(self):
-        with tempfile.TemporaryDirectory() as tmp:
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as tmp:
             root = Path(tmp)
             manager, workspace = self.make_manager(root)
             observed = []
@@ -344,7 +349,7 @@ class WorkflowManagerTests(unittest.TestCase):
         self.assertIn("VISIBLE_LEGACY_REPORT", combined)
 
     def test_cancel_stops_active_workflow_and_owned_agents(self):
-        with tempfile.TemporaryDirectory() as tmp:
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as tmp:
             root = Path(tmp)
             manager, workspace = self.make_manager(
                 root, BlockingWorkflowAgent)
@@ -363,7 +368,7 @@ class WorkflowManagerTests(unittest.TestCase):
         self.assertEqual(final["error"], "用户取消")
 
     def test_spawn_failure_cancels_already_started_agents(self):
-        with tempfile.TemporaryDirectory() as tmp:
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as tmp:
             root = Path(tmp)
             manager, workspace = self.make_manager(
                 root, BlockingWorkflowAgent)
@@ -397,7 +402,7 @@ class WorkflowManagerTests(unittest.TestCase):
         self.assertEqual(active_total, 0)
 
     def test_post_spawn_state_failure_cancels_child_and_releases_slot(self):
-        with tempfile.TemporaryDirectory() as tmp:
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as tmp:
             root = Path(tmp)
             manager, workspace = self.make_manager(
                 root, BlockingWorkflowAgent)
@@ -427,7 +432,7 @@ class WorkflowManagerTests(unittest.TestCase):
         self.assertEqual(active_total, 0)
 
     def test_foreign_live_owner_cannot_be_marked_cancelled(self):
-        with tempfile.TemporaryDirectory() as tmp:
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as tmp:
             root = Path(tmp)
             manager, workspace = self.make_manager(
                 root, BlockingWorkflowAgent)
@@ -464,7 +469,7 @@ class WorkflowManagerTests(unittest.TestCase):
         self.assertTrue(workflows._owner_alive(record))
 
     def test_scheduler_shares_gateway_limits_across_workflows(self):
-        with tempfile.TemporaryDirectory() as tmp:
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as tmp:
             root = Path(tmp)
             manager, workspace = self.make_manager(
                 root, ConcurrencyWorkflowAgent)
@@ -499,7 +504,7 @@ class WorkflowManagerTests(unittest.TestCase):
             for value in max_by_gateway.values()))
 
     def test_requires_two_qualified_flagship_seats(self):
-        with tempfile.TemporaryDirectory() as tmp:
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as tmp:
             root = Path(tmp)
             workspace = agents.AgentWorkspace(
                 root=root / "agents", agent_factory=WorkflowAgent)
@@ -519,7 +524,7 @@ class WorkflowManagerTests(unittest.TestCase):
             workspace.close()
 
     def test_free_dag_passes_completed_dependency_report_downstream(self):
-        with tempfile.TemporaryDirectory() as tmp:
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as tmp:
             root = Path(tmp)
             manager, workspace = self.make_manager(root)
 
@@ -561,7 +566,7 @@ class WorkflowManagerTests(unittest.TestCase):
         self.assertIn("evidence from qwen-max@boyue", durable_child["context"])
 
     def test_request_budget_counts_each_child_provider_attempt(self):
-        with tempfile.TemporaryDirectory() as tmp:
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as tmp:
             root = Path(tmp)
             manager, workspace = self.make_manager(
                 root, MultiAttemptWorkflowAgent)
@@ -591,7 +596,7 @@ class WorkflowManagerTests(unittest.TestCase):
         self.assertIn("provider-attempt budget exhausted", nodes[1]["error"])
 
     def test_per_agent_budget_prevents_early_nodes_from_starving_peers(self):
-        with tempfile.TemporaryDirectory() as tmp:
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as tmp:
             root = Path(tmp)
             manager, workspace = self.make_manager(
                 root, GreedyWorkflowAgent)
@@ -627,7 +632,7 @@ class WorkflowManagerTests(unittest.TestCase):
             for node in final["plan"]["agents"]))
 
     def test_dynamic_nodes_append_while_running_and_obey_dependencies(self):
-        with tempfile.TemporaryDirectory() as tmp:
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as tmp:
             root = Path(tmp)
             manager, workspace = self.make_manager(
                 root, ConcurrencyWorkflowAgent)
@@ -665,7 +670,7 @@ class WorkflowManagerTests(unittest.TestCase):
             event["kind"] == "nodes_added" for event in final["events"]))
 
     def test_dynamic_nodes_fail_closed_on_request_budget_and_cycle(self):
-        with tempfile.TemporaryDirectory() as tmp:
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as tmp:
             root = Path(tmp)
             manager, workspace = self.make_manager(
                 root, BlockingWorkflowAgent)
@@ -706,7 +711,7 @@ class WorkflowManagerTests(unittest.TestCase):
             workspace.close()
 
     def test_dynamic_nodes_reject_exhausted_runtime_budget_before_mutation(self):
-        with tempfile.TemporaryDirectory() as tmp:
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as tmp:
             root = Path(tmp)
             manager, workspace = self.make_manager(
                 root, BlockingWorkflowAgent)
@@ -759,7 +764,7 @@ class WorkflowManagerTests(unittest.TestCase):
         self.assertEqual(after["expected_agents"], before["expected_agents"])
 
     def test_pause_resume_requeues_interrupted_nodes_without_losing_state(self):
-        with tempfile.TemporaryDirectory() as tmp:
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as tmp:
             root = Path(tmp)
             manager, workspace = self.make_manager(
                 root, BlockingWorkflowAgent)
@@ -795,7 +800,7 @@ class WorkflowManagerTests(unittest.TestCase):
             for node in final["plan"]["agents"]))
 
     def test_completed_node_restart_requires_and_cascades_downstream(self):
-        with tempfile.TemporaryDirectory() as tmp:
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as tmp:
             root = Path(tmp)
             manager, workspace = self.make_manager(root)
             started = manager.start_plan(
@@ -827,7 +832,7 @@ class WorkflowManagerTests(unittest.TestCase):
             for node in final["plan"]["agents"]))
 
     def test_free_plan_rejects_cycles_and_under_budgeted_review(self):
-        with tempfile.TemporaryDirectory() as tmp:
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as tmp:
             root = Path(tmp)
             manager, workspace = self.make_manager(root)
             cyclic = [
@@ -871,7 +876,7 @@ class WorkflowManagerTests(unittest.TestCase):
             workspace.close()
 
     def test_paused_dag_recovers_only_interrupted_nodes_within_budget(self):
-        with tempfile.TemporaryDirectory() as tmp:
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as tmp:
             root = Path(tmp)
             manager, workspace = self.make_manager(
                 root, BlockingWorkflowAgent)

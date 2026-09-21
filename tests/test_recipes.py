@@ -7,6 +7,7 @@ from unittest import mock
 
 from unittest import mock as _mock
 from core import agents, recipes, workflows
+from tests.platform_support import requires_symlinks  # noqa: E402
 
 
 def lineup():
@@ -126,6 +127,7 @@ class RecipeTests(unittest.TestCase):
 
             self.assertEqual(selected["scope"], "user")
 
+    @requires_symlinks
     def test_project_parent_symlink_escape_is_rejected_before_write(self):
         with tempfile.TemporaryDirectory() as tmp, tempfile.TemporaryDirectory() as out:
             cwd = Path(tmp)

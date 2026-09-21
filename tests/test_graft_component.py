@@ -9,6 +9,7 @@ import unittest
 from pathlib import Path
 
 from core import graft_component
+from tests.platform_support import requires_symlinks  # noqa: E402
 
 
 def _sha256(path):
@@ -144,6 +145,7 @@ class ManagedGraftComponentTests(unittest.TestCase):
         with self.assertRaisesRegex(graft_component.ComponentError, "无法读取"):
             graft_component.inspect(self.app / "missing.lock.json")
 
+    @requires_symlinks
     def test_launcher_symlink_is_never_followed_during_repair(self):
         target = self.persistent / "other-launcher"
         target.write_text("do-not-overwrite\n", encoding="utf-8")

@@ -8,6 +8,7 @@ TaskManager 只负责阻塞工具的运行生命周期，不碰 transcript、Con
 background 只改变 UI/事件所有权，不改变 worker、artifact 或取消语义。
 """
 from __future__ import annotations
+import selectors
 from . import paths
 from . import wincompat
 
@@ -268,7 +269,7 @@ class _Artifact:
             os.chmod(self.path.parent, 0o700)
         except OSError:
             pass
-        flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
+        flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_BINARY", 0)
         if hasattr(os, "O_CLOEXEC"):
             flags |= os.O_CLOEXEC
         if hasattr(os, "O_NOFOLLOW"):
@@ -754,7 +755,7 @@ class TaskHandle:
             time.sleep(min(0.01, self.manager.poll_interval))
         if self._group_exists():
             self._send_group(
-                signal.SIGKILL, allow_exited_leader=True)
+                wincompat.SIGKILL, allow_exited_leader=True)
             deadline = time.monotonic() + 1.0
             while self._group_exists() and time.monotonic() < deadline:
                 with self._lock:
@@ -798,9 +799,9 @@ class TaskHandle:
             with self._lock:
                 if self._stop_stage != signal.SIGTERM:
                     return
-                self._stop_stage = signal.SIGKILL
+                self._stop_stage = wincompat.SIGKILL
                 self._signal_at = now
-            self._send_group(signal.SIGKILL)
+            self._send_group(wincompat.SIGKILL)
 
     def cancel(self):
         with self._lock:
@@ -851,6 +852,12 @@ class TaskHandle:
         with self._lock:
             self.returncode = int(returncode)
             self.signal = -self.returncode if self.returncode < 0 else None
+            if (self.signal is None and wincompat.IS_WINDOWS
+                    and self._stop_stage is not None):
+                # Windows 不用负退出码编码「被信号杀死」：终止走 Job Object /
+                # taskkill，退出码是 1。但界面和事件里要说清楚**是被我们停掉的**、
+                # 停到了哪一级，否则「已取消」看起来像进程自己正常退出。
+                self.signal = self._stop_stage
 
     def record_error(self, error):
         value = self.redact_result(
@@ -867,7 +874,7 @@ class TaskHandle:
             self._advance_stop()
             time.sleep(min(0.01, self.manager.poll_interval))
         if proc.poll() is None:
-            self._send_group(signal.SIGKILL)
+            self._send_group(wincompat.SIGKILL)
             try:
                 proc.wait(timeout=1.0)
             except subprocess.TimeoutExpired:
@@ -891,6 +898,7 @@ class TaskHandle:
             list(argv), cwd=cwd, env=env,
             stdout=subprocess.PIPE, stderr=subprocess.PIPE,
             **wincompat.popen_group_kwargs(), bufsize=0)
+        wincompat.attach_to_job(proc)   # Windows：整棵树一次收（见 wincompat）
         try:
             # Popen 之后的 bind、selector 构造和每一次 register 必须都在
             # 同一个 cleanup boundary 内；任何 setup 错误都不能泄漏 PGID。
@@ -997,7 +1005,10 @@ class TaskHandle:
                 try:
                     label = signal.Signals(self.signal).name
                 except ValueError:
-                    label = str(self.signal)
+                    # Windows 没有 SIGKILL 这个枚举成员，但我们用它当终止阶段
+                    # 标记；直接显示数字会让人以为是退出码。
+                    label = ("SIGKILL" if self.signal == wincompat.SIGKILL
+                             else str(self.signal))
                 pieces.append(f"[signal {label}]")
             else:
                 pieces.append(f"[exit {self.returncode}]")
@@ -1213,7 +1224,7 @@ class TaskManager:
             separators=(",", ":")).encode("utf-8")
         temporary = directory / (
             f".{ARTIFACT_INDEX_NAME}.{uuid.uuid4().hex}.tmp")
-        flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
+        flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_BINARY", 0)
         if hasattr(os, "O_CLOEXEC"):
             flags |= os.O_CLOEXEC
         if hasattr(os, "O_NOFOLLOW"):
@@ -1906,7 +1917,7 @@ class TaskManager:
             worker.join(timeout=(
                 self.interrupt_grace + self.terminate_grace + 1.5))
             if worker.is_alive():
-                task._send_group(signal.SIGKILL)
+                task._send_group(wincompat.SIGKILL)
                 worker.join(timeout=1.0)
             self._finish_task(task)
         return [task.snapshot() for task in managed]

@@ -13,6 +13,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 import zylab as CLI
 from core import controller, tasks
 from tests.pty_harness import PTYSend, run_pty_child
+from tests.terminal_screen import parse_final_screen
 
 
 class MainAgent:
@@ -339,6 +340,28 @@ class TaskCommandTests(unittest.TestCase):
 
 
 class TaskPTYTests(unittest.TestCase):
+    def assertRowOrder(self, output, upto, above, below):
+        """在**算出来的屏幕**上，`below` 必须自成一行，落在 `above` 下面。
+
+        以前这里断的是「这段字节里出现过 \\r\\n」。那是**整帧重画**的副产品，
+        不是契约：增量重绘只重写变化的行，行间靠 `CSI nB` / `CSI nA` 走位，
+        一个 \\r\\n 都不发，而屏幕逐格相同（2026-09-21 用 terminal_screen
+        逐行比过主线与移植后的两份输出，除工作目录那行的路径外完全一致）。
+        旧写法量的是重绘策略，不是用户看到的东西。
+        tests/terminal_screen.py 开篇就写着：原始字节流里混着已被覆盖的旧帧，
+        不是可靠的断言对象。
+        """
+        head = output[:upto + len(below)]
+        rows = parse_final_screen(head, 80, 24)["primary"].text_rows(trim=True)
+        above_rows = [i for i, line in enumerate(rows) if above in line]
+        below_rows = [i for i, line in enumerate(rows) if below in line]
+        screen = "\n".join(f"{i:>3}| {line}" for i, line in enumerate(rows) if line)
+        self.assertTrue(above_rows, f"屏幕上找不到 {above!r}：\n{screen}")
+        self.assertTrue(below_rows, f"屏幕上找不到 {below!r}：\n{screen}")
+        self.assertGreater(
+            min(below_rows), min(above_rows),
+            f"{below!r} 没有画在 {above!r} 下面：\n{screen}")
+
     def run_child(self, body, sends, timeout=9.0):
         return run_pty_child(
             body, sends,
@@ -487,12 +510,16 @@ print("RESULT:" + json.dumps(result, ensure_ascii=False))
         self.assertGreaterEqual(raw_index, 0, output)
         self.assertGreater(background_index, raw_index, output)
         self.assertIn("/task bg000001 attach", output)
-        self.assertIn("\r\n", output[raw_index:background_index])
+        self.assertRowOrder(output, background_index,
+                            "⏺ Bash(", "· background ·")
         self.assertIn("RAW_DONE", output)
         done_index = output.rfind("RAW_DONE")
         completed_index = output.find("· completed ·", done_index)
         self.assertGreater(completed_index, done_index, output)
-        self.assertIn("\r\n", output[done_index:completed_index])
+        # 原始输出的最后一行（RAW_DONE）与"已完成"提示必须各占一行——
+        # 这正是旧的 \r\n 断言想说的事。
+        self.assertRowOrder(output, completed_index,
+                            "RAW_DONE", "· completed ·")
         self.assertIn("AFTER_BACKGROUND", output)
         self.assertIn("AFTER_FOREGROUND", output)
         foreground_index = output.find("FOREGROUND_RAW")

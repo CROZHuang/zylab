@@ -14,6 +14,7 @@ could simply remount a protected bind read-write again.
 
 from __future__ import annotations
 from . import paths
+from . import wincompat
 
 import enum
 import os
@@ -423,6 +424,25 @@ class UnshareSandboxAdapter:
         if self._capabilities is not None and not refresh:
             return self._capabilities
         probed_at = float(self._clock())
+        if wincompat.IS_WINDOWS:
+            # 这个适配器建立在 Linux 用户命名空间 + 私有 bind mount 之上，
+            # Windows 上没有对应物。早退并说清楚：否则这里报的是
+            # 「缺少可执行文件：unshare, setpriv」，读起来像「装上就好了」，
+            # 而实际上装不了。UNSANDBOXED 的逐次确认仍是唯一的出路。
+            self._capabilities = SandboxCapabilities(
+                adapter=self.name,
+                available=False,
+                executable=self.unshare_executable,
+                setpriv_executable=self.setpriv_executable,
+                protected_paths_read_only=False,
+                command_execution=False,
+                network_isolation=False,
+                probed_at=probed_at,
+                reason=("Windows 没有 Linux 命名空间沙箱（unshare + 私有 bind "
+                        "mount）；Bash 只能走 UNSANDBOXED 逐次确认，"
+                        "受保护路径的词法硬守卫仍然生效"),
+            )
+            return self._capabilities
         missing = self._missing_runtime()
         if missing:
             self._capabilities = SandboxCapabilities(

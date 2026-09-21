@@ -139,7 +139,13 @@ class ProbeFreshnessTests(unittest.TestCase):
 
 
 class CircuitPolicyTests(unittest.TestCase):
-    def test_third_transient_failure_opens_for_ten_minutes(self):
+    def test_circuit_opens_short_then_backs_off_exponentially(self):
+        """到阈值先开一个**短**窗口，其后每多一次连续失败翻倍。
+
+        09-20 实测：唯一计入熔断的 transient_http 按定义会自愈——那次 503 抖动
+        过后网关 2 分钟就恢复了，而固定 600s 会对一条已经健康的路由继续封锁
+        8 分钟。短窗口起步让瞬时抖动迅速放行；真正持续坏掉的路由才被逐步拉长。
+        """
         record = None
         for at in (100, 101):
             record = health.record_request_outcome(
@@ -151,16 +157,39 @@ class CircuitPolicyTests(unittest.TestCase):
             error_kind="network", retryable=True, now=102)
 
         self.assertEqual(record["consecutive_failures"], 3)
+        # 第一次开窗 = base（30s），不是上限。
         self.assertEqual(
-            health.parse_utc(record["circuit_open_until"]), 702)
+            health.parse_utc(record["circuit_open_until"]), 132)
         before = health.route_decision(
-            record, explicit=False, now=701.999999)
+            record, explicit=False, now=131.999999)
         boundary = health.route_decision(
-            record, explicit=False, now=702)
+            record, explicit=False, now=132)
         self.assertFalse(before.allowed)
         self.assertTrue(before.circuit_open)
         self.assertTrue(boundary.allowed)
         self.assertFalse(boundary.circuit_open)
+
+        # 第 4 次连续失败：窗口翻倍到 60s（103 + 60 = 163）。
+        record = health.record_request_outcome(
+            record, health.REQUEST_FAILURE,
+            error_kind="network", retryable=True, now=103)
+        self.assertEqual(record["consecutive_failures"], 4)
+        self.assertEqual(
+            health.parse_utc(record["circuit_open_until"]), 163)
+
+    def test_backoff_caps_at_max_and_never_shortens_an_open_window(self):
+        policy = health.ModelHealthPolicy(
+            circuit_failure_threshold=1,
+            circuit_open_ttl=10, circuit_open_max_ttl=25)
+        record, seen = None, []
+        for at in (0, 1, 2, 3):
+            record = health.record_request_outcome(
+                record, health.REQUEST_FAILURE,
+                error_kind="transient_http", retryable=True,
+                policy=policy, now=at)
+            seen.append(health.parse_utc(record["circuit_open_until"]) - at)
+        # 10 → 20 → 封顶 25 → 25
+        self.assertEqual(seen, [10, 20, 25, 25])
 
     def test_explicit_route_bypasses_with_warning(self):
         record = {

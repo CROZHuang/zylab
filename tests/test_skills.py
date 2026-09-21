@@ -8,6 +8,7 @@ from unittest import mock
 
 import zylab as CLI
 from core import agent, context, skills, tools
+from tests.platform_support import requires_symlinks  # noqa: E402
 
 
 def write_skill(root, name, description, body="REFERENCE BODY", extra=""):
@@ -193,6 +194,7 @@ class SkillPromptTests(unittest.TestCase):
 
 
 class SkillReadBoundaryTests(unittest.TestCase):
+    @requires_symlinks
     def test_all_three_skill_roots_are_readable_but_credentials_stay_denied(self):
         with tempfile.TemporaryDirectory() as d:
             root = Path(d)

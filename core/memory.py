@@ -31,8 +31,19 @@ SCOPES = {GLOBAL, PROJECT}
 MAX_ENTRY_CHARS = 12_000
 MAX_TITLE_CHARS = 120
 MAX_STABLE_KEY_CHARS = 160
-DEFAULT_INDEX_CHARS = 25_000
-DEFAULT_INDEX_ENTRIES = 24
+# 一条记忆的**类型**。照搬 Claude Code 的四类（user / feedback / project / reference）：
+# 它们的时效与用法不同——user/feedback 是长期行为约束，project 是会过期的项目状态，
+# reference 是外部指针。模型看类型就知道该多信任它。
+TYPES = ("user", "feedback", "project", "reference")
+DEFAULT_TYPE = "project"
+# 索引里每条只出一行「钩子」。2026-09-20 在用户真实的 59 条记忆上实测：按一行钩子做 BM25，
+# top-3 命中 16/18；按正文只有 11/18（长条目把词频稀释了）。而且一行索引每条只要约 68 token，
+# 59 条 ≈ 4,046 token，常驻 system 也付得起；把正文全塞进去则 7 条就吃掉 4,339 token。
+MAX_DESCRIPTION_CHARS = 200
+DEFAULT_INDEX_CHARS = 12_000
+DEFAULT_INDEX_ENTRIES = 60
+# 模型按需取正文时单条的上限（与 Claude Code 的 4,096 B 同口径）。
+RECALL_ENTRY_BYTES = 4_096
 MAX_CAPSULE_CHARS = 32_000
 MAX_CAPSULE_WIRE_CHARS = 100_000
 EMPTY_SHA256 = hashlib.sha256(b"").hexdigest()
@@ -194,6 +205,12 @@ class MemoryStore:
         _private(path)
 
     def list(self, *, scope="all", cwd=None, include_session=True):
+        """include_session=False 用来排掉老的 session_handoff 条目。
+
+        那条确定性 handoff（「最后一句用户话 + 最后一句我的话」）已于 2026-09-21 删除——
+        实测它写出来的是「用户目标：好的」，7 条占掉 system 里 4,339 token。现在由
+        memory_extract 的轮末抽取代替。老会话里落盘的条目还在，所以这个开关留着。
+        """
         scopes = (GLOBAL, PROJECT) if scope == "all" else (scope,)
         rows = []
         for selected in scopes:
@@ -216,9 +233,25 @@ class MemoryStore:
             key=lambda item: str(item.get("updated_at") or ""), reverse=True)
         return explicit + handoffs
 
+    @staticmethod
+    def _hook(description, content):
+        """一行钩子：索引里代表这条记忆的那句话。
+
+        必须带上用户以后会用来找它的词——实测一条英文钩子（"Video generation…"）
+        让中文查询「生成一段视频」完全召不回来。
+        """
+        text = " ".join(redact(str(description or "")).split())
+        if not text:
+            for line in str(content or "").splitlines():
+                line = " ".join(line.split()).lstrip("#-* ").strip()
+                if line:
+                    text = line
+                    break
+        return text[:MAX_DESCRIPTION_CHARS]
+
     def add(self, content, *, title=None, scope=PROJECT, cwd=None,
             source_session=None, evidence=None, kind="explicit",
-            stable_key=None):
+            stable_key=None, entry_type=None, description=None):
         text = redact(str(content or "").strip())
         if not text:
             raise MemoryError("memory 内容不能为空")
@@ -253,11 +286,16 @@ class MemoryStore:
                 match = next((item for item in authority["entries"]
                               if item.get("id") == identifier), None)
             created = match.get("created_at") if match else now
+            selected_type = str(entry_type or "").strip().lower()
+            if selected_type not in TYPES:
+                selected_type = (match or {}).get("type") or DEFAULT_TYPE
             record = {
                 "id": identifier,
                 "kind": str(kind or "explicit"),
+                "type": selected_type,
                 "stable_key": selected_stable_key,
                 "title": selected_title,
+                "description": self._hook(description, text),
                 "content": text,
                 "source_session": source_session or None,
                 "evidence": _copy(evidence or {}),
@@ -300,35 +338,29 @@ class MemoryStore:
 
     def render_index(self, *, cwd=None, max_chars=DEFAULT_INDEX_CHARS,
                      max_entries=DEFAULT_INDEX_ENTRIES):
+        """一条一行的钩子索引：模型据此决定要不要 memory_read 取正文。
+
+        以前这里把**每条的正文**全塞进 system——7 条垃圾 handoff 就占了 4,339 token，
+        而模型连取正文的工具都没有。现在正文按需取（RECALL_ENTRY_BYTES 封顶）。
+        """
         max_chars = max(0, min(100_000, int(max_chars)))
-        max_entries = max(0, min(100, int(max_entries)))
+        max_entries = max(0, min(200, int(max_entries)))
         all_rows = self.list(cwd=cwd)
         rows = all_rows[:max_entries]
         blocks = []
         included = []
         for row in rows:
-            stable_key = (
-                f" · stable_key={row['stable_key']}"
-                if row.get("stable_key") else "")
-            block = (
-                f"## {row['id']} · {row['scope']} · {row.get('title') or '?'}\n"
-                f"source_session={row.get('source_session') or 'explicit'} · "
-                f"updated={row.get('updated_at') or '?'}{stable_key}\n"
-                + str(row.get("content") or "").strip())
-            separator = "\n\n" if blocks else ""
-            used = len(separator.join(blocks))
-            remaining = max_chars - used - len(separator)
-            if len(block) > remaining:
-                marker = "\n…[memory index budget reached]"
-                if remaining >= 240 + len(marker):
-                    block = block[:remaining - len(marker)] + marker
-                else:
-                    break
+            hook = self._hook(row.get("description"), row.get("content"))
+            block = (f"- {row['id']} · {row.get('type') or DEFAULT_TYPE}"
+                     f" · {row['scope']} · {row.get('title') or '?'}"
+                     + (f" — {hook}" if hook else ""))
+            block = " ".join(block.split())
+            separator = "\n" if blocks else ""
+            if len("\n".join(blocks)) + len(separator) + len(block) > max_chars:
+                break                      # 放不下就少列几条，绝不截断成半句
             blocks.append(block)
             included.append(row["id"])
-            if len("\n\n".join(blocks)) >= max_chars:
-                break
-        text = "\n\n".join(blocks)
+        text = "\n".join(blocks)
         if len(text) > max_chars:
             raise MemoryError("memory index 内部预算计算错误")
         return {
@@ -340,56 +372,38 @@ class MemoryStore:
                 text.encode("utf-8", "surrogatepass")).hexdigest(),
         }
 
-    def capture_session(self, agent, *, title=None, cwd=None,
-                        task_plan=None):
-        """Upsert one project-scoped, source-bound deterministic handoff."""
-        messages = list(getattr(agent, "messages", ()) or ())
-        users = [str(item.get("content") or "").strip()
-                 for item in messages
-                 if item.get("role") == "user"
-                 and not _is_internal_goal_message(item)
-                 and isinstance(item.get("content"), str)
-                 and str(item.get("content") or "").strip()]
-        assistants = [str(item.get("content") or "").strip()
-                      for item in messages
-                      if item.get("role") == "assistant"
-                      and isinstance(item.get("content"), str)
-                      and str(item.get("content") or "").strip()]
-        summary = getattr(agent, "context_summary", None) or {}
-        blocks = []
-        if summary.get("status") == "valid" and summary.get("content"):
-            blocks.append("## Compact handoff\n" + str(summary["content"])[:8000])
-        if users:
-            blocks.append("## Latest user objective\n" + users[-1][:2500])
-        if assistants:
-            blocks.append("## Latest reported result\n" + assistants[-1][:2500])
-        if isinstance(task_plan, dict):
-            pending = [item for item in task_plan.get("items") or []
-                       if item.get("status") != "completed"]
-            if pending:
-                blocks.append("## Pending plan\n" + "\n".join(
-                    f"- [{item.get('status')}] {item.get('content')}"
-                    for item in pending[:20]))
-        if not blocks:
-            return None
-        content = "\n\n".join(blocks)[:MAX_ENTRY_CHARS]
-        raw_sha = context_projection.sha256(messages)
-        session_id = str(getattr(agent, "session_id", ""))
-        return self.add(
-            content,
-            title=title or (users[0][:80] if users else f"session {session_id[:8]}"),
-            scope=PROJECT,
-            cwd=cwd,
-            source_session=session_id,
-            evidence={
-                "raw_sha256": raw_sha,
-                "message_count": len(messages),
-                "summary_sha256": summary.get("covered_sha256"),
-            },
-            kind="session_handoff",
-            stable_key=f"session:{session_id}",
-        )
-
+    def render_entry(self, identifier, *, cwd=None,
+                     max_bytes=RECALL_ENTRY_BYTES):
+        """按 id / stable_key / 标题前缀取一条记忆的正文（给模型的 memory_read）。"""
+        record = self.get(identifier, cwd=cwd)
+        body = str(record.get("content") or "")
+        encoded = body.encode("utf-8", "surrogatepass")
+        limit = max(256, int(max_bytes))
+        truncated = len(encoded) > limit
+        if truncated:
+            body = encoded[:limit].decode("utf-8", "ignore")
+        age = ""
+        updated = str(record.get("updated_at") or "")
+        try:
+            days = (datetime.now(timezone.utc)
+                    - datetime.fromisoformat(updated)).days
+            age = f"；{days} 天前写的" if days > 0 else "；今天写的"
+        except (TypeError, ValueError):
+            pass
+        header = (f"[memory {record['id']} · {record.get('type') or DEFAULT_TYPE}"
+                  f" · {record['scope']} · {record.get('title') or '?'}"
+                  f" · 更新于 {updated or '?'}{age}]")
+        if truncated:
+            body += f"\n…[已截断到 {limit:,} 字节]"
+        return {
+            "id": record["id"],
+            "type": record.get("type") or DEFAULT_TYPE,
+            "scope": record["scope"],
+            "title": record.get("title") or "",
+            "updated_at": updated,
+            "truncated": truncated,
+            "text": header + "\n" + body,
+        }
 
 def _recent_user_messages(agent, limit=4, chars=5000):
     values = []

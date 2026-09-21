@@ -8,6 +8,7 @@ harness 执行完把结果喂回去，**循环直到模型不再调工具为止*
 不流式的话手感直接死掉。
 """
 from . import paths
+from . import away_recap as away_policy
 import hashlib
 import itertools
 import json
@@ -22,14 +23,48 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 from . import (attachments, checkpoints, client, context as context_projection,
-               memory as memory_db, models as models_db, store, tools)
+               memory as memory_db, memory_extract as extract_policy,
+               instructions, models as models_db, store, tools,
+               wincompat)
 
 # 持久化统一走 store：sessions/<id>.json、usage.jsonl、stats-cache.json
 USAGE_LOG = store.USAGE_LOG
 
 # kimi-k3 于 2026-08-21 起在网关上 404（目录仍保留记录，但不可调用）。
 # k3-256k 可用且首 token 0.4s，比原来记录的 k3 20-24s 快得多。
+# 写死一个模型名是行不通的：它只对定它的那把 key 成立。2026-09-21 实测，这个出厂默认
+# 在维护者自己的目录里都已经是 delisted（2026-09-16 下架）——陌生人 clone 下来不跑 init
+# 直接 `zylab -p "hi"` 撞上的是一个不存在的模型。所以它只当**最后兜底**，正常路径走
+# default_model()：settings > 本地目录里真能用的 > 这个常量。
 MODEL = paths.env_get("MODEL", "kimi-k3-256k")
+# 明显不是"干活主力"的模型：自动挑默认值时跳过（挑中一个 OCR 模型当编码 agent 的默认
+# 比没有默认更糟）。
+_NOT_A_WORKHORSE = re.compile(
+    r"embed|rerank|ocr|tts|whisper|audio|image|vision|vl\b|guard|moderation", re.I)
+
+
+def default_model(gateway=None):
+    """没有显式配置时用哪个模型：本地目录里**列得出、没下架、窗口最大**的那个。
+
+    顺序是 ZYLAB_MODEL 环境变量 > 本地目录 > MODEL 常量。调用方负责先看 settings——
+    用户在 settings 里写死的永远优先，这个函数不碰它。
+    """
+    explicit = str(paths.env_get("MODEL", "") or "").strip()
+    if explicit:
+        return explicit
+    try:
+        rows = models_db.probed_rows(
+            gateway if gateway is not None else client.GATEWAY)
+    except Exception:                                 # noqa: BLE001 - 目录坏了不该让人起不来
+        rows = []
+    for row in rows:                                  # probed_rows 已按窗口从大到小排好
+        name = str(row.get("id") or "")
+        if not name or row.get("listed") is False or row.get("status") == "delisted":
+            continue
+        if _NOT_A_WORKHORSE.search(name):
+            continue
+        return name
+    return MODEL
 # 网关标称 1,049k；实测 200,130 tokens 的输入照单全收（2026-08-21 二分探测）。
 # 注意：早先记录的「80,131 可用上下文」是错的 —— 那是某次请求的实际用量，不是上限。
 # 兜底值；真实上限按模型从网关查（见 Agent.set_model）。
@@ -61,18 +96,53 @@ KEEP_TAIL = 6             # 压缩时保留最近几个完整用户轮次
 # 每段几十 K，靠摘要链衔接（上一段摘要作为下一段的第一条 source）。
 COMPACT_SOURCE_TOKENS = 60_000
 COMPACT_MAX_PASSES = 4          # 一次 /compact 最多连压几段
-# ---- 交接摘要（recap）----
-# 压缩摘要和交接摘要是**两件不同的事**，以前被压缩的触发点绑在一起：
-#   压缩摘要：为了塞进上下文窗口，238K 才触发，会替换掉原文；
-#   交接摘要：为了让 resume 的人知道到哪了，几十 K 就该有，**不进投影**。
-# 实测最近 5 个会话没有一个有摘要（4 个测得的里 3 个永远够不到压缩阈值），
-# recap 于是只能靠 task_plan 和第一条用户原话 —— 这才是它信息量低的真因。
-RECAP_MIN_TOKENS = 40_000     # 原文估算超过这么多才值得花一次调用
-RECAP_REFRESH_TURNS = 15      # 距上次交接摘要又过了这么多轮就刷新
-RECAP_SOURCE_TOKENS = 60_000
+COMPACT_TAIL_MIN_TOKENS = 4_000
+COMPACT_TAIL_MAX_TOKENS = 40_000
+# 触发之后压到阈值的这个比例以下再停。以前是「压到刚好装得下就停」：一段摘要的输入有上限
+# （COMPACT_SOURCE_TOKENS），长会话一段压不完，压完仍占阈值的 52–57%，几万 token 之后又得
+# 再压一次，而每次压缩都要把整个尾部重发一遍。
+#
+# 2026-09-20 用**真实的压缩链**在 7 个真实会话上逐请求回放（compact_at=200,000，只有最长的
+# 两个会话会压）：压到一半以下，累计输入 218.5M → 192.7M（−11.8%）、压缩事件 4 → 3，代价是
+# 摘要请求 4 → 6 段（源 247K → 299K token）。每次事件恰好 2 段，没有空转。
+# 阈值更小时（139,264，即 163,840 窗口的模型）这个开关完全不起作用：一段就能压到 41–53K，
+# 本来就远低于一半。所以它只在「一段压不完」的长会话上起作用——那正是需要它的地方。
+COMPACT_DEEP_FRACTION = 0.5
+# 自动压缩的熔断：连续失败这么多次就歇一阵。每次失败最多烧 3 个请求（关思考 → 大额度 →
+# 换模型），不设闸就是每一轮都再烧一遍。Claude Code 同样是连续 3 次失败后本会话不再自动压。
+# 这里不是永久的：过了冷却期、换了模型、或用户手动 /compact，都会重新试。
+COMPACT_BREAKER_FAILURES = 3
+COMPACT_BREAKER_SECONDS = 30 * 60
+COMPACT_SAME_PLAN_RETRY_SECONDS = 5 * 60      # 同一份计划刚失败过：这么久之内不重试
 COMPACT_MAX_TOKENS = 6_000
 COMPACT_RETRY_MAX_TOKENS = 16_000
 COMPACT_THINKING_OFF = {"type": "disabled"}
+
+
+def _request_params_rejected(error):
+    """上一次尝试是不是被网关以「参数不对」拒掉的（400），而且不是输入太长。
+
+    有的模型不许关思考（glm-5.3@boyue：400 code 1210）。这种失败换个参数就能好，
+    和 503（重发没用）、输入太长（得压缩，不是换参数）都不是一回事。
+    """
+    if getattr(error, "kind", None) != "invalid_request":
+        return False
+    return models_db.parse_limit(str(error)) is None
+
+
+class _ThinkingOffLearner:
+    """一次阶梯运行内的观察者：关思考被 400、同一 route 不关就成功 → 记进模型目录。"""
+
+    def __init__(self):
+        self._rejected = set()
+
+    def observe(self, gateway, model, thinking, error, succeeded):
+        key = (str(gateway), str(model))
+        if thinking == COMPACT_THINKING_OFF and _request_params_rejected(error):
+            self._rejected.add(key)
+        elif thinking is None and succeeded and key in self._rejected:
+            self._rejected.discard(key)
+            models_db.note_thinking_off_rejected(*key)
 
 
 def compact_threshold(ctx_limit, override=None):
@@ -192,14 +262,20 @@ SYSTEM = """你是 zylab，一个跑在终端里的软件工程助理。你通�
 - Python 动态调用、反射、生成代码和字符串引用可能漏边。关键结论必须用
   read_file/grep 和实际测试核实；Graft 不能替代源码与运行证据。
 
-长期记忆（memory_write / memory_forget）：
+长期记忆（memory_read / memory_write / memory_forget）：
+- `<memory-index>` 里每条只有**一行钩子**，不是正文。觉得某条和当前任务相关，用
+  memory_read 取正文再用，**不要凭标题猜内容**。
 - 只在信息对未来会话仍有用时写 memory；不要每轮都写。用户明确要求记住时优先处理。
+  轮末还有一次自动抽取，所以不必为了「别忘了」而抢着写。
 - 该记：用户稳定的偏好、约束、否决以及为什么；带测量方法的实测数字和结论；
   考虑过但明确否决的方案及理由；路径/URL/凭据位置等外部资源指针，但绝不含凭据本身。
 - 不该记：仓库代码结构、git 历史、ZYLAB.md 已记录的内容；只在当前对话有意义的
   中间状态；可随时从文件系统直接读取的事实。
+- 分四类（type）：user=用户是谁与长期偏好；feedback=对你工作方式的要求；
+  project=在做的事与约束；reference=外部资源指针。description 写一行钩子，
+  **带上用户以后会用来找它的词**——中文任务就写中文，否则检索不到。
 - 一条一事。把相对日期换成绝对日期；写清为什么以及未来如何应用，不只写结论。
-- 写前查看已注入的 memory-index 是否有近似条目；同一事实复用其 stable_key 更新，
+- 写前查看 memory-index 是否有近似条目；同一事实复用其 stable_key 更新，
   不要追加近似副本。发现错误或过期条目时用 memory_forget 纠正。
 - 不要把密钥、token、密码或个人身份信息交给 memory_write；自动脱敏只是最后一道防线。
 
@@ -283,6 +359,27 @@ def site_facts():
     return out
 
 
+def shell_facts():
+    """Windows 上告诉模型它在跟哪个 shell 说话，以及两条会静默失败的本地规矩。
+
+    不说的后果都是**不报错的错**：模型按 WSL 习惯写 `/mnt/c/...`（Git Bash 里
+    那是个不存在的相对目录，命令空跑），或者建出 `aux.py` / `报告.md ` 这种
+    Win32 会改名或当设备的文件。Linux/macOS 上这段一行都不出，零 token。
+    """
+    if not wincompat.IS_WINDOWS:
+        return []
+    try:
+        shell = tools.bash_executable()
+    except Exception:          # noqa: BLE001 —— 环境事实缺一条不该挡住整轮请求
+        shell = "bash"
+    return [
+        f"shell: {shell}（Git Bash；命令按 bash 语法写）",
+        r"路径: 写 C:\... 或 Git Bash 的 /c/...；这台机器上没有 /mnt/c/",
+        "文件名: 避开 CON/PRN/AUX/NUL/COM1-9/LPT1-9（带扩展名也算）"
+        "和结尾的点或空格 —— Win32 会静默改名或当成设备",
+    ]
+
+
 def env_context():
     cwd = os.getcwd()
     try:
@@ -295,6 +392,7 @@ def env_context():
              f"日期: {time.strftime('%Y-%m-%d')}",
              f"模型: {MODEL} ({client.GATEWAY})"]
     lines.extend(site_facts())
+    lines.extend(shell_facts())
     if branch:
         lines.append(f"git 分支: {branch}")
     try:
@@ -305,8 +403,13 @@ def env_context():
     return "<env>\n" + "\n".join(lines) + "\n</env>"
 
 
+# 指令记忆最近一次加载留下的提示（超量、被拒的 import、读不了的文件）。
+# /doctor 从这里取——这些事不该只在第一次加载时闪一下就没了。
+INSTRUCTION_NOTES = []
+
+
 def user_instructions():
-    """用户级全局指令 <state_home>/ZYLAB.md —— 跨项目。"""
+    """用户级全局指令 <state_home>/ZYLAB.md —— 跨项目，支持 @import。"""
     try:
         txt = store.USER_MD.read_text(encoding="utf-8").strip()
     except OSError:
@@ -317,25 +420,27 @@ def user_instructions():
             and not l.startswith("项目专属") and not l.startswith("例如")]
     if not body:
         return ""
+    notes = []
+    # scope="user"：这个文件是这台机器的主人自己写的，import 不限在工作目录内；
+    # 凭据那道闸照样过（纵深防御，误写一条 @~/.ssh/id_rsa 不该就这么发出去）。
+    expanded, _ = instructions.expand(
+        store.USER_MD, scope="user",
+        root=os.path.realpath(os.getcwd()), notes=notes)
+    INSTRUCTION_NOTES.extend(notes)
+    txt = expanded.strip() or txt
     return f"<user-instructions src=\"{store.USER_MD}\">\n{txt}\n</user-instructions>"
 
 
 def project_instructions(cwd=None):
-    """加载 CLAUDE.md —— 沿用 Claude Code 的约定，从当前目录往上找。"""
-    cwd = Path_up(cwd or os.getcwd())
-    out = []
-    for p in cwd:
-        f = os.path.join(p, "CLAUDE.md")
-        if os.path.isfile(f):
-            try:
-                with open(f, encoding="utf-8") as handle:
-                    body = handle.read()
-                out.append(f"<project-instructions src=\"{f}\">\n"
-                           f"{body}\n</project-instructions>")
-            except OSError:
-                pass
-            break
-    return "\n\n".join(out)
+    """项目级指令：AGENTS.md / CLAUDE.md，从根到 cwd **逐层全收**，支持 @import。
+
+    以前是「往上找到第一个 CLAUDE.md 就停」：不认 AGENTS.md（于是 zylab 在自己
+    仓库里干活读不到自己的规矩），单体仓库只有一层能生效，而且是哪一层取决于 cwd
+    在哪。规则与信任边界都在 core/instructions.py。
+    """
+    bundle = instructions.collect(cwd)
+    INSTRUCTION_NOTES[:] = list(bundle.notes)
+    return instructions.render(bundle)
 
 
 def _authority_text(value, closing_tag):
@@ -461,21 +566,12 @@ def _repair_truncated_calls(calls):
     整个工具循环卡死。这里在回传前修复：解析失败的 arguments 换成
     {"_truncated": "<原始前 120 字符>"}，历史可追溯、JSON 合法，
     模型看到占位会自行重发调用。
+
+    规范实现在 `client.repair_truncated_tool_calls`——出站净化
+    （`client._sanitize_outgoing_messages`）走的是同一份逻辑。保留本名是因为
+    `tests/test_repair_truncated_calls.py` 直接 import 它。
     """
-    import json as _json
-    repaired = []
-    for call in calls:
-        call = dict(call)
-        raw_args = str(call.get("function", {}).get("arguments") or "")
-        try:
-            _json.loads(raw_args)
-        except (ValueError, TypeError):
-            fn = dict(call.get("function") or {})
-            fn["arguments"] = _json.dumps(
-                {"_truncated": raw_args[:120]}, ensure_ascii=False)
-            call["function"] = fn
-        repaired.append(call)
-    return repaired
+    return client.repair_truncated_tool_calls(calls)
 
 
 def _turn_indices(max_turns):
@@ -547,7 +643,10 @@ class Agent:
         self.turns = 0
         self.compact_failed = None
         self.context_summary = None
-        self.session_recap = None
+        # 最近一条 away recap：{"text", "ts", "users"}。只给人看，绝不进 messages。
+        self.away_recap = None
+        # 上一次主请求的 (工具集, 控制消息)；旁路请求据此与主循环共用缓存前缀。
+        self._last_request_shape = None
         self.context_invalid_reason = None
         self._compact_failed_key = None
         self._last_age_notice_key = None
@@ -600,9 +699,10 @@ class Agent:
         else:
             self.messages.insert(0, message)
         # Compact coverage excludes the system prefix, but revalidate the
-        # boundary in case an old record had no system message.
-        candidate = {"summary": getattr(self, "context_summary", None)}
-        self.load_context(candidate)
+        # boundary in case an old record had no system message.  Round-trip
+        # the whole snapshot: passing only the summary made load_context drop
+        # everything else it restores (the away recap vanished on every resume).
+        self.load_context(self.context_snapshot())
         return message["content"]
 
     def set_memory_context(self, value):
@@ -630,6 +730,7 @@ class Agent:
     def set_model(self, model):
         """切模型时同步上下文上限和压缩阈值 —— 两者都是 per-model 的。"""
         self.model = model
+        self._compact_failures = 0        # 压缩的熔断是冲着上一个模型去的：换了就重新给机会
         # 优先查本地能力表（离线、瞬时）；只有表里没有才回落到网关查询。
         # 切模型是交互动作，不该卡在一次网络往返上。
         self.ctx_known = True
@@ -967,10 +1068,212 @@ class Agent:
 
     # ------------------------------------------------------------ 上下文
     def context_snapshot(self):
-        """会话 JSON 只保存可重建投影所需的摘要元数据，外加交接摘要。"""
+        """会话 JSON 只保存可重建投影所需的摘要元数据，外加最近一条 away recap。"""
         return {"version": 1,
                 "summary": getattr(self, "context_summary", None),
-                "recap": getattr(self, "session_recap", None)}
+                "away_recap": getattr(self, "away_recap", None)}
+
+    # ------------------------------------------------------------ away recap
+    def record_away_recap(self, text):
+        """记下刚展示的 recap，连同当时的提问数——「距上次 recap 新增 ≥2 条提问
+        才再做一次」靠它判定。只存进会话记录的 context，不进 messages。"""
+        self.away_recap = {
+            "text": str(text),
+            "ts": datetime.now(timezone.utc).isoformat(),
+            "users": away_policy.real_user_messages(self.messages),
+        }
+        return self.away_recap
+
+    def generate_away_recap(self, cancel=None, allowed_tools=None):
+        """模型现写一行 recap（照搬 Claude Code awaySummary 的生成函数）。
+
+        上下文 = 主请求会发的那份投影（含压缩摘要与老化）+ 末尾追加 CC 的提示词；单轮。
+
+        **请求的前缀必须和主循环逐字节一致**（CC 的 CacheSafeParams）：同一份 system、
+        同一组控制消息、**同一套工具定义**——工具定义排在提示词最前面，少了它整个上下文
+        的 prompt cache 就全废了。09-20 实测（deepseek-v4-flash@deepinfer，6.5 万 token）：
+        同前缀命中 65,024/65,279 token，首字 0.4–0.5s；不命中 4.6s；「带工具」与「不带
+        工具」是两份互不相干的缓存。主循环在 Boyue 上 91.8% 的输入 token 来自缓存，
+        旁路请求没有理由自己冷启动。所以工具照发，只是不许用：回复里出现工具调用即算失败。
+        ``allowed_tools`` 只在本进程还没发过主请求时用（刚 resume），与 run() 的同名参数同义。
+
+        **写 recap 的就是这个窗口此刻在用的模型，没有第二个选项**（用户 09-20 定；
+        CC 也是主循环模型）。所以这里不借用压缩的「换一家来写」兜底：那会在没人
+        要求的情况下，把会话内容发给用户没给这个窗口选的另一个 provider。压缩值得
+        付这个代价（上下文卡在天花板上会一直烧 token），recap 只是个方便，写不出来
+        就安静地失败——CC 也是失败计数、一轮三次后放弃。
+        返回 {"kind": "ok"|"no-turn"|"aborted"|"api-error"|"failed", "text", …}。
+        """
+        def aborted():
+            return cancel is not None and getattr(cancel, "is_set", lambda: False)()
+
+        if not away_policy.real_user_messages(self.messages):
+            return {"kind": "no-turn", "text": ""}
+        shape = getattr(self, "_last_request_shape", None)
+        if shape is not None:
+            offered, controls = shape
+        else:
+            offered = self._offered_tools(
+                self._effective_tool_allowlist(allowed_tools))
+            controls = None
+        # 投影层保证协议合法：被中断的轮次留下的未应答 tool_calls 已经被它剔掉
+        # （并留一条省略说明），所以在末尾直接追加 user 消息是安全的。
+        projection = self.project_context(offered, control_messages=controls)
+        messages = list(projection.messages)
+        messages.append({"role": "user", "content": away_policy.PROMPT})
+
+        # 同一个模型最多发两次：先关思考（一行字不需要思考，也最省）；只有在
+        # 「思考吃光了额度」（09-20 实测 glm-5.3 在 max_tokens=200 下 31.8s 后返回
+        # 空正文）或网关拒收这组参数（400：有的模型不许关思考）时，才按模型默认的
+        # 思考方式、给足额度再来一次。503 之类重发没用，交给下次触发。
+        # route 在开头取一次：两次尝试必须是同一个模型，哪怕中途有人 /model 切走。
+        model, gateway = self.model, self.gateway
+        attempts = (
+            {"max_tokens": COMPACT_MAX_TOKENS, "thinking": dict(COMPACT_THINKING_OFF)},
+            {"max_tokens": COMPACT_RETRY_MAX_TOKENS, "thinking": None},
+        )
+        if models_db.thinking_off_rejected(gateway, model):
+            attempts = attempts[1:]           # 已经学到它不许关思考：别先白撞一个 400
+        learner = _ThinkingOffLearner()
+        temp = 0.2 if models_db.supports_temperature(gateway, model) else None
+        text, error, reasoning_chars, tool_called = "", None, 0, False
+        used = {"model": model, "gateway": gateway}
+        started = time.monotonic()
+        for index, params in enumerate(attempts):
+            if aborted():
+                return {"kind": "aborted", "text": ""}
+            if index:
+                starved = (error is None and not text.strip()
+                           and reasoning_chars > 0)
+                if not (starved or _request_params_rejected(error)):
+                    break
+            text, error, reasoning_chars, tool_called = "", None, 0, False
+            try:
+                for event in client.stream_chat(
+                        model, messages, tools=offered or None,
+                        max_tokens=params["max_tokens"], temperature=temp,
+                        thinking=params["thinking"], cancel=cancel,
+                        gateway=gateway,
+                        trace_context=self._trace_context(
+                            uuid.uuid4().hex, None, projection=projection,
+                            purpose="away_recap")):
+                    if event["t"] == "text":
+                        text += event["v"]
+                    elif event["t"] == "reasoning":
+                        reasoning_chars += len(event["v"])
+                    elif event["t"] == "tool" and event.get("v"):
+                        tool_called = True
+            except Exception as exc:                  # noqa: BLE001 - recap 不能弄崩会话
+                error = exc
+            learner.observe(gateway, model, params["thinking"], error,
+                            error is None and bool(text.strip()) and not tool_called)
+            if tool_called:
+                # 工具是为了缓存才带上的，不是给它用的：绝不执行，这次就算没写出来。
+                text = ""
+                break
+            if error is None and text.strip():
+                break
+        used["seconds"] = round(time.monotonic() - started, 1)
+        if aborted():
+            return {"kind": "aborted", "text": ""}
+        if error is not None:
+            return {"kind": "api-error", "text": str(error), **used}
+        cleaned, capped = away_policy.clean(text)
+        if not cleaned:
+            return {"kind": "failed",
+                    "text": "模型想调工具而不是直接回答" if tool_called else "",
+                    **used}
+        return {"kind": "ok", "text": cleaned, "capped": capped, **used}
+
+    def extract_memories(self, *, index_text="", cancel=None,
+                         allowed_tools=None):
+        """轮末抽取跨会话记忆：一次与主循环共用前缀的旁路请求。
+
+        形状与 generate_away_recap 完全一样（同 system、同控制消息、**同一套工具定义**，
+        工具照发但不许用），理由也一样：旁路请求没有理由自己冷启动 prompt cache。
+        阶梯同压缩：先关思考，被网关拒收（有的模型不许关）或思考吃光额度时，按模型默认
+        方式给足额度再来一次。
+
+        失败一律安静：返回 kind != "ok"，一个字都不写进 memory。记错比不记更糟。
+        返回 {"kind": ok|no-turn|aborted|api-error|failed, "entries", model, gateway, seconds}。
+        """
+        def aborted():
+            return cancel is not None and getattr(cancel, "is_set", lambda: False)()
+
+        if away_policy.real_user_messages(self.messages) < (
+                extract_policy.MIN_USER_MESSAGES):
+            return {"kind": "no-turn", "entries": []}
+        shape = getattr(self, "_last_request_shape", None)
+        if shape is not None:
+            offered, controls = shape
+        else:
+            offered = self._offered_tools(
+                self._effective_tool_allowlist(allowed_tools))
+            controls = None
+        projection = self.project_context(offered, control_messages=controls)
+        messages = list(projection.messages)
+        messages.append({
+            "role": "user",
+            "content": extract_policy.PROMPT + extract_policy.existing_block(index_text),
+        })
+
+        model, gateway = self.model, self.gateway
+        attempts = (
+            {"max_tokens": extract_policy.MAX_TOKENS,
+             "thinking": dict(COMPACT_THINKING_OFF)},
+            {"max_tokens": extract_policy.RETRY_MAX_TOKENS, "thinking": None},
+        )
+        if models_db.thinking_off_rejected(gateway, model):
+            attempts = attempts[1:]
+        learner = _ThinkingOffLearner()
+        temp = 0.2 if models_db.supports_temperature(gateway, model) else None
+        text, error, reasoning_chars, tool_called = "", None, 0, False
+        used = {"model": model, "gateway": gateway}
+        started = time.monotonic()
+        for index, params in enumerate(attempts):
+            if aborted():
+                return {"kind": "aborted", "entries": []}
+            if index:
+                starved = (error is None and not text.strip()
+                           and reasoning_chars > 0)
+                if not (starved or _request_params_rejected(error)):
+                    break
+            text, error, reasoning_chars, tool_called = "", None, 0, False
+            try:
+                for event in client.stream_chat(
+                        model, messages, tools=offered or None,
+                        max_tokens=params["max_tokens"], temperature=temp,
+                        thinking=params["thinking"], cancel=cancel,
+                        gateway=gateway,
+                        trace_context=self._trace_context(
+                            uuid.uuid4().hex, None, projection=projection,
+                            purpose="memory_extract")):
+                    if event["t"] == "text":
+                        text += event["v"]
+                    elif event["t"] == "reasoning":
+                        reasoning_chars += len(event["v"])
+                    elif event["t"] == "tool" and event.get("v"):
+                        tool_called = True
+            except Exception as exc:                  # noqa: BLE001 - 抽取不能弄崩会话
+                error = exc
+            learner.observe(gateway, model, params["thinking"], error,
+                            error is None and bool(text.strip()) and not tool_called)
+            if tool_called:
+                text = ""
+                break
+            if error is None and text.strip():
+                break
+        used["seconds"] = round(time.monotonic() - started, 1)
+        if aborted():
+            return {"kind": "aborted", "entries": []}
+        if error is not None:
+            return {"kind": "api-error", "entries": [], "text": str(error), **used}
+        entries = extract_policy.parse(text)
+        if not entries:
+            return {"kind": "failed", "entries": [],
+                    "text": ("模型想调工具而不是直接回答" if tool_called
+                             else "没有解析出可用条目"), **used}
+        return {"kind": "ok", "entries": entries, **used}
 
     def load_context(self, data):
         """恢复摘要；哈希或边界不匹配时 fail-closed。"""
@@ -979,10 +1282,10 @@ class Agent:
             self.messages, candidate)
         self.context_summary = candidate if valid else None
         self.context_invalid_reason = None if valid else reason
-        # 交接摘要不参与投影，所以哈希对不上也不作废：它顶多是「落后了几轮」，
-        # 而一份稍旧的交接说明远好过没有。
-        recap = data.get("recap") if isinstance(data, dict) else None
-        self.session_recap = recap if isinstance(recap, dict) else None
+        # away recap 不参与投影，哈希对不上也不作废：它只是给人看的一行路标。
+        # （旧记录里的 context["recap"] 是已下线的交接摘要，读到就忽略。）
+        away = data.get("away_recap") if isinstance(data, dict) else None
+        self.away_recap = away if isinstance(away, dict) and away.get("text") else None
         self._compact_failed_key = None
         self._last_age_notice_key = None
         return valid
@@ -1008,38 +1311,13 @@ class Agent:
             offered_tools, control_messages=control_messages).report
 
     def force_compact(self, *, route_explicit=False,
-                      before_provider_attempt=None):
-        """无视阈值立刻压一次 —— 手动命令和上下文拒绝后的补救。"""
+                      before_provider_attempt=None, instructions=None):
+        """无视阈值立刻压一次 —— 手动命令和上下文拒绝后的补救。
+        ``instructions``：``/compact <要求>`` 里用户对摘要提的附加要求。"""
         return self.maybe_compact(
             force=True, route_explicit=route_explicit,
-            before_provider_attempt=before_provider_attempt)
-
-    def recap_is_stale(self, *, min_tokens=RECAP_MIN_TOKENS,
-                       refresh_turns=RECAP_REFRESH_TURNS):
-        """要不要（重新）生成交接摘要。便宜的判断，不发任何请求。"""
-        messages = list(self.messages or [])
-        if context_projection.estimate_messages(messages) < max(0, min_tokens):
-            return False                      # 短会话回放本身就是完整画面
-        recap = getattr(self, "session_recap", None)
-        covered = int((recap or {}).get("covered_to") or 0)
-        if not recap:
-            return True
-        fresh_turns = sum(
-            1 for message in messages[covered:]
-            if message.get("role") == "user")
-        return fresh_turns >= max(1, int(refresh_turns))
-
-    def refresh_session_recap(self, *, route_explicit=False, turn_id=None,
-                              before_provider_attempt=None):
-        """生成/推进交接摘要。与压缩共用同一套请求与降级，只是存到别处。"""
-        plan = context_projection.plan_compaction(
-            self.messages, getattr(self, "session_recap", None), keep_tail=0,
-            max_source_tokens=RECAP_SOURCE_TOKENS)
-        if not plan:
-            return None
-        return self._execute_compaction_plan(
-            plan, route_explicit=route_explicit, turn_id=turn_id,
-            before_provider_attempt=before_provider_attempt, slot="recap")
+            before_provider_attempt=before_provider_attempt,
+            instructions=instructions)
 
     def summarize_to(self, message_count, *, before_provider_attempt=None):
         """Summarize raw history through one exact checkpoint boundary."""
@@ -1089,26 +1367,41 @@ class Agent:
         2. 大额度 —— 网关忽略 thinking 时，让思考和正文都装得下。
         3. 换模型 —— 前两步都没拿到正文时，换席位池里另一家来写。
         """
-        attempts = [
-            {"label": "thinking-off", "max_tokens": COMPACT_MAX_TOKENS,
-             "thinking": dict(COMPACT_THINKING_OFF), "route": None,
-             "when": "first"},
-            # 只在「思考吃光额度」时才值得：同一模型真不肯写正文时再发一次没用
-            {"label": "wide-budget", "max_tokens": COMPACT_RETRY_MAX_TOKENS,
-             "thinking": None, "route": None, "when": "thinking_starved"},
-        ]
+        def first_step(gateway, model, label, route):
+            # 已经学到这条 route 不许关思考：直接按它默认的方式问、给足额度，
+            # 不再每次先白撞一个 400。
+            if models_db.thinking_off_rejected(gateway, model):
+                return {"label": label, "max_tokens": COMPACT_RETRY_MAX_TOKENS,
+                        "thinking": None, "route": route, "when": "first"}
+            return {"label": label, "max_tokens": COMPACT_MAX_TOKENS,
+                    "thinking": dict(COMPACT_THINKING_OFF), "route": route,
+                    "when": "first"}
+
+        attempts = [first_step(self.gateway, self.model, "thinking-off", None)]
+        if attempts[0]["thinking"] is not None:
+            # 同一个模型、按它默认的思考方式、给足额度再问一次。只在两种情况下值得：
+            # 思考吃光了额度；或网关拒收了这组参数（不许关思考）。真不肯写正文、
+            # 503 之类再发一次没用。（第一步已经是这个形状时就不重复了。）
+            attempts.append(
+                {"label": "wide-budget", "max_tokens": COMPACT_RETRY_MAX_TOKENS,
+                 "thinking": None, "route": None, "when": "thinking_starved"})
+        else:
+            attempts[0]["label"] = "default-thinking"
         fallback = self.compaction_fallback_route()
         if fallback:
-            attempts.append({
-                "label": "fallback:" + str(fallback.get("seat") or "?"),
-                "max_tokens": COMPACT_MAX_TOKENS,
-                "thinking": dict(COMPACT_THINKING_OFF),
-                "route": fallback, "when": "any_failure"})
+            step = first_step(fallback["gateway"], fallback["model"],
+                              "fallback:" + str(fallback.get("seat") or "?"),
+                              fallback)
+            step["when"] = "any_failure"
+            attempts.append(step)
         return tuple(attempts)
 
     @staticmethod
-    def compaction_should_attempt(params, error, summary, reasoning_chars):
-        """``params`` 是**下一次**尝试；决定它该不该跑。
+    def compaction_should_attempt(params, error, summary, reasoning_chars,
+                                  defects=()):
+        """``params`` 是**下一次**尝试；决定它该不该跑。``defects`` 是上一次的摘要被拒收
+        的原因（见 ``context.summary_defects``）；被拒收的摘要不算成功，调用方传进来的
+        ``summary`` 应当已经清空。
 
         「思考吃光额度」是确定性故障，加大额度就能修；「正文真为空、也没思考」说明
         这个模型不肯写，只有换模型才有意义，同一个模型再发一次是白烧 token。
@@ -1116,49 +1409,202 @@ class Agent:
         if error is None and summary.strip():
             return False                      # 上一次已经成功
         if params.get("when") == "thinking_starved":
+            if _request_params_rejected(error):
+                return True                   # 不许关思考：换成默认思考方式再问
+            if "truncated" in defects and set(defects) <= {"truncated", "structure"}:
+                return True                   # 额度不够写完：同一个模型加大额度再来
             return (error is None and not summary.strip()
                     and reasoning_chars > 0)
         return True                           # any_failure
 
-    def _compaction_plan(self, force=False, preview=None):
-        """选择需要摘要的完整前缀；不发请求也不改变 raw。"""
+    def compaction_tail_tokens(self):
+        """压缩时原样留在尾部的那一截有多大：阈值的 1/8，夹在 4K–40K 之间。
+
+        留得太少，模型刚做的事只剩摘要里的一句话；留得太多，压一次腾不出多少地方
+        （以前「留 6 个用户轮次」在自治会话里等于整个会话都留着）。
+        """
+        budget = int(getattr(self, "compact_at", 0) or 0) or 200_000
+        return min(COMPACT_TAIL_MAX_TOKENS, max(COMPACT_TAIL_MIN_TOKENS, budget // 8))
+
+    def compaction_deep_target(self):
+        """已经开始压了，压到哪里为止。见 COMPACT_DEEP_FRACTION。"""
+        budget = int(getattr(self, "compact_at", 0) or 0) or 200_000
+        return max(1, int(budget * COMPACT_DEEP_FRACTION))
+
+    def _compaction_plan(self, force=False, preview=None, *, deep=False):
+        """选择需要摘要的完整前缀；不发请求也不改变 raw。
+
+        `deep=True` 是同一次压缩里的**续压**：要不要接着压只看估算值与
+        compaction_deep_target()。
+        """
         if preview is None:
             preview = self.project_context(tools.SCHEMA)
         aged = preview.report["tool_previews"]["saved_chars"]
         pressure = preview.report["untrimmed_estimated_tokens"]
-        if not force:
+        if deep and not force:
+            # 续压不看 last_total：那是**压缩之前**那次请求的读数，早已过期，拿它当
+            # 依据会在压完之后还一直嫌大。
+            if pressure < self.compaction_deep_target():
+                return None
+            if self.compaction_breaker_open():
+                return None
+        elif not force:
             over_measured = getattr(self, "last_total", 0) >= self.compact_at
             over_estimated = pressure >= self.compact_at
             if not over_estimated and (not over_measured or aged):
                 return None
+            if self.compaction_breaker_open():
+                return None
 
+        summary = getattr(self, "context_summary", None)
         plan = context_projection.plan_compaction(
-            self.messages, getattr(self, "context_summary", None), KEEP_TAIL,
-            max_source_tokens=COMPACT_SOURCE_TOKENS)
+            self.messages, summary, KEEP_TAIL,
+            max_source_tokens=COMPACT_SOURCE_TOKENS,
+            tail_tokens=self.compaction_tail_tokens())
+        if not plan and not deep:
+            # 整个会话都装得进尾部预算（小会话上手动 /compact、或撞墙后的强制压缩）：
+            # 退回「留最近几个用户轮次」，行为与以前一致。续压时**不**退回：尾部已经在
+            # 预算之内，再压也只能啃尾巴，白烧一个请求。
+            plan = context_projection.plan_compaction(
+                self.messages, summary, KEEP_TAIL,
+                max_source_tokens=COMPACT_SOURCE_TOKENS)
         if not plan:
             return None
         attempt_key = plan["covered_sha256"]
-        if (not force and getattr(self, "_compact_failed_key", None)
-                == attempt_key):
+        # 同一份计划刚失败过就先别再来（一轮里会经过这里好几次）；但只拦一小会儿——以前是
+        # 「这份计划失败过就永不重试」，网关抖一次 503，这个会话就再也不会自动压缩了。
+        recently = (time.monotonic() - float(getattr(self, "_compact_failed_at", 0) or 0)
+                    < COMPACT_SAME_PLAN_RETRY_SECONDS)
+        if (not force and recently
+                and getattr(self, "_compact_failed_key", None) == attempt_key):
             return None
         return plan
 
+    def compaction_breaker_open(self):
+        """自动压缩是不是在歇着：连续失败 ≥3 次、且还在冷却期内。"""
+        failures = int(getattr(self, "_compact_failures", 0) or 0)
+        if failures < COMPACT_BREAKER_FAILURES:
+            return False
+        since = time.monotonic() - float(getattr(self, "_compact_failed_at", 0) or 0)
+        if since >= COMPACT_BREAKER_SECONDS:
+            self._compact_failures = 0            # 冷却期过了：重新给机会
+            return False
+        return True
+
+    def _compaction_restore(self, record, plan):
+        """压缩成功的那一刻，把工作现场采下来随摘要带回：最近动过的文件的当前内容 + 任务计划。
+
+        文件走和 read_file 工具**同一道读闸**（workspace 边界、凭据文件硬拒）；用户把 read_file
+        的权限设成非 allow 时一个文件都不读——这里没有人可以点「同意」。任何一步出错都只是少带
+        一样东西，绝不让压缩失败。
+        """
+        restored = {"at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+                    "files": [], "task_plan": ""}
+        provider = getattr(self, "compaction_state", None)
+        try:
+            state = dict(provider() or {}) if callable(provider) else {}
+        except Exception:                             # noqa: BLE001
+            state = {}
+        try:
+            from . import plans as plan_records       # noqa: PLC0415
+            task_plan = plan_records.normalize_record(state.get("task_plan"))
+            if any(item["status"] != "completed" for item in task_plan["items"]):
+                restored["task_plan"] = plan_records.plain_text(
+                    task_plan, title="任务计划")
+        except Exception:                             # noqa: BLE001
+            pass
+
+        permissions = (getattr(self, "hook_cfg", None) or {}).get("permissions") or {}
+        if permissions.get("read_file", "allow") != "allow":
+            return restored
+        root = getattr(self, "workspace_root", None) or os.getcwd()
+        recent = self._recently_read_paths(plan["covered_to"])
+        budget = context_projection.RESTORE_TOTAL_CHARS
+        # 工作集里新的在后；改过 / 写过的排前面——要接着干活，先得看到自己动过的文件现在长什么样。
+        rows = list(reversed(record.get("working_set") or []))
+        rows.sort(key=lambda item: item.get("verb") == "读")
+        readonly = 0
+        for item in rows:
+            if len(restored["files"]) >= context_projection.RESTORE_FILES or budget <= 0:
+                break
+            path = str(item.get("path") or "")
+            if not path or path in recent:
+                continue                      # 尾部里刚读过：原文就在眼前，别再带一份
+            only_read = item.get("verb") == "读"
+            if only_read and readonly >= context_projection.RESTORE_READONLY_FILES:
+                continue
+            try:
+                real = tools._guard_read(path, cwd=root, action="回灌")
+                if not os.path.isfile(real) or os.path.getsize(real) > 1_000_000:
+                    continue
+                with open(real, encoding="utf-8", errors="replace") as handle:
+                    text = handle.read(context_projection.RESTORE_FILE_CHARS * 4)
+            except Exception:                         # noqa: BLE001 - Denied / OSError：跳过
+                continue
+            if "\x00" in text:
+                continue                      # 二进制
+            limit = min(context_projection.RESTORE_READONLY_CHARS if only_read
+                        else context_projection.RESTORE_FILE_CHARS, budget)
+            truncated = len(text) > limit
+            body = text[:limit]
+            restored["files"].append({
+                "path": path, "verb": item.get("verb"), "chars": len(body),
+                "truncated": truncated, "content": body})
+            budget -= len(body)
+            readonly += 1 if only_read else 0
+        return restored
+
+    def _recently_read_paths(self, tail_start):
+        """尾部里（不会被老化的那几步之内）用 read_file 读过的路径：它们的原文还在上下文里。"""
+        try:
+            fresh = int(aging_policy(getattr(self, "ctx_limit", None) or CTX_LIMIT)
+                        ["age_after_turns"])
+        except Exception:                             # noqa: BLE001
+            fresh = AGE_AFTER_TURNS
+        paths, seen = set(), 0
+        for message in reversed(self.messages[int(tail_start):]):
+            if message.get("role") != "assistant":
+                continue
+            seen += 1
+            if seen > fresh:
+                break
+            for call in message.get("tool_calls") or []:
+                function = call.get("function") or {}
+                if function.get("name") != "read_file":
+                    continue
+                try:
+                    paths.add(str(json.loads(function.get("arguments") or "{}").get("path")))
+                except (ValueError, TypeError):
+                    continue
+        return paths
+
     def _finish_compaction(self, plan, summary, error=None, *,
-                           reasoning_chars=0, used_route=None, slot="summary"):
+                           reasoning_chars=0, used_route=None, defects=()):
         """只接受完整成功的摘要；失败保留 raw 并返回可见降级说明。"""
         self.compact_failed = (
             f"{type(error).__name__}: {error}"[:160]
             if error is not None else None)
         if self.compact_failed or not summary.strip():
             self._compact_failed_key = plan["covered_sha256"]
+            self._compact_failed_at = time.monotonic()
+            self._compact_failures = int(getattr(self, "_compact_failures", 0) or 0) + 1
+            rejected = "、".join(
+                context_projection.DEFECT_TEXT.get(code, code) for code in defects)
             why = self.compact_failed or (
+                # 写出来了但不能用：装上去就永久替换了那段历史，所以拒收。
+                f"模型写出的摘要被拒收（{rejected}）" if rejected else
                 # 说清是哪一种空：思考吃光额度是可修的（换模型/加额度），
                 # 「真空」是模型不肯写。两者的下一步完全不同。
                 f"模型只输出思考（{reasoning_chars:,} 字）没有正文，"
                 "输出额度被思考吃光"
                 if reasoning_chars > 0 else "provider 返回空摘要")
+            paused = ""
+            if self._compact_failures == COMPACT_BREAKER_FAILURES:
+                paused = (f" 已连续失败 {COMPACT_BREAKER_FAILURES} 次："
+                          f"{COMPACT_BREAKER_SECONDS // 60} 分钟内不再自动压缩"
+                          "（/compact 可手动重试；换模型后立即恢复）。")
             return (f"[摘要生成失败：{why}。原始 {plan['source_turns']} 个完整用户轮次"
-                    "未被改写；本次请求将用可逆投影和明确省略标记降级。]")
+                    "未被改写；本次请求将用可逆投影和明确省略标记降级。" + paused + "]")
 
         used = used_route or {}
         record = context_projection.make_summary(
@@ -1170,57 +1616,60 @@ class Agent:
         # 模型和用户都不知道丢了什么（反馈书差距 2）。
         record["missing_anchors"] = context_projection.missing_anchors(
             summary, record.get("pinned"))
-        if slot == "recap":
-            # 交接摘要只给 resume 看，**绝不**进 provider 投影：这个会话还有
-            # 大把预算，用摘要替换原文是白丢细节（compact_threshold 那条注释
-            # 说的「赌低了 → 每次会话都提前丢历史」）。
-            self.session_recap = record
-            return summary
+        record["restored"] = self._compaction_restore(record, plan)
         self.context_summary = record
         self.context_invalid_reason = None
         self._compact_failed_key = None
+        self._compact_failures = 0
         self.last_total = 0
         return summary
 
     def maybe_compact(self, force=False, preview=None, *, route_explicit=False,
-                      before_provider_attempt=None):
+                      before_provider_attempt=None, instructions=None):
         """为早期完整轮次生成摘要，但绝不改写 self.messages。
 
         单次请求的输入有上限，所以这里可能连压几段：每段成功后 context_summary
-        前移，下一段把它当作 source 的第一条继续。自动压缩会在投影装得下时自然
-        停（_compaction_plan 返回 None）；force 则一直压到只剩 KEEP_TAIL。
+        前移，下一段把它当作 source 的第一条继续。压到 compaction_deep_target()
+        以下就停（_compaction_plan 返回 None）。
         """
         result = None
         for index in range(COMPACT_MAX_PASSES):
-            # 第一段之后不再 force：继续压只为把投影压进预算，压到装得下就停。
-            # 否则 /compact 在长会话上会一路压到只剩 KEEP_TAIL，白等好几分钟。
+            # 第一段之后不再 force，改走「续压」：压到目标以下就停，不会一路压到只剩
+            # KEEP_TAIL——那会让 /compact 在长会话上白等好几分钟。
             plan = self._compaction_plan(
-                force=force and index == 0,
+                force=force and index == 0, deep=index > 0,
                 preview=preview if index == 0 else None)
             if not plan:
                 break
             result = self._execute_compaction_plan(
                 plan, route_explicit=route_explicit,
-                before_provider_attempt=before_provider_attempt)
+                before_provider_attempt=before_provider_attempt,
+                instructions=instructions)
             if str(result or "").startswith("[摘要生成失败"):
                 break
         return result
 
     def _execute_compaction_plan(self, plan, *, route_explicit=False,
                                  turn_id=None, before_provider_attempt=None,
-                                 slot="summary"):
+                                 instructions=None):
         """Run one synchronous summary request and commit only full success."""
 
-        prompt = context_projection.summary_prompt(plan)
+        prompt = context_projection.summary_prompt(plan, instructions)
         summary = ""
         error = None
         reasoning_chars = 0
+        defects = ()
         attempts = self.compaction_attempts()
+        learner = _ThinkingOffLearner()
         used = {"model": self.model, "gateway": self.gateway}
         for index, params in enumerate(attempts):
             if index and not self.compaction_should_attempt(
-                    params, error, summary, reasoning_chars):
-                break
+                    params, error, summary, reasoning_chars, defects):
+                # 这一步不适用就**跳过**它，不是收工。这里曾是 break：主模型 503
+                # 或返回真空正文时，「加大额度」不适用 → 整个循环结束，排在它后面的
+                # 「换一家来写」永远走不到——而那正是它存在的理由（09-20 实测：只发
+                # 1 次请求就放弃；只有「思考吃光 → 加大额度仍吃光」才到得了第三步）。
+                continue
             route = params.get("route") or {}
             model = route.get("model") or self.model
             gateway = route.get("gateway") or self.gateway
@@ -1230,6 +1679,8 @@ class Agent:
             summary = ""
             error = None
             reasoning_chars = 0
+            defects = ()
+            finish_reason = None
             try:
                 for event in client.stream_chat(
                         model, [{"role": "user", "content": prompt}],
@@ -1251,14 +1702,24 @@ class Agent:
                         summary += event["v"]
                     elif event["t"] == "reasoning":
                         reasoning_chars += len(event["v"])
+                    elif event["t"] == "done":
+                        finish_reason = event.get("reason")
             except Exception as exc:                  # noqa: BLE001
                 error = exc
+            if error is None and summary.strip():
+                # 验收：装上去就永久替换了那段历史，残次品宁可不要。
+                defects = tuple(context_projection.summary_defects(
+                    summary, finish_reason))
+                if defects:
+                    summary = ""
             used = {"model": model, "gateway": gateway}
+            learner.observe(gateway, model, params["thinking"], error,
+                            error is None and bool(summary.strip()))
             if error is None and summary.strip():
                 break
         return self._finish_compaction(
             plan, summary, error, reasoning_chars=reasoning_chars,
-            used_route=used, slot=slot)
+            used_route=used, defects=defects)
 
     def _note_route_outcome(self, exc=None):
         """把一次真实请求的结果写回能力缓存 —— 平台名单在变，这是最硬的证据。
@@ -1456,9 +1917,9 @@ class Agent:
                 "result": None,
             }
             for index in range(COMPACT_MAX_PASSES):
-                # 同 maybe_compact：只有第一段是强制的，之后压到装得下即止。
+                # 同 maybe_compact：只有第一段是强制的，之后是续压（压到目标以下即止）。
                 plan = self._compaction_plan(
-                    force=force and index == 0,
+                    force=force and index == 0, deep=index > 0,
                     preview=preview if index == 0 else None)
                 if plan is None:
                     break
@@ -1466,14 +1927,18 @@ class Agent:
                 summary = ""
                 error = None
                 reasoning_chars = 0
+                defects = ()
                 attempts = self.compaction_attempts()
+                learner = _ThinkingOffLearner()
                 used = {"model": self.model, "gateway": self.gateway}
                 # 尝试序列见 compaction_attempts()：关思考 → 大额度 → 换模型。
                 # 每次尝试是独立的一条 aux request，metrics 里能看出走到了第几步。
                 for step, params in enumerate(attempts):
                     if step and not self.compaction_should_attempt(
-                            params, error, summary, reasoning_chars):
-                        break
+                            params, error, summary, reasoning_chars, defects):
+                        # 不适用就跳过，不是收工——同 _execute_compaction_plan 的说明：
+                        # 这里曾是 break，主模型 503 时「换一家来写」永远走不到。
+                        continue
                     route = params.get("route") or {}
                     model = route.get("model") or self.model
                     gateway = route.get("gateway") or self.gateway
@@ -1494,6 +1959,8 @@ class Agent:
                     summary = ""
                     error = None
                     reasoning_chars = 0
+                    defects = ()
+                    finish_reason = None
                     try:
                         for event in provider(
                                 model,
@@ -1525,6 +1992,8 @@ class Agent:
                                 summary += event["v"]
                             elif event["t"] == "reasoning":
                                 reasoning_chars += len(event["v"])
+                            elif event["t"] == "done":
+                                finish_reason = event.get("reason")
                             # 摘要正文不渲染，但每个 provider 事件都把控制权还给
                             # Session，以处理输入、spinner、queue 和 Esc。
                             yield {"t": "poll", "phase": "compaction"}
@@ -1560,15 +2029,28 @@ class Agent:
                             "result": None,
                         }
 
+                    if error is None and summary.strip():
+                        # 验收：装上去就永久替换了那段历史，残次品宁可不要。
+                        defects = tuple(context_projection.summary_defects(
+                            summary, finish_reason))
+                        if defects:
+                            summary = ""
                     succeeded = error is None and bool(summary.strip())
+                    learner.observe(gateway, model, params["thinking"], error,
+                                    succeeded)
                     details = None
                     if not succeeded:
+                        rejected = "、".join(
+                            context_projection.DEFECT_TEXT.get(code, code)
+                            for code in defects)
                         details = {
                             "error_kind": (
                                 type(error).__name__ if error
+                                else "RejectedSummary" if defects
                                 else "EmptyResponse"),
                             "error": (
                                 str(error) if error
+                                else f"摘要被拒收：{rejected}" if defects
                                 else f"provider 只输出思考 {reasoning_chars:,} 字"
                                 if reasoning_chars else "provider 返回空摘要"),
                         }
@@ -1579,22 +2061,29 @@ class Agent:
                     used = {"model": model, "gateway": gateway}
                     if succeeded:
                         break
-                    following = (attempts[step + 1]
-                                 if step + 1 < len(attempts) else None)
-                    if following is None or not self.compaction_should_attempt(
-                            following, error, summary, reasoning_chars):
+                    # 下一个**适用的**尝试，不是紧邻的下一个：主模型报错时「加大
+                    # 额度」不适用，但排在它后面的「换模型」适用。
+                    following = next(
+                        (candidate for candidate in attempts[step + 1:]
+                         if self.compaction_should_attempt(
+                             candidate, error, summary, reasoning_chars,
+                             defects)), None)
+                    if following is None:
                         break
                     yield {
                         "t": "route_warning",
                         "v": ("摘要没拿到正文（"
-                              + (f"思考吃光了 {params['max_tokens']:,} 额度"
+                              + ("摘要被拒收：" + "、".join(
+                                    context_projection.DEFECT_TEXT.get(code, code)
+                                    for code in defects) if defects else
+                                 f"思考吃光了 {params['max_tokens']:,} 额度"
                                  if reasoning_chars else
                                  str(error) if error else "空响应")
                               + f"），改用 {following['label']} 重试"),
                     }
                 result = self._finish_compaction(
                     plan, summary, error, reasoning_chars=reasoning_chars,
-                    used_route=used)
+                    used_route=used, defects=defects)
                 outcome = {
                     "attempted": True,
                     "interrupted": False,
@@ -1662,6 +2151,8 @@ class Agent:
                        "action": action}
                 return
             offered = self._offered_tools(effective_allowed_tools)
+            # 旁路请求（recap）要和主请求共用前缀才吃得到 prompt cache：记下形状。
+            self._last_request_shape = (offered, controls)
 
             try:
                 projection = self.project_context(
@@ -1970,8 +2461,13 @@ class Agent:
                 # 整个会话卡死。回传前把坏 arguments 替换为合法占位，
                 # 模型看到占位会自行重试调用。
                 message["tool_calls"] = _repair_truncated_calls(calls)
+            # 必须把**修好的**那份交给 controller：它会 `tool_calls or
+            # message["tool_calls"]` 优先取入参，再反写回 message，传原始
+            # `calls` 等于当场撤销上面的修复，坏 arguments 照样落盘（09-20
+            # 实测：一条坏消息让整个会话此后每次请求都 400）。
             action = controller.complete_response(
-                message, tool_calls=calls, usage=usage, reason=reason)
+                message, tool_calls=message.get("tool_calls") or calls,
+                usage=usage, reason=reason)
             self.messages.append(message)
 
             if decision_candidate is not None:
@@ -2997,6 +3493,7 @@ class Agent:
             deliver_inbox()
             # 工具 schema 也是输入预算的一部分；plan mode 只投影只读工具。
             offered = self._offered_tools(effective_allowed_tools)
+            self._last_request_shape = (offered, None)
 
             try:
                 projection = self.project_context(offered)

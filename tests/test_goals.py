@@ -684,8 +684,10 @@ class GoalCommandTests(unittest.TestCase):
         replay = CLI.format_resume_replay(record["messages"], limit=20)
         self.assertNotIn("<goal_round>", replay)
         self.assertIn("human objective", replay)
-        recap = CLI.format_recap(record, replay_limit=20)
-        self.assertNotIn("Objective: x", recap)
+        # recap 现在由模型现写；对内部续轮提示的保证变成：它不算人的提问，
+        # 不能拿来凑「够 3 条才 recap」的数。
+        self.assertEqual(
+            CLI.AWAY_RECAP.real_user_messages(record["messages"]), 1)
 
     def test_allowed_goal_tool_is_hidden_without_active_goal(self):
         fake = SimpleNamespace(

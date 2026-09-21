@@ -121,10 +121,15 @@ class PostToolUse(unittest.TestCase):
         marker = os.path.join(tempfile.gettempdir(), "kc_post_hook_marker")
         if os.path.exists(marker):
             os.remove(marker)
+        # hook 命令是交给 bash 跑的：Windows 路径里的反斜杠在 bash 里是转义符，
+        # `touch C:\Users\...\kc_post_hook_marker` 会被读成一个叫
+        # `C:Users...kc_post_hook_marker` 的相对文件，落在**当前工作目录**里
+        # （实测在仓库根目录留下过这么一个文件）。正斜杠两个平台都认。
+        marker_sh = marker.replace(chr(92), "/")
         prev = dict(tools.HOOK_CTX)
         try:
             tools.HOOK_CTX["cfg"] = cfg_with(
-                "PostToolUse", "list_dir", f"touch {marker}; exit 2")
+                "PostToolUse", "list_dir", f"touch {marker_sh}; exit 2")
             prepared = tools.prepare(
                 "list_dir", {"path": "/tmp"}, workspace_root="/tmp")
             out = tools.run("list_dir", prepared)

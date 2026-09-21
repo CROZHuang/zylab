@@ -49,6 +49,35 @@ def _user_sandbox_cfg():
     return sandbox if isinstance(sandbox, dict) else {}
 
 
+def home_dir():
+    """家目录。**`$HOME` 在所有平台上都算数。**
+
+    `os.path.expanduser("~")` 在 Windows 上只认 `USERPROFILE` /
+    `HOMEDRIVE+HOMEPATH`，**完全忽略 `HOME`**。而 `HOME` 正是测试用来把状态
+    重定向到临时目录的那根杠杆（AGENTS.md §3：跑测试不该改用户的真实数据）——
+    在 Windows 上它静默失效，于是测试会写进真实的 `~/.zylab`。
+    POSIX 上 expanduser 本来就优先取 $HOME，这里行为一字不变。
+    """
+    explicit = os.environ.get("HOME")
+    if explicit:
+        return Path(explicit)
+    resolved = os.path.expanduser("~")
+    if not os.path.isabs(resolved):
+        # `expanduser` **解析不出来时原样返回 "~"**（Windows 上 HOME /
+        # USERPROFILE / HOMEDRIVE+HOMEPATH 都缺失就会这样，最小 env 的子进程
+        # 测试里很常见）。照着它建目录，会在**当前工作目录**下造出一个名字
+        # 就叫 `~` 的文件夹，把整棵状态树倒进去 —— 实测在仓库根目录里造出了
+        # `./~/.zylab/`。宁可退到临时目录，也不要把状态撒进随便哪个 cwd。
+        import tempfile
+        for candidate in (os.environ.get("USERPROFILE"),
+                          (os.environ.get("HOMEDRIVE", "")
+                           + os.environ.get("HOMEPATH", "")) or None):
+            if candidate and os.path.isabs(candidate):
+                return Path(candidate)
+        return Path(tempfile.gettempdir()) / f".{APP_NAME}-nohome"
+    return Path(resolved)
+
+
 def env_prefix():
     return APP_NAME.upper() + "_"
 
@@ -87,7 +116,7 @@ def portable_home():
 
 
 def default_home():
-    return Path(os.path.expanduser("~")) / f".{APP_NAME}"
+    return home_dir() / f".{APP_NAME}"
 
 
 def is_portable():
@@ -116,7 +145,7 @@ def user_md_name():
 
 def user_config_key_file():
     """XDG 风格的 `~/.config/zylab/keys.env`：换 HOME 即生效，不探测。"""
-    return Path(os.path.expanduser("~")) / ".config" / APP_NAME / "keys.env"
+    return home_dir() / ".config" / APP_NAME / "keys.env"
 
 
 def protected_paths():
@@ -184,11 +213,44 @@ def under_protected(path):
     return False
 
 
+def path_under(value, roots):
+    """value 是否等于某个 root、或落在它之下。**所有前缀式路径守卫的唯一实现。**
+
+    纯字符串比较，调用方自己决定要不要先 realpath（与旧的 `is_protected` 同约定）。
+
+    Windows 上**不能**按 `root + "/"` 比：那里的分隔符是 `\\`，盘符大小写和
+    `D:/archive` / `d:\\archive\\` 这些等价写法也都要认。原来的写法在 Windows 上
+    恒为 False —— 也就是说声明了受保护路径、词法守卫却一条都拦不住，而界面上
+    看不出任何异常（2026-09-17 实测）。
+
+    以前 `core/paths.is_protected`、`core/tools._under_protected`、
+    `core/tools._under_state_dir` 各写了一遍同一个前缀比较，于是同一个平台 bug
+    要修三处。收敛到这里：**POSIX 分支保持原表达式，一字未动。**
+    """
+    value = str(value)
+    if sys.platform != "win32":
+        return any(value == root or value.startswith(root + "/")
+                   for root in roots if root)
+    normalized = os.path.normcase(os.path.normpath(value))
+    _, value_rest = os.path.splitdrive(normalized)
+    for root in roots:
+        if not root:
+            continue
+        stem = os.path.normcase(os.path.normpath(str(root)))
+        root_drive, root_rest = os.path.splitdrive(stem)
+        # 声明里带盘符（`D:\archive`）就只守那个盘；不带盘符的 `/archive`
+        # 在 Windows 上是**盘符相对**写法，对任何盘上的同名路径都生效 ——
+        # 守多了只是拒绝写入，守漏了才是事故。
+        target, stem = (normalized, stem) if root_drive else (value_rest, root_rest)
+        if target == stem or target.startswith(
+                stem if stem.endswith(os.sep) else stem + os.sep):
+            return True
+    return False
+
+
 def is_protected(path):
     """path 是否落在任一受保护路径内（字符串比较；调用方自己决定要不要先 realpath）。"""
-    value = str(path)
-    return any(value == root or value.startswith(root + "/")
-               for root in protected_paths())
+    return path_under(path, protected_paths())
 
 
 def machine_facts():

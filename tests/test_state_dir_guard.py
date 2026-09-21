@@ -17,6 +17,11 @@ import zylab
 from core import agent as A, store, tools
 
 STATE = os.path.realpath(str(store.HOME))
+# 嵌进 bash 命令串里的那份拼写。Windows 路径带反斜杠，而 bash（以及守卫用来
+# 切词的 shlex posix 模式）把反斜杠当转义符 —— 不换成正斜杠的话，
+# 命令在真 bash 里也会被吃掉分隔符，测的就不是守卫了。
+# POSIX 上没有反斜杠，这行是恒等变换。
+STATE_SH = STATE.replace(chr(92), "/")
 
 
 def risk(command, cwd="/tmp"):
@@ -26,12 +31,12 @@ def risk(command, cwd="/tmp"):
 class BashStateDirTests(unittest.TestCase):
     def test_mutations_under_the_state_dir_are_high_risk(self):
         cases = [
-            f"rm -v {STATE}/sessions/a.json {STATE}/sessions/b.json",
-            f"sed -i 's/x/y/' {STATE}/settings.json",
-            f"echo '{{}}' > {STATE}/settings.json",
-            f"cd {STATE}/sessions && rm -v a.json",
-            f"python3 - <<'EOF'\nimport json\np='{STATE}/settings.json'\nd=json.load(open(p))\njson.dump(d, open(p,'w'))\nEOF",
-            f"cp /tmp/x.env {STATE}/keys.env",
+            f"rm -v {STATE_SH}/sessions/a.json {STATE_SH}/sessions/b.json",
+            f"sed -i 's/x/y/' {STATE_SH}/settings.json",
+            f"echo '{{}}' > {STATE_SH}/settings.json",
+            f"cd {STATE_SH}/sessions && rm -v a.json",
+            f"python3 - <<'EOF'\nimport json\np='{STATE_SH}/settings.json'\nd=json.load(open(p))\njson.dump(d, open(p,'w'))\nEOF",
+            f"cp /tmp/x.env {STATE_SH}/keys.env",
         ]
         for command in cases:
             with self.subTest(command=command[:60]):
@@ -42,10 +47,10 @@ class BashStateDirTests(unittest.TestCase):
 
     def test_reads_and_unrelated_writes_are_not_flagged(self):
         cases = [
-            f"cat {STATE}/settings.json",
-            f"ls -la {STATE}/sessions | head",
-            f"grep -rn workflow {STATE}/sessions/",
-            f"python3 -c \"import json; print(json.load(open('{STATE}/settings.json')))\"",
+            f"cat {STATE_SH}/settings.json",
+            f"ls -la {STATE_SH}/sessions | head",
+            f"grep -rn workflow {STATE_SH}/sessions/",
+            f"python3 -c \"import json; print(json.load(open('{STATE_SH}/settings.json')))\"",
             "rm -v /tmp/other.json",
             "sed -i 's/a/b/' /tmp/proj/app.py",
         ]
@@ -61,7 +66,7 @@ class WriteToolStateDirTests(unittest.TestCase):
     def test_write_tools_targeting_the_state_dir_carry_risk(self):
         for name in ("write_file", "edit_file"):
             value = tools._assess_state_write_risk(
-                name, {"path": f"{STATE}/settings.json"}, cwd="/tmp")
+                name, {"path": f"{STATE_SH}/settings.json"}, cwd="/tmp")
             self.assertIsNotNone(value)
             self.assertEqual(value.kinds, ("state_dir_mutation",))
         self.assertIsNone(tools._assess_state_write_risk(

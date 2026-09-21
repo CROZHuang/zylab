@@ -66,7 +66,7 @@ class RawImmutability(unittest.TestCase):
         raw_before = copy.deepcopy(ag.messages)
 
         def summarize(*args, **kwargs):
-            yield {"t": "text", "v": "## objective\nexact checkpoint"}
+            yield {"t": "text", "v": "## objective\nexact checkpoint\n## constraints\n- none\n## decisions\n- none\n## files_changed\n- none\n## evidence\n- none\n## pending\n- none\n## risks\n- none"}
             yield {"t": "done", "usage": {}, "reason": "stop"}
 
         with mock.patch.object(client, "stream_chat", summarize):

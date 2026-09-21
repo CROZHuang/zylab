@@ -62,7 +62,12 @@ class ModelHealthPolicy:
     probe_transient_base_ttl: float = 5 * 60
     probe_transient_max_ttl: float = 60 * 60
     circuit_failure_threshold: int = 3
-    circuit_open_ttl: float = 10 * 60
+    # 熔断时长是**指数退避的基数**，不是固定值：第一次开 base，其后每多一次
+    # 连续失败翻倍，上限 circuit_open_max_ttl。理由见 09-20 实测——唯一计入
+    # 熔断的 transient_http 按定义会自愈，网关 2 分钟就恢复了，固定 600s 等于
+    # 对一条已经健康的路由继续自我封锁 8 分钟。
+    circuit_open_ttl: float = 30
+    circuit_open_max_ttl: float = 10 * 60
 
     def __post_init__(self):
         durations = {
@@ -70,6 +75,7 @@ class ModelHealthPolicy:
             "probe_transient_base_ttl": self.probe_transient_base_ttl,
             "probe_transient_max_ttl": self.probe_transient_max_ttl,
             "circuit_open_ttl": self.circuit_open_ttl,
+            "circuit_open_max_ttl": self.circuit_open_max_ttl,
         }
         for name, value in durations.items():
             if not math.isfinite(float(value)) or float(value) <= 0:
@@ -83,6 +89,9 @@ class ModelHealthPolicy:
         if self.probe_transient_max_ttl < self.probe_transient_base_ttl:
             raise ValueError(
                 "probe_transient_max_ttl must be >= probe_transient_base_ttl")
+        if self.circuit_open_max_ttl < self.circuit_open_ttl:
+            raise ValueError(
+                "circuit_open_max_ttl must be >= circuit_open_ttl")
 
 
 DEFAULT_POLICY = ModelHealthPolicy()
@@ -330,7 +339,14 @@ def record_request_outcome(
     failures = int(current["consecutive_failures"] or 0) + 1
     current["consecutive_failures"] = failures
     if failures >= policy.circuit_failure_threshold:
-        proposed = at + policy.circuit_open_ttl
+        # 指数退避：刚到阈值开 base，之后每多一次连续失败翻倍，封顶 max。
+        # 瞬时抖动（503/网络）通常一两次就过去，短窗口让路由迅速回到可用；
+        # 真正持续坏掉的路由才会被逐步拉长到上限。
+        steps = failures - int(policy.circuit_failure_threshold)
+        ttl = min(
+            float(policy.circuit_open_ttl) * (2 ** max(0, steps)),
+            float(policy.circuit_open_max_ttl))
+        proposed = at + ttl
         try:
             existing = _stored_epoch(current, "circuit_open_until")
         except (TypeError, ValueError):
@@ -361,7 +377,11 @@ def route_decision(
 
     until = format_utc(until_epoch)
     kind = str(record.get("last_error_kind") or "transient failure")
-    warning = f"circuit open until {until}; last error: {kind}"
+    # 子串 "circuit open until" 与错误类别是对外契约（测试与 UI 都依赖），
+    # 倒计时只做追加：原始 UTC 时间戳对人没有意义，"还有 N 秒"才有。
+    remaining = max(0, int(round(float(until_epoch) - float(at))))
+    warning = (
+        f"circuit open until {until} (还有 {remaining}s); last error: {kind}")
     if explicit:
         return RouteDecision(
             True, True, bypassed=True, warning=warning,

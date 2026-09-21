@@ -862,7 +862,7 @@ class ManagedController(unittest.TestCase):
         def provider(model, messages, **kwargs):
             calls["n"] += 1
             if calls["n"] == 1:
-                yield {"t": "text", "v": "## objective\ncontinue"}
+                yield {"t": "text", "v": "## objective\ncontinue\n## constraints\n- none\n## decisions\n- none\n## files_changed\n- none\n## evidence\n- none\n## pending\n- none\n## risks\n- none"}
             else:
                 yield {"t": "text", "v": "done"}
             yield {"t": "done", "reason": "stop", "usage": {}}

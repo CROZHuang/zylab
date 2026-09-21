@@ -21,6 +21,7 @@
 4. **跨项目 memory 变更不可静默发生。** global 写入与所有删除都携带最终参数摘要；
    批准按参数 SHA-256 绑定到一次调用，执行层会重新计算并拒绝缺失或失配的批准。
 """
+import select
 from . import paths
 from . import wincompat
 import fnmatch
@@ -33,6 +34,7 @@ import re
 import signal
 import threading
 import shlex
+import shutil
 import subprocess
 import time
 from collections.abc import Mapping
@@ -43,7 +45,8 @@ from . import (checkpoints, goals as goal_runtime,
                graft as graft_runtime, models, plans, webfetch,
                sandbox as sandbox_runtime)
 
-MAX_OUT = 30000          # 单个工具结果的字符上限；80k 上下文经不起一次 cat 大文件
+MAX_OUT = 30000          # 单个工具结果在**捕获时**的字符上限（约 8K token）。投影里的「新鲜大结果」
+                         # 档（context.RECENT_LARGE_TOOL_CHARS）只做兜底，不得比它更严。
 MAX_READ_LINES = 2000
 BULK_DELETE_FILE_THRESHOLD = 100
 PROTECTED = tuple(paths.protected_paths())
@@ -52,6 +55,7 @@ PROTECTED = tuple(paths.protected_paths())
 # 配置放宽、被项目级配置收紧），这里只是没有配置时的兜底。
 SAFE = {
     "read_file", "list_dir", "glob", "grep", "todo_write", "subagent",
+    "memory_read",
     "goal_update", "goal_propose", "task_status",
     "context_status", "expand_output", "subagent_control",
     "graft_find_code", "graft_file_api", "graft_trace_calls",
@@ -355,11 +359,69 @@ def _backup(path, content=None):
         return None
 
 
+def bash_executable():
+    """Bash 的绝对路径。找不到就给一条能照着做的错，而不是 FileNotFoundError。
+
+    模型写的命令是 bash 语法（`&&`、管道、重定向、`$(...)`），所以 Windows 上
+    也必须是真 bash，不能换成 cmd/PowerShell —— 换了等于换一门语言，工具层的
+    词法守卫（按 bash 语义切词）也会跟着失准。Git for Windows 自带的
+    `bash.exe` 就是这个角色，Claude Code 在 Windows 上走的也是它。
+    """
+    for found in _bash_candidates():
+        if not _is_wsl_launcher(found):
+            return found
+    if wincompat.IS_WINDOWS:
+        raise Denied(
+            "Windows 上找不到可用的 bash —— Bash 工具需要它。\n"
+            "装 Git for Windows（https://git-scm.com/download/win），"
+            "它自带 bash.exe；装完确保 <Git>\\usr\\bin 或 <Git>\\bin 在 PATH 里。\n"
+            "（PATH 上 System32\\bash.exe 那个是 WSL 启动器，不算——它把命令送进另一个"
+            "文件系统命名空间，zylab 的路径守卫在那边一条也对不上。）\n"
+            "（模型写的是 bash 语法，换成 cmd/PowerShell 会同时让命令和安全守卫失准。）",
+            decision="bash_unavailable", source="hard_guard")
+    return "bash"
+
+
+def _bash_candidates():
+    """PATH 上所有叫 bash 的可执行文件，按 PATH 顺序。"""
+    seen = []
+    for entry in os.environ.get("PATH", os.defpath).split(os.pathsep):
+        if not entry:
+            continue
+        found = shutil.which("bash", path=entry)
+        if found and found not in seen:
+            seen.append(found)
+    if not seen:
+        found = shutil.which("bash")
+        if found:
+            seen.append(found)
+    return seen
+
+
+def _is_wsl_launcher(path):
+    """`C:\\Windows\\System32\\bash.exe` 是 WSL 启动器，不是本机 bash。
+
+    装了 WSL 的 Windows 默认就有它，而且 System32 在 PATH 上通常排得很靠前；
+    没装 Git for Windows（或它的 bin 排在后面）时 `shutil.which("bash")` 拿到的
+    就是这个。用它跑命令的后果不是「慢一点」而是**换了一台机器**：cwd 传的是
+    `C:\\Users\\x\\proj`，WSL 里根本不认；工具层守卫比的是 Windows 路径，
+    命令碰的是 `/mnt/c/...`，`_guard` / 状态目录守卫全部静默落空。宁可不跑。
+    """
+    if not wincompat.IS_WINDOWS:
+        return False
+    root = os.environ.get("SystemRoot") or os.environ.get("windir") or "C:\\Windows"
+    system_dirs = [os.path.join(root, d) for d in ("System32", "Sysnative", "SysWOW64")]
+    here = os.path.dirname(os.path.realpath(os.path.abspath(path)))
+    return paths.path_under(here, system_dirs)
+
+
 def _guard(path):
     """拒绝任何指向受保护路径的写操作。用 realpath 解析，符号链接绕不过去。"""
     rp = os.path.realpath(os.path.abspath(os.path.expanduser(str(path))))
     for p in PROTECTED:
-        if rp == p or rp.startswith(p + "/"):
+        # 逐个 root 比，是为了让报错里能指出**是哪条**声明拦下的。
+        # 比较本身走 paths.path_under（认 Windows 分隔符/盘符）。
+        if paths.path_under(rp, (p,)):
             raise Denied(
                 f"拒绝写入 {rp}\n"
                 f"{p} 被配置为只读归档，工具层硬守卫，配置与授权都不能放宽。\n"
@@ -415,11 +477,13 @@ def _guard_read(path, *, cwd=None, action="读取"):
             "工具结果就会随消息历史发往 provider。\n"
             "确需该文件的内容，请由用户手动粘贴必要片段。",
             decision="credential_path_denied", source="hard_guard")
-    if rp == root or rp.startswith(root + "/"):
+    # 用 paths.path_under 而不是 `root + "/"`：Windows 的分隔符是 `\`，
+    # 原写法在那里恒为 False —— workspace **内**的文件也会被判成越界，
+    # 于是 read_file/list_dir/glob/grep 全部读不到任何东西（2026-09-17 实测）。
+    if paths.path_under(rp, (root,)):
         return rp
-    for trusted in _trusted_read_roots(root):
-        if rp == trusted or rp.startswith(trusted + "/"):
-            return rp
+    if paths.path_under(rp, tuple(_trusted_read_roots(root))):
+        return rp
     raise Denied(
         f"拒绝{action} workspace 之外的路径：{rp}\n"
         f"当前 workspace：{root}\n"
@@ -460,13 +524,34 @@ _GUARD_ONLY_MUTATORS = {"rsync"}
 
 
 def _under_protected(rp):
-    return any(rp == p or rp.startswith(p + "/") for p in PROTECTED)
+    # PROTECTED 是模块全局（测试直接 patch 它），所以传显式 roots，而不是让
+    # paths 自己去读环境；比较本身收敛到 paths.path_under（认 Windows 分隔符/盘符）。
+    return paths.path_under(rp, PROTECTED)
+
+
+_MSYS_DRIVE = re.compile(r"^/(?:cygdrive/|mnt/)?([A-Za-z])(?=/|$)")
+
+
+def _from_shell_path(text):
+    """Git Bash / MSYS 的 `/c/Users/x`、`/cygdrive/c/...`、`/mnt/c/...` → `C:\\Users\\x`。
+
+    Windows 上模型跑的 shell 就是 Git Bash，它写出来的绝对路径多半是这种形态。
+    不还原的话 `os.path.abspath("/c/Users/x")` 会当成**当前盘**下的 `\\c\\Users\\x`，
+    于是受保护路径守卫和状态目录守卫都判不出来 —— 命令照跑，边界形同虚设。
+    POSIX 上原样返回（那里 `/c/...` 就是真的 /c）。
+    """
+    if not wincompat.IS_WINDOWS:
+        return text
+    match = _MSYS_DRIVE.match(text)
+    if match is None:
+        return text
+    return match.group(1).upper() + ":\\" + text[match.end():].lstrip("/")
 
 
 def _resolve_against(path, cwd):
     """把命令里的一个路径 token 解析成 realpath：先按 cwd 补齐相对路径，再 expanduser
     与 realpath —— `../../archive/x`、`~`、符号链接都走同一条路。"""
-    expanded = os.path.expanduser(str(path))
+    expanded = os.path.expanduser(_from_shell_path(str(path)))
     if not os.path.isabs(expanded):
         expanded = os.path.join(cwd, expanded)
     return os.path.realpath(os.path.abspath(expanded))
@@ -1064,7 +1149,7 @@ def _state_dir():
 
 
 def _under_state_dir(path, state):
-    return bool(state) and (path == state or path.startswith(state + "/"))
+    return bool(state) and paths.path_under(path, (state,))
 
 
 def _state_dir_mutation_evidence(command, *, cwd):
@@ -1268,6 +1353,7 @@ def _run_bash_direct(argv, *, cwd, timeout):
             cwd=cwd, **wincompat.popen_group_kwargs())
     except OSError as exc:
         raise RuntimeError(_redact_runtime_text(str(exc))) from exc
+    wincompat.attach_to_job(process)   # Windows：整棵树一次收（见 wincompat）
     capture = _BoundedCapture()
     redactor = task_runtime.KnownSecretRedactor()
     timed_out = False
@@ -1378,7 +1464,7 @@ def t_bash(command, timeout=120, network=False, background=False,
         # 不是「绕过受保护路径不变量」—— 那条从来不可被确认放宽。
         workspace = _read_workspace(_prepared, _execution_context)
         _guard_bash_unsandboxed(command, cwd=workspace)
-        argv, cwd = ["bash", "-lc", command], workspace
+        argv, cwd = [bash_executable(), "-lc", command], workspace
     marker = f"[{decision.marker}]"
     if decision.sandboxed:
         network_isolated = bool(
@@ -1415,19 +1501,80 @@ def t_read_file(path, offset=0, limit=MAX_READ_LINES, _prepared=None,
     except Exception as e:
         return f"[读取失败: {e}]"
     total = len(lines)
-    sel = lines[int(offset): int(offset) + int(limit)]
-    body = "\n".join(f"{i+int(offset)+1:>6}\t{l}" for i, l in enumerate(sel))
-    more = f"\n[共 {total} 行，显示 {int(offset)+1}-{int(offset)+len(sel)}]" if total > len(sel) else ""
-    return _clip(body) + more
+    offset, limit = max(0, int(offset)), max(0, int(limit))
+    sel = lines[offset: offset + limit]
+    # 按**整行**装到字符上限为止，没读完就给下一个 offset。以前是先拼好再 _clip：超过 30,000 字符
+    # 的窗口会在**文件中间**挖掉一段（头 2/3 + 尾 1/3），2026-09-20 在真实会话里 90 次读取有 10 次
+    # 如此——对命令输出这是对的形状（错误在结尾），对文件不是：模型要的是连续的行和「从哪接着读」。
+    rows, used = [], 0
+    for index, line in enumerate(sel):
+        row = f"{index + offset + 1:>6}\t{line}"
+        if rows and used + len(row) + 1 > MAX_OUT:
+            break
+        rows.append(row)
+        used += len(row) + 1
+    body = _clip("\n".join(rows))               # 只有单行就超限（压缩过的 JS 之类）才会真的截
+    shown = offset + len(rows)
+    if shown >= total and not offset:
+        return body
+    note = f"\n[共 {total} 行，显示 {offset + 1}-{shown}"
+    if shown < total:
+        capped = "（到单次 30,000 字符上限）" if len(rows) < len(sel) else ""
+        note += f"{capped}；后面还有 {total - shown} 行，接着读：offset={shown}"
+    return body + note + "]"
+
+
+def _detect_newline(raw):
+    """文件占多数的换行风格。只认 `\\r\\n` 与 `\\n` —— 裸 `\\r`（老 Mac）不在支持范围。"""
+    crlf = raw.count("\r\n")
+    lf = raw.count("\n") - crlf
+    return "\r\n" if crlf > lf else "\n"
+
+
+def _read_source(path):
+    """读源文件，返回 (归一化成 \\n 的文本, 原换行风格)。
+
+    `newline=""` 关掉 Python 的通用换行翻译，这样才**看得见**文件本来的换行；
+    匹配用归一化后的文本（模型写的 old/new 一律用 \\n）。
+    """
+    with open(path, "r", encoding="utf-8", newline="") as handle:
+        raw = handle.read()
+    return raw.replace("\r\n", "\n"), _detect_newline(raw)
+
+
+def _write_source(path, text, newline="\n"):
+    """按指定换行风格逐字写回。
+
+    **不能用 `write_text(...)` 的默认文本模式。** 那会把 `\\n` 翻成
+    `os.linesep`：Windows 上编辑一个 LF 文件的一个词，整份文件的换行会被
+    悄悄改成 CRLF —— git 里是全文件 diff，`#!/bin/sh` 脚本还会直接跑不起来
+    （2026-09-17 实测）。反过来在 POSIX 上编辑 CRLF 文件也会被压成 LF。
+    统一成「保留文件原有风格」，两个平台行为一致。
+    """
+    with open(path, "w", encoding="utf-8", newline="") as handle:
+        handle.write(text.replace("\n", newline) if newline != "\n" else text)
 
 
 def t_write_file(path, content, **_):
     rp = _guard(path)
+    # 只在**新建**时查保留名：已经存在的文件说明这名字在本机能用，再拦就是拦
+    # 用户自己的历史文件。
+    if wincompat.IS_WINDOWS and not Path(rp).exists():
+        problem = wincompat.reserved_path_problem(rp)
+        if problem:
+            return f"[拒绝新建：{problem}]"
     Path(rp).parent.mkdir(parents=True, exist_ok=True)
     existed = Path(rp).exists()
     # 覆盖前先备份。模型改错一个大文件时，这是唯一的退路。
     bak = _backup(rp) if existed else None
-    Path(rp).write_text(content, encoding="utf-8")
+    # 覆盖已有文件时沿用它原本的换行风格；新建文件按模型给的内容逐字写。
+    newline = "\n"
+    if existed:
+        try:
+            newline = _read_source(rp)[1]
+        except (OSError, UnicodeDecodeError):
+            newline = "\n"
+    _write_source(rp, content, newline)
     note = f"，原文已备份" if bak else ""
     return (f"[{'覆盖' if existed else '新建'} {rp}，"
             f"{len(content)} 字符 / {content.count(chr(10))+1} 行{note}]")
@@ -1438,15 +1585,17 @@ def t_edit_file(path, old, new, replace_all=False, **_):
     p = Path(rp)
     if not p.exists():
         return f"[不存在: {rp}]"
-    src = p.read_text(encoding="utf-8")
+    src, newline = _read_source(rp)
     n = src.count(old)
     if n == 0:
         return f"[未找到待替换内容。注意必须逐字匹配，含缩进和换行]"
     if n > 1 and not replace_all:
         return f"[匹配到 {n} 处，不唯一。请扩大 old 的上下文，或传 replace_all=true]"
     bak = _backup(rp)
-    p.write_text(src.replace(old, new) if replace_all else src.replace(old, new, 1),
-                 encoding="utf-8")
+    _write_source(
+        rp,
+        src.replace(old, new) if replace_all else src.replace(old, new, 1),
+        newline)
     return (f"[已改 {rp}，替换 {n if replace_all else 1} 处"
             f"{'，原文已备份' if bak else ''}]")
 
@@ -1539,142 +1688,160 @@ def t_glob(pattern, path=".", _task=None, _prepared=None,
     return body
 
 
+# ---------------------------------------------------------------- 搜索引擎
+# 排除清单按 2026-08-21 的实测文件分布定，不是拍脑袋：
+#   .cache 20.5% / venvs 18.8% / .vscode-server 10.9% / .cursor-server 5.8%
+# 这些是**工具和缓存**，排掉安全。项目数据再大也不排 —— 搜不到等于没有。
+#
+# 两个踩过的坑：
+#   1. 排除项匹配的是目录 **basename 而非路径** —— 曾把 "data" 放进去，
+#      结果搜索根目录自己被排掉，0.0s 返回「没匹配」，看起来像搜过了。
+#   2. 曾误排一个名字像临时目录、实际是主力工作区的目录，把最大的一坨项目
+#      代码整个搜不到。名字不是判据。
+# 判据：只排「重装就能重建」的东西，绝不排任何人写过的东西。
+_SEARCH_SKIP_DIRS = frozenset((
+    ".git", "__pycache__", "node_modules", ".venv", "venvs", "site-packages",
+    ".cache", ".vscode-server", ".vscode-remote-containers", ".cursor-server",
+    ".recyclebininternal"))
+# 只排二进制格式（读了也只会说「Binary file matches」，白费 I/O）。
+# **不排 *.jsonl** —— 整条流水线都是 JSONL，排掉等于让数据搜不到。
+_SEARCH_SKIP_GLOBS = (
+    "*.parquet", "*.zst", "*.bin", "*.safetensors", "*.pt", "*.pth",
+    "*.npy", "*.svs", "*.sdpc", "*.tif", "*.tiff", "*.png", "*.jpg")
+# 单个文件读多少就算了。超大文件多半是数据转储，不是源码。
+_SEARCH_MAX_FILE_BYTES = 8 * 1024 * 1024
+
+
+def _walk_search_tree(root, include_glob=None):
+    """产出待搜索的文件路径。
+
+    与 `grep -r` 对齐的几条：按 basename 排目录、**不跟随符号链接**
+    （那是 `-R` 才做的事，跟随会绕出 workspace，也会打转）、
+    include 只按 basename 匹配。
+    """
+    root = str(root)
+    if os.path.isfile(root):
+        yield root
+        return
+    for current, dirnames, filenames in os.walk(root, followlinks=False):
+        dirnames[:] = sorted(
+            name for name in dirnames
+            if name not in _SEARCH_SKIP_DIRS
+            and not os.path.islink(os.path.join(current, name)))
+        for name in sorted(filenames):
+            full = os.path.join(current, name)
+            if os.path.islink(full):
+                continue
+            if include_glob and not fnmatch.fnmatch(name, include_glob):
+                continue
+            if any(fnmatch.fnmatch(name, pat) for pat in _SEARCH_SKIP_GLOBS):
+                continue
+            yield full
+
+
+def _match_lines_in_file(path, matcher):
+    """产出 (行号, 该行原始字节)。
+
+    全程走**字节**：正则也编译成 bytes。这样既不必为每一行付解码成本，
+    也不会被非 UTF-8 的文件噎住（只在真正要输出时才解码，errors="replace"）。
+    含 NUL 的文件当二进制跳过 —— 与 grep 一致，不往结果里倒二进制。
+    """
+    try:
+        size = os.path.getsize(path)
+    except OSError:
+        return
+    if size > _SEARCH_MAX_FILE_BYTES:
+        return
+    try:
+        with open(path, "rb") as handle:
+            data = handle.read(_SEARCH_MAX_FILE_BYTES)
+    except (OSError, ValueError):
+        return
+    if b"\0" in data[:8192]:
+        return
+    if not matcher.search(data):
+        return          # 整文件一次否定，绝大多数文件到此为止
+    for index, raw in enumerate(data.split(b"\n"), start=1):
+        if raw.endswith(b"\r"):
+            raw = raw[:-1]
+        if matcher.search(raw):
+            yield index, raw
+
+
 def t_grep(pattern, path=".", glob=None, ignore_case=False, max_results=100,
            timeout=45, _task=None, _prepared=None,
            _execution_context=None, **_):
+    """在 workspace 内按正则搜索文本。**进程内实现，不依赖系统上的 grep。**
+
+    为什么不外包给 `grep`：那是一条会沉默失效的路，两个平台各踩过一次。
+      * Windows 上的 grep 来自 Git for Windows（MSYS），MSYS 运行时会对自己的
+        argv **再做一次 glob 展开** —— `["--include", "*.py"]` 变成
+        `--include a.py c.py`，过滤器只剩第一个文件，其余文件名还成了额外的
+        搜索路径；`["-e", "*.py"]` 更糟，搜的直接不是用户要的东西。
+      * GNU grep 把 include/exclude 放进同一张有序表、按「先匹配者胜」处理，
+        `--include` 排在 `--exclude` 之后就整条失效（实测 grep 3.0，与平台无关）。
+      * 机器上根本没有 grep 时，只能给一句「去装 Git for Windows」。
+
+    这些都不是「修好某一版就完了」的问题，而是**依赖外部工具**本身带来的。
+    现在整棵树的遍历、过滤、匹配都在进程内完成：两个平台字节级一致，
+    装没装 Git 都一样能搜。
+
+    **一处刻意的语义变化**：正则方言从 grep 的 POSIX BRE 换成 Python `re`
+    （≈ PCRE）。模型写出来的几乎都是 PCRE 风格（`\\d`、`(a|b)`、`+?`），
+    BRE 里这些要么要转义要么不支持 —— 换过来是对齐，不是妥协。
+    """
     read_root = _read_workspace(_prepared, _execution_context)
     search_path = _guard_read(path, cwd=read_root, action="搜索")
-    # 必须是 grep -r。本机没有 ripgrep 二进制，子进程里 rg 会 127 not found。
-    # -H + --null 把 filename 与正文用 NUL 分开：正文进入 tool result 前逐条
-    # 重新过 hard guard，递归扫描命中的 keys.env / .ssh / 越界 symlink 不会泄漏。
-    cmd = ["grep", "-rHn", "--null", "--color=never"]
-    if ignore_case:
-        cmd.append("-i")
-    # 排除清单按 2026-08-21 的实测文件分布定，不是拍脑袋：
-    #   .cache 20.5% / venvs 18.8% / .vscode-server 10.9% / .cursor-server 5.8%
-    # 这些是**工具和缓存**，排掉安全。项目数据再大也不排 —— 搜不到等于没有。
-    #
-    # 两个踩过的坑：
-    #   1. `--exclude-dir` 匹配的是目录 **basename 而非路径** —— 曾把 "data" 放进去，
-    #      结果搜索根目录自己被排掉，0.0s 返回「没匹配」，看起来像搜过了。
-    #   2. 曾误排一个名字像临时目录、实际是主力工作区的目录，把最大的一坨项目
-    #      代码整个搜不到。名字不是判据。
-    # 判据：只排「重装就能重建」的东西，绝不排任何人写过的东西。
-    for ex in (".git", "__pycache__", "node_modules", ".venv", "venvs", "site-packages",
-               ".cache", ".vscode-server", ".vscode-remote-containers", ".cursor-server",
-               ".recyclebininternal"):
-        cmd += ["--exclude-dir", ex]
-    # 只排二进制格式（grep 读了也只会说 "Binary file matches"，白费 I/O）。
-    # **不排 *.jsonl** —— 这台机器的整条流水线都是 JSONL，排掉等于让数据搜不到。
-    for ex in ("*.parquet", "*.zst", "*.bin", "*.safetensors", "*.pt", "*.pth",
-               "*.npy", "*.svs", "*.sdpc", "*.tif", "*.tiff", "*.png", "*.jpg"):
-        cmd += ["--exclude", ex]
-    if glob:
-        cmd += ["--include", glob]
-    cmd += ["-e", pattern, search_path]
-
-    # 流式读取而不是 subprocess.run(timeout=)，为了两件事：
-    #   1. **够数即停。** 凑满 max_results 就杀掉 grep，不再扫完整棵树。
-    #      绝大多数搜索命中都在前面，这一条省掉的时间比任何排除列表都多。
-    #   2. **超时也要交出已搜到的。** run(timeout=) 会把部分输出连同异常一起丢掉，
-    #      白等 45 s 还什么都不给。部分结果 + 明确标注「没搜完」远好过空手而归。
-    #
-    # 为什么必须这样：实测过一个约 100 GiB 可搜文本的工作区，大头是几万个
-    # 1–20 MiB 的中等文件（按大小设上限也砍不掉），卷速约 74 MB/s ——
-    # 全树 grep 要二十多分钟。这不是能靠调参解决的，只能「早停 + 说实话」。
-    proc = subprocess.Popen(
-        cmd, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
-        **wincompat.popen_group_kwargs(bool(_task)))
-    if _task is not None:
-        _task.bind_process(proc, managed_output=False)
-    fd = proc.stdout.fileno()
-    buf, lines = b"", []
-    pending_file = None
-
-    def drain_records(*, final=False):
-        nonlocal buf, pending_file
-        while True:
-            if pending_file is None:
-                split_at = buf.find(b"\0")
-                if split_at < 0:
-                    break
-                pending_file = buf[:split_at]
-                buf = buf[split_at + 1:]
-            line_end = buf.find(b"\n")
-            if line_end < 0:
-                if not final or not buf:
-                    break
-                payload = buf
-                buf = b""
-            else:
-                payload = buf[:line_end]
-                buf = buf[line_end + 1:]
-            filename = pending_file.decode("utf-8", "replace")
-            pending_file = None
-            safe = _visible_read_path(
-                filename, cwd=read_root, action="返回搜索结果")
-            if safe is None:
-                continue
-            lines.append(
-                f"{safe}:{payload.decode('utf-8', 'replace')}")
-    deadline = time.time() + timeout
-    timed_out = capped = eof = cancelled = False
     try:
-        while True:
-            if _task is not None and _task.is_cancelled():
-                cancelled = True
+        matcher = re.compile(
+            pattern.encode("utf-8", "surrogateescape"),
+            re.IGNORECASE if ignore_case else 0)
+    except re.error as exc:
+        return f"[正则无效：{exc}]"
+
+    lines = []
+    deadline = time.time() + max(0.0, float(timeout))
+    timed_out = capped = cancelled = False
+    scanned = 0
+    for candidate in _walk_search_tree(search_path, glob):
+        if _task is not None and _task.is_cancelled():
+            cancelled = True
+            break
+        if time.time() >= deadline:
+            timed_out = True
+            if _task is not None:
+                _task.request_timeout()
+            break
+        # 每个命中文件仍然逐条过读闸：递归扫到的凭据文件、越界 symlink
+        # 一律静默隐藏（与外包给 grep 时 `--null` 逐记录复核的效果一致）。
+        safe = _visible_read_path(
+            candidate, cwd=read_root, action="返回搜索结果")
+        if safe is None:
+            continue
+        scanned += 1
+        for lineno, raw in _match_lines_in_file(candidate, matcher):
+            lines.append(
+                f"{safe}:{lineno}:{raw.decode('utf-8', 'replace')}")
+            if len(lines) >= max_results:
+                capped = True
                 break
-            left = deadline - time.time()
-            if left <= 0:
-                timed_out = True
-                if _task is not None:
-                    _task.request_timeout()
-                break
-            ready = wincompat.wait_pipe_readable(
-                fd, min(0.05 if _task is not None else 0.5, left))
-            if ready:
-                chunk = os.read(fd, 1 << 16)
-                if not chunk:
-                    eof = True
-                    drain_records(final=True)
-                    break
-                buf += chunk
-                drain_records()
-                if len(lines) >= max_results:
-                    capped = True
-                    break
-            elif proc.poll() is not None:
-                eof = True
-                break
-    finally:
-        if proc.poll() is None:
-            if _task is not None and (cancelled or timed_out):
-                _task.ensure_process_stopped(proc)
-            else:
-                proc.kill()
-        rc = proc.wait()
-        if _task is not None:
-            _task.record_returncode(rc)
-            _task.unbind_process(proc)
-        if proc.stdout is not None:
-            proc.stdout.close()
+        if capped:
+            break
 
     if cancelled:
         body = _clip("\n".join(lines[:max_results]))
         if body:
             return body + "\n[grep 已取消；以上只是取消前的部分结果]"
         return "[grep 已取消，未完成扫描]"
-    if eof and rc == 127:
-        return "[grep 未找到 —— 这是命令不存在，不是没搜到]"
     skipped = ("已跳过：缓存/虚拟环境/编辑器目录、二进制格式、凭据路径"
                + (f"、非 {glob} 的文件" if glob else ""))
     if not lines:
         if timed_out:
             # 「超时」绝不能读成「不存在」—— 这是本机 F1「asserting absence」的原样复现。
             return (f"[搜索超时 {timeout}s，**没搜完**，因此不能断定 '{pattern}' 不存在。\n"
-                    f" {search_path} 这棵树按 74 MB/s 要读几十分钟。\n"
+                    f" {search_path} 这棵树太大，读不完。\n"
                     f" 缩小 path，或加 glob 限定文件类型（如 glob='*.py'）再搜。]")
-        return f"[没有匹配 '{pattern}'（grep 跑完了，确实没有）。{skipped}]"
+        return f"[没有匹配 '{pattern}'（搜完了，确实没有）。{skipped}]"
 
     body = _clip("\n".join(lines[:max_results]))
     if timed_out:
@@ -1711,7 +1878,7 @@ def _memory_stable_key(value):
 
 
 def t_memory_write(content, title=None, scope="project", stable_key=None,
-                   **kwargs):
+                   type=None, description=None, **kwargs):
     """Persist one model-judged fact through the local memory authority."""
     from . import memory as memory_db
     execution = _memory_context(kwargs.get("_execution_context"))
@@ -1729,12 +1896,33 @@ def t_memory_write(content, title=None, scope="project", stable_key=None,
         },
         kind="explicit",
         stable_key=key,
+        entry_type=type,
+        description=description,
     )
     key_note = f" · stable_key={key}" if key else ""
     return (
         f"[memory saved {row['id']} · {row['scope']} · explicit"
         f"{key_note} · secret-redacted]"
     )
+
+
+def t_memory_read(target="", **kwargs):
+    """取回一条记忆的正文。
+
+    system 里常驻的只是**一行钩子**的索引（每条约 68 token）；正文在这里按需取。
+    以前正文是全量塞进 system 的，模型反而没有取回的手段——7 条垃圾 handoff 就占了
+    4,339 token，而真正需要细节时它什么也做不了。
+    """
+    from . import memory as memory_db
+    target = str(target or "").strip()
+    if not target:
+        raise ValueError("memory_read 必须提供 target（索引行里的 m-… id）")
+    _memory_context(kwargs.get("_execution_context"))
+    view = memory_db.MemoryStore().render_entry(
+        target,
+        cwd=_read_workspace(kwargs.get("_prepared"),
+                            kwargs.get("_execution_context")))
+    return view["text"]
 
 
 def t_memory_forget(identifier, **kwargs):
@@ -2022,12 +2210,13 @@ def t_context_status(**kwargs):
 def t_expand_output(target="", page=1, **kwargs):
     """取回被折叠的工具输出原文。
 
-    旧工具结果在投影里会被换成带 `artifact=sha256:…` 的占位，正文仍在磁盘上。
-    以前只有用户能 `/expand`，模型只能把昂贵的命令重跑一遍。
+    旧工具结果在投影里会被换成带 `artifact=sha256:…` 的占位，原文仍在会话记录里。
+    以前只有用户能 `/expand`，模型只能把昂贵的命令重跑一遍。target 认占位里**写出来的**那个
+    `sha256:…`：早先只认 tool_call_id / task_id，而占位里两样都没有，模型从来没调成过。
     """
     target = str(target or "").strip()
     if not target:
-        raise ValueError("expand_output 必须提供 target（tool_call_id 或 task_id）")
+        raise ValueError("expand_output 必须提供 target（占位里的 sha256:…，或 task_id）")
     try:
         page = int(page)
     except (TypeError, ValueError):
@@ -2038,7 +2227,16 @@ def t_expand_output(target="", page=1, **kwargs):
     if callback is None:
         raise RuntimeError("当前 runtime 没有绑定 expand 通道")
     result = callback({"target": target, "page": page})
-    return json.dumps(result, ensure_ascii=False, sort_keys=True)
+    if not isinstance(result, dict) or result.get("error") or "text" not in result:
+        return json.dumps(result, ensure_ascii=False, sort_keys=True)
+    # 原文按原样给，不裹进 JSON：整页文本转义后换行全变成 \n，既费 token 又难读。
+    more = (f"还有下一页：page={result.get('next_page')}" if result.get("has_more")
+            else "已到末尾")
+    missing = result.get("missing_streams") or []
+    lost = f"；这些流的落盘文件已不在：{'、'.join(map(str, missing))}" if missing else ""
+    return (f"[expand_output target={result.get('target')} page={result.get('page')} "
+            f"total_bytes={result.get('total_bytes')}；{more}{lost}]\n"
+            + str(result.get("text") or ""))
 
 
 SUBAGENT_CONTROL_ACTIONS = ("list", "peek", "send")
@@ -2891,6 +3089,7 @@ IMPL = {"bash": t_bash, "read_file": t_read_file, "write_file": t_write_file,
         "context_status": t_context_status,
         "expand_output": t_expand_output,
         "goal_propose": t_goal_propose,
+        "memory_read": t_memory_read,
         "memory_write": t_memory_write, "memory_forget": t_memory_forget,
         "web_fetch": t_web_fetch,
         "graft_find_code": t_graft_find_code,
@@ -2975,9 +3174,11 @@ SCHEMA = [
                         "工作时，先看看还剩多少，必要时改用 subagent 把调研隔离出去。",
        {}, []),
     _f("expand_output", "取回被折叠的工具输出原文。旧工具结果在上下文里会被换成带 "
-                       "`artifact=sha256:…` 的占位；正文仍在磁盘上，用这个按页取回，"
-                       "**不要重跑昂贵的命令**。target 用占位里的 tool_call_id 或 task_id。",
-       {"target": {"type": "string", "description": "tool_call_id 或 task_id"},
+                       "`artifact=sha256:…` 的占位；原文没有丢，用这个按页取回，"
+                       "**不要重跑昂贵的命令**。target 照抄占位里的 `sha256:…`；"
+                       "后台任务用 task_id。",
+       {"target": {"type": "string",
+                   "description": "占位里的 sha256:…（照抄），或 task_id / tool_call_id"},
         "page": {"type": "integer", "minimum": 1, "description": "第几页，默认 1"}},
        ["target"]),
     _f("graft_index", "查看或构建结构索引。索引缺失/过期时，graft_* 查询工具会失败 —— "
@@ -2998,7 +3199,8 @@ SCHEMA = [
         "tail": {"type": "integer",
                  "description": "action=output 时取最后多少字符，默认 4000"}},
        []),
-    _f("read_file", "读取文件内容，带行号。大文件用 offset/limit 分段读。",
+    _f("read_file", "读取文件内容，带行号。一次最多返回约 30,000 字符的**连续整行**；没读完时"
+                    "末尾会给出接着读的 offset。",
        {"path": {"type": "string"}, "offset": {"type": "integer", "description": "起始行(0基)"},
         "limit": {"type": "integer", "description": "最多读多少行，默认 2000"}}, ["path"]),
     _f("write_file", "写入文件，已存在则整体覆盖。局部修改请用 edit_file。",
@@ -3010,7 +3212,9 @@ SCHEMA = [
     _f("list_dir", "列出目录内容。", {"path": {"type": "string"}}, []),
     _f("glob", "按文件名模式递归查找文件，按修改时间新到旧排序。如 '*.py'。",
        {"pattern": {"type": "string"}, "path": {"type": "string"}}, ["pattern"]),
-    _f("grep", "在文件内容里递归搜索正则。可用 glob 限定文件类型，如 '*.py'。",
+    _f("grep", "在文件内容里递归搜索正则。**Python 正则方言**（`\\d`、`(a|b)`、"
+               "`+?` 直接可用，不是 grep 的 BRE）。可用 glob 限定文件类型，"
+               "如 '*.py'。进程内实现，与系统上装没装 grep 无关。",
        {"pattern": {"type": "string"}, "path": {"type": "string"},
         "glob": {"type": "string", "description": "如 '*.py'"},
         "ignore_case": {"type": "boolean"}}, ["pattern"]),
@@ -3053,9 +3257,14 @@ SCHEMA = [
                     "按 host 自动选路由：声明为直连的 host 走直连，"
                     "其余走代理，失败自动换路由重试。"
                     "pypi.org 本机全路由不通，会直接提示改用清华镜像。"
-                    "查文档、核对 API、看报错解释时用它；sandbox 内 bash 默认断网。",
+                    "查文档、核对 API、看报错解释时用它；sandbox 内 bash 默认断网。"
+                    "它只抓取**给定的 URL**，不是搜索引擎：搜索结果页常被反爬或"
+                    "在当前网络下不可达，需要检索时优先用带查询接口的站点"
+                    "（如 Wikipedia REST 搜索、GitHub 搜索 API），失败就如实告诉用户。",
        {"url": {"type": "string", "description": "http/https URL"},
-        "timeout": {"type": "number", "description": "秒，默认 20，上限 60"}},
+        "timeout": {"type": "number", "description":
+                    "秒，默认 20，上限 60。这是**每条路由的墙钟上限**"
+                    "（最多两条路由，最坏合计 2×timeout）"}},
        ["url"]),
     _f("consult_session", "向另一个已保存 chat 的最后一次原子快照发起只读咨询。"
                            "目标 chat 不会切换、resume 或被写入；咨询固定使用目标"
@@ -3212,6 +3421,11 @@ SCHEMA = [
            "values": {"type": "object",
                       "description": "配方参数（${param} 字面替换）"},
        }, ["action"]),
+    _f("memory_read", "取回一条长期记忆的正文。system 里的 <memory-index> 只有一行钩子；"
+                     "觉得某条与当前任务相关就用它取正文，**不要凭标题猜内容**。"
+                     "target 照抄索引行开头的 m-… id。",
+       {"target": {"type": "string", "description": "索引行里的 m-… id"}},
+       ["target"]),
     _f("memory_write", "把一条真正值得跨会话保留的长期记忆写入本地 memory。"
                       "只记用户稳定偏好/约束及原因、带测量方法的实测结论、"
                       "明确否决方案及理由、或不含凭据的外部资源指针。"
@@ -3226,6 +3440,12 @@ SCHEMA = [
                      "description": "默认 project；仅跨项目偏好才用 global"},
            "stable_key": {"type": "string", "maxLength": 160,
                           "description": "同一语义事实的稳定键；更新时必须复用"},
+           "type": {"type": "string",
+                    "enum": ["user", "feedback", "project", "reference"],
+                    "description": "user=用户是谁/长期偏好；feedback=对你工作方式的要求；"
+                                   "project=在做的事与约束；reference=外部资源指针"},
+           "description": {"type": "string", "maxLength": 200,
+                           "description": "一行钩子，进索引。必须带上以后会用来找它的词"},
        }, ["content"]),
     _f("memory_forget", "删除一条错误、过期或不应持久保存的 memory。"
                          "identifier 使用 memory index 中的 m-* id 或唯一前缀。",
@@ -3442,6 +3662,41 @@ def _prepare_bash_sandbox(
     return decision, capabilities, prepared_command
 
 
+# 会产生副作用、或把文字交给别处长期保存/执行的工具。只读的搜索类工具不拦：
+# 开发 zylab 自己时，搜这个标记本身是正当需求。
+_MARKER_GUARDED_TOOLS = frozenset({
+    "write_file", "edit_file", "bash", "memory_write", "todo_write",
+    "subagent", "workflow", "goal_propose", "goal_update"})
+
+
+def _strings_in(value, depth=0):
+    if isinstance(value, str):
+        yield value
+    elif depth < 4 and isinstance(value, Mapping):
+        for item in value.values():
+            yield from _strings_in(item, depth + 1)
+    elif depth < 4 and isinstance(value, (list, tuple)):
+        for item in value:
+            yield from _strings_in(item, depth + 1)
+
+
+def _refuse_projection_markers(name, args):
+    """参数里带着上下文投影的占位符 → 拒绝。那不是内容，是 harness 放进旧消息的省略标记。"""
+    if name not in _MARKER_GUARDED_TOOLS:
+        return
+    from .context import PROJECTION_MARKER            # 延迟 import，避开循环依赖
+    for text in _strings_in(args):
+        hit = PROJECTION_MARKER.search(text)
+        if hit:
+            raise Denied(
+                f"参数里出现了上下文投影的占位符（{hit.group(0)}…）。那不是内容：它是 harness "
+                "为了省 token 放进**旧消息**里的省略标记，你在历史里看到的被截短的参数，"
+                "原件当时是完整的。把它写进文件或命令只会毁掉真实内容/让命令残缺。\n"
+                "请重新给出**完整的真实内容**，一个字都不要用占位符代替；需要旧内容就重新读文件。"
+                "（如果你只是在搜索这个标记本身，换成不含该字面量的写法，例如只搜「参数投影」。）",
+                decision="projection_marker_in_arguments", source="context_guard")
+
+
 def prepare(name, args, *, on_note=None, context=None, workspace_root=None):
     """Run PreToolUse exactly once and freeze its final arguments.
 
@@ -3477,6 +3732,7 @@ def prepare(name, args, *, on_note=None, context=None, workspace_root=None):
             note(f"PreToolUse hook 异常，已放行：{type(exc).__name__}: {exc}")
     if not isinstance(final_args, dict):
         raise TypeError("PreToolUse 最终 args 必须是 object")
+    _refuse_projection_markers(name, final_args)
     effective_workspace_root = _canonical_workspace_root(
         workspace_root or getattr(context, "workspace_root", "") or os.getcwd())
     prepared_write = None

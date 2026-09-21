@@ -1,15 +1,10 @@
 """Real-PTY regression coverage for the M4a session picker workflow."""
 
-import fcntl
 import json
 import os
-import pty
 import re
-import select
-import struct
 import subprocess
 import sys
-import termios
 import textwrap
 import time
 import unittest
@@ -17,6 +12,9 @@ from pathlib import Path
 
 
 ROOT = Path(__file__).resolve().parent.parent
+sys.path.insert(0, str(ROOT))
+
+from tests.pty_harness import RawPTY  # noqa: E402
 
 
 class SessionPickerPTYTests(unittest.TestCase):
@@ -30,7 +28,10 @@ repo = os.environ["ZYLAB_TEST_REPO"]
 import sys
 sys.path.insert(0, repo)
 
-with tempfile.TemporaryDirectory(prefix="zylab-picker-") as root:
+# ignore_cleanup_errors：child 退出时 zylab 仍握着状态目录里的文件，
+# Windows 上删不掉（平台语义，不是缺陷）；POSIX 上照样删得掉。
+with tempfile.TemporaryDirectory(
+        prefix="zylab-picker-", ignore_cleanup_errors=True) as root:
     home = os.path.join(root, "home")
     workspace = os.path.join(root, "workspace")
     os.makedirs(home)
@@ -170,14 +171,6 @@ print("RESULT:" + json.dumps(result, ensure_ascii=False))
 """
 
     def setUp(self):
-        master, slave = pty.openpty()
-        # A stable, reasonably wide viewport avoids testing clipping here; the
-        # picker renderer has separate narrow-terminal unit coverage.
-        fcntl.ioctl(
-            slave,
-            termios.TIOCSWINSZ,
-            struct.pack("HHHH", 40, 140, 0, 0),
-        )
         env = os.environ.copy()
         env["ZYLAB_TEST_REPO"] = str(ROOT)
         # This fixture asserts an explicit deepinfer footer and must not inherit
@@ -188,41 +181,29 @@ print("RESULT:" + json.dumps(result, ensure_ascii=False))
         env.pop("ZYLAB_BASE", None)
         env.pop("ZYLAB_KEYS_FILE", None)
         env.setdefault("TERM", "xterm-256color")
-        self.master = master
-        self.proc = subprocess.Popen(
+        # RawPTY：POSIX 用 openpty + TIOCSWINSZ，Windows 用 ConPTY。
+        # 宽视口是刻意的，这里不测裁剪（picker 渲染另有窄终端单测）。
+        self.pty = RawPTY(
             [sys.executable, "-c", textwrap.dedent(self.CHILD)],
-            stdin=slave,
-            stdout=slave,
-            stderr=slave,
-            cwd=ROOT,
-            env=env,
-            close_fds=True,
-        )
-        os.close(slave)
+            cwd=ROOT, env=env, cols=140, rows=40)
+        self.proc = self.pty
         self.output = bytearray()
 
     def tearDown(self):
-        if self.proc.poll() is None:
-            self.proc.kill()
+        if self.pty.poll() is None:
+            self.pty.kill()
         try:
-            self.proc.wait(timeout=1.0)
-        except subprocess.TimeoutExpired:
-            self.proc.kill()
-            self.proc.wait(timeout=1.0)
-        os.close(self.master)
+            self.pty.wait(timeout=1.0)
+        except Exception:
+            self.pty.kill()
+        self.pty.close()
 
     def _decoded(self):
         return self.output.decode("utf-8", "replace")
 
     def _read_available(self):
         while True:
-            ready, _, _ = select.select([self.master], [], [], 0)
-            if not ready:
-                return
-            try:
-                chunk = os.read(self.master, 65536)
-            except OSError:
-                return
+            chunk = self.pty.read(0)
             if not chunk:
                 return
             self.output.extend(chunk)
@@ -245,15 +226,10 @@ print("RESULT:" + json.dumps(result, ensure_ascii=False))
             match = pattern.search(bytes(self.output), start)
             if match:
                 return match.end()
-            ready, _, _ = select.select([self.master], [], [], 0.1)
-            if ready:
-                try:
-                    chunk = os.read(self.master, 65536)
-                except OSError:
-                    chunk = b""
-                if chunk:
-                    self.output.extend(chunk)
-                    continue
+            chunk = self.pty.read(0.1)
+            if chunk:
+                self.output.extend(chunk)
+                continue
             if self.proc.poll() is not None:
                 self._read_available()
                 break
@@ -263,10 +239,7 @@ print("RESULT:" + json.dumps(result, ensure_ascii=False))
         )
 
     def _send(self, payload):
-        os.write(
-            self.master,
-            payload if isinstance(payload, bytes) else payload.encode("utf-8"),
-        )
+        self.pty.write(payload)
 
     def test_resume_picker_full_workflow_preserves_state_and_main_draft(self):
         cursor = self._expect("/help 看命令")

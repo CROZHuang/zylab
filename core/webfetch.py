@@ -81,7 +81,7 @@ BLOCKED_HOSTS = {
 # 家目录因人而异，所以路径可覆盖。找不到不是错误 —— 直连路由仍可用；
 # 但要让用户知道缺什么。
 _ENV_FILE = paths.env_get("ENV_FILE") or str(
-    Path(os.path.expanduser("~")) / ".env-persistent.sh")
+    paths.home_dir() / ".env-persistent.sh")
 _LEGACY_ENV_FILES = paths.legacy_env_files()
 _PROXY_LINE = re.compile(r"^_PROXY_[A-Z0-9_]*='([^']+)'", re.M)
 
@@ -104,16 +104,38 @@ def redact(url):
     return urllib.parse.urlunsplit(parts)
 
 
-def resolve_proxy(cfg=None):
-    """代理 URL 的解析链：settings → 环境变量 → shell 环境文件。
+def looks_like_proxy_url(value):
+    """值是否真是一个代理 URL（scheme://host），而不是别的什么东西。
 
-    找不到返回 None（直连仍可用）；带凭据的值从不落日志。
+    09-20 实测的事故：环境文件里 `_PROXY_CLEAR='unset http_proxy …'` 排在最前，
+    旧实现取**第一个** `_PROXY_*` 匹配，于是把一条 shell 命令当代理交给
+    ProxyHandler，urllib 抛 `InvalidURL: URL can't contain control characters`，
+    代理这条腿当场失效、退到直连再超时——用户看到的只是「两条路由都失败」。
+    """
+    try:
+        parts = urllib.parse.urlsplit(str(value or "").strip())
+    except ValueError:
+        return False
+    return parts.scheme in ("http", "https", "socks5", "socks5h") and bool(parts.netloc)
+
+
+def resolve_proxy(cfg=None):
+    """代理 URL 的解析链：settings → ZYLAB_WEB_PROXY → shell 环境文件。
+
+    每一级都要过 `looks_like_proxy_url`：形态不对就继续往下找，绝不把一个
+    不是 URL 的值交给 ProxyHandler。找不到返回 None（直连仍可用）；
+    带凭据的值从不落日志。
+
+    **刻意不读标准的 http(s)_proxy 环境变量。** 09-20 实测：本机那四个变量
+    全部指向「只通 AI 厂商域名」的那条代理，拿它抓通用网页一律
+    `Tunnel connection failed: 403`——环境里「有代理」不等于「这条代理通得了
+    目标」。网页抓取要用哪条代理必须显式声明（上面三级之一）。
     """
     web = (cfg or {}).get("web") if isinstance(cfg, dict) else None
-    if isinstance(web, dict) and str(web.get("proxy") or "").strip():
+    if isinstance(web, dict) and looks_like_proxy_url(web.get("proxy")):
         return str(web["proxy"]).strip()
     env = paths.env_get("WEB_PROXY", "").strip()
-    if env:
+    if looks_like_proxy_url(env):
         return env
     for candidate in (_ENV_FILE,) + _LEGACY_ENV_FILES:
         try:
@@ -121,9 +143,12 @@ def resolve_proxy(cfg=None):
                 text = fh.read()
         except OSError:
             continue
-        found = _PROXY_LINE.search(text)
-        if found:
-            return found.group(1).strip()
+        # 取**第一个形态合法的**，而不是第一个匹配：同一个文件里既有
+        # `_PROXY_CLEAR`（清代理的 shell 命令）也有真正的代理地址。
+        for found in _PROXY_LINE.finditer(text):
+            value = found.group(1).strip()
+            if looks_like_proxy_url(value):
+                return value
     return None
 
 
@@ -300,6 +325,37 @@ def _open_via(url, route, proxy, timeout):
     return opener.open(request, timeout=timeout)
 
 
+def _within_deadline(fn, seconds):
+    """在**墙钟** seconds 秒内跑完 fn，否则抛 TimeoutError。
+
+    urllib 的 timeout 只约束**单次 socket 操作**：connect、TLS 握手、代理的
+    CONNECT、每一次 read 各拿一份完整预算，重定向的每一跳再来一轮。09-20 实测：
+    `timeout=30` 的调用跑了 270 秒，`timeout=10` 跑了 90 秒——交互式会话里
+    一个工具调用沉默四分半，模型和用户都只能干等。
+
+    阻塞中的 socket 操作无法从外部打断，所以放进守护线程、到点就不再等它；
+    被放弃的线程会在自己的 socket 超时后自然结束。异常原样带回调用方，
+    于是 HTTPError「不换路由」、_HopGuard 拒绝「不重试」两条既有契约不变。
+    """
+    import threading
+    box = {}
+
+    def run():
+        try:
+            box["value"] = fn()
+        except BaseException as exc:                   # noqa: BLE001 - 原样带回
+            box["error"] = exc
+
+    worker = threading.Thread(target=run, name="zylab-webfetch", daemon=True)
+    worker.start()
+    worker.join(seconds)
+    if worker.is_alive():
+        raise TimeoutError(f"超过墙钟上限 {seconds:.0f}s")
+    if "error" in box:
+        raise box["error"]
+    return box["value"]
+
+
 def fetch(url, *, timeout=DEFAULT_TIMEOUT, cfg=None, max_bytes=MAX_BYTES,
           max_chars=MAX_CHARS, opener=_open_via):
     """抓取一个 URL，按 host 选路由，主路由连接层失败换另一条重试一次。
@@ -326,15 +382,21 @@ def fetch(url, *, timeout=DEFAULT_TIMEOUT, cfg=None, max_bytes=MAX_BYTES,
             proxy_missing = True
             notes.append("proxy 未配置(settings web.proxy / ZYLAB_WEB_PROXY)，跳过")
             continue
-        try:
+        def attempt(route=route):
             with opener(url, route, proxy, timeout) as resp:
                 raw = resp.read(max_bytes + 1)
-                clipped_bytes = len(raw) > max_bytes
-                if clipped_bytes:
+                clipped = len(raw) > max_bytes
+                if clipped:
                     raw = raw[:max_bytes]
-                body = render_body(
-                    resp.headers.get("Content-Type"), raw)
-                status = getattr(resp, "status", 200)
+                return (raw, clipped,
+                        render_body(resp.headers.get("Content-Type"), raw),
+                        getattr(resp, "status", 200))
+
+        try:
+            # timeout 同时是 socket 级超时与**这条路由的墙钟上限**；
+            # 两条路由最坏合计 2×timeout，而不是此前实测的 9×。
+            raw, clipped_bytes, body, status = _within_deadline(
+                attempt, timeout)
         except urllib.error.HTTPError as exc:
             # HTTP 状态错误 = 已经到达目标，不是路由问题；不换路由。
             detail = exc.read(400).decode("utf-8", "replace")

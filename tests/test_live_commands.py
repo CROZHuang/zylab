@@ -403,7 +403,7 @@ class SubcommandMenuCoverageTests(unittest.TestCase):
 
     def test_the_commands_added_on_09_08_are_discoverable(self):
         expected = {
-            "/recap": {"now"},
+            "/recap": {"help"},           # 09-20 起 /recap 直接现写一行，没有 now 子动作了
             "/model": {"check", "gateway", "refresh"},
             "/goal": {"accept", "reject"},
             "/agents": {"workflow"},

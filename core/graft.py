@@ -440,6 +440,7 @@ def _direct_worker(argv, *, cwd, env, timeout):
         argv, cwd=cwd, env=env, stdin=subprocess.DEVNULL,
         stdout=subprocess.PIPE, stderr=subprocess.PIPE,
         **wincompat.popen_group_kwargs())
+    wincompat.attach_to_job(proc)   # Windows：整棵树一次收（见 wincompat）
     timed_out = False
     try:
         stdout, stderr = proc.communicate(timeout=timeout)
@@ -453,7 +454,7 @@ def _direct_worker(argv, *, cwd, env, timeout):
             stdout, stderr = proc.communicate(timeout=2)
         except subprocess.TimeoutExpired:
             try:
-                wincompat.signal_process_group(proc.pid, signal.SIGKILL)
+                wincompat.signal_process_group(proc.pid, wincompat.SIGKILL)
             except (OSError, ProcessLookupError):
                 pass
             stdout, stderr = proc.communicate()
@@ -468,7 +469,7 @@ def _direct_worker(argv, *, cwd, env, timeout):
             proc.communicate(timeout=2)
         except BaseException:
             try:
-                wincompat.signal_process_group(proc.pid, signal.SIGKILL)
+                wincompat.signal_process_group(proc.pid, wincompat.SIGKILL)
             except (OSError, ProcessLookupError):
                 pass
             try:

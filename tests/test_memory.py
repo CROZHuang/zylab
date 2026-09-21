@@ -87,8 +87,11 @@ class MemoryTests(unittest.TestCase):
             self.assertEqual(
                 (rows[0]["evidence"] or {}).get("writer"), "model")
             self.assertIn("路线 B", rows[0]["content"])
-            self.assertIn("stable_key=route-preference-api_key=[REDACTED]",
-                          rendered["text"])
+            # 索引是一条一行的钩子（不再是全文）；脱敏对它同样有效
+            self.assertEqual(len(rendered["text"].splitlines()), 1)
+            self.assertTrue(rendered["text"].startswith("- m-"))
+            self.assertIn("路线 B", rendered["text"])
+            self.assertNotIn(secret, rendered["text"])
             self.assertIn("路线 B", fresh_system)
             self.assertIn("[REDACTED]", raw_before_forget)
             self.assertNotIn(secret, raw_before_forget)
@@ -345,25 +348,6 @@ class MemoryTests(unittest.TestCase):
             self.assertEqual(
                 stat.S_IMODE(os.stat(project_files[0]).st_mode), 0o600)
 
-    def test_session_capture_upserts_stable_source_bound_handoff(self):
-        with tempfile.TemporaryDirectory() as tmp:
-            authority = memory.MemoryStore(Path(tmp) / "memory")
-            first = authority.capture_session(FakeAgent(), cwd=tmp)
-            FakeAgent.messages.append({
-                "role": "assistant", "content": "第二阶段也完成"})
-            try:
-                second = authority.capture_session(FakeAgent(), cwd=tmp)
-            finally:
-                FakeAgent.messages.pop()
-
-            self.assertEqual(first["id"], second["id"])
-            rows = authority.list(cwd=tmp)
-            self.assertEqual(len(rows), 1)
-            self.assertEqual(rows[0]["source_session"], "session-memory")
-            self.assertEqual(rows[0]["kind"], "session_handoff")
-            self.assertIn("raw_sha256", rows[0]["evidence"])
-            self.assertIn("第二阶段也完成", rows[0]["content"])
-
     def test_capsule_is_hashed_bounded_and_rendered_as_derived(self):
         index = {
             "text": "memory clue " * 2000,
@@ -411,6 +395,83 @@ class MemoryTests(unittest.TestCase):
                 oversized, ensure_ascii=False, sort_keys=True))
         with self.assertRaisesRegex(memory.MemoryError, "wire 上限"):
             memory.validate_capsule(oversized)
+
+    def test_the_index_is_hooks_and_the_body_is_fetched_on_demand(self):
+        """system 里常驻的是一行钩子，不是正文。
+
+        2026-09-20 实测：旧设计把每条正文全塞进 system——7 条垃圾 handoff 就占了 4,339
+        token，而模型连取正文的工具都没有。一行钩子在用户真实的 59 条记忆上约 68 token/条，
+        且按钩子做 BM25 的 top-3 命中 16/18，按正文只有 11/18。
+        """
+        with tempfile.TemporaryDirectory() as tmp:
+            authority = memory.MemoryStore(Path(tmp) / "memory")
+            body = "结论：滚动老化保留。\n" + "细节。" * 2_000
+            row = authority.add(
+                body, title="老化保留", cwd=tmp, entry_type="feedback",
+                description="滚动老化保留，不改成捕获时截一次；不老化输入多 14–28%")
+            rendered = authority.render_index(cwd=tmp)
+
+            self.assertEqual(len(rendered["text"].splitlines()), 1)
+            self.assertLess(len(rendered["text"]), 320, rendered["text"])
+            self.assertNotIn("细节。细节。", rendered["text"], "正文不该进索引")
+            self.assertIn("feedback", rendered["text"])
+            self.assertIn("14–28%", rendered["text"], "钩子要带上以后会用来找它的词")
+            self.assertIn(row["id"], rendered["text"])
+
+            view = authority.render_entry(row["id"], cwd=tmp)
+            self.assertIn("细节。", view["text"])
+            self.assertTrue(view["truncated"])
+            self.assertLessEqual(
+                len(view["text"].encode("utf-8")),
+                memory.RECALL_ENTRY_BYTES + 400)
+            self.assertIn("feedback", view["text"])
+            self.assertIn("今天写的", view["text"])
+
+    def test_a_missing_description_falls_back_to_the_first_real_line(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            authority = memory.MemoryStore(Path(tmp) / "memory")
+            authority.add("## 标题行\n\n用户要求报告默认发布成页面。",
+                          title="页面偏好", cwd=tmp, entry_type="user")
+            self.assertIn("标题行", authority.render_index(cwd=tmp)["text"])
+
+    def test_an_unknown_type_falls_back_and_an_update_keeps_the_old_one(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            authority = memory.MemoryStore(Path(tmp) / "memory")
+            first = authority.add("事实一", title="t", cwd=tmp,
+                                  entry_type="nonsense", stable_key="k")
+            self.assertEqual(first["type"], memory.DEFAULT_TYPE)
+            typed = authority.add("事实二", title="t", cwd=tmp,
+                                  entry_type="user", stable_key="k")
+            self.assertEqual(typed["type"], "user")
+            kept = authority.add("事实三", title="t", cwd=tmp, stable_key="k")
+            self.assertEqual(kept["type"], "user", "更新一条记忆不该把类型冲掉")
+
+    def test_memory_read_is_read_only_and_reports_a_bad_target(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "memory"
+            context = tools.ExecutionContext.capture(
+                workspace_root=tmp, session="s", turn_id="t")
+            old = os.getcwd()
+            os.chdir(tmp)
+            try:
+                with mock.patch.object(memory, "ROOT", root):
+                    memory.MemoryStore(root).add(
+                        "老化保留的理由与数字", title="老化", cwd=tmp,
+                        entry_type="feedback")
+                    identifier = memory.MemoryStore(root).list(
+                        cwd=tmp)[0]["id"]
+                    prepared = tools.prepare(
+                        "memory_read", {"target": identifier}, context=context)
+                    self.assertFalse(prepared.requires_memory_confirmation)
+                    text = tools.run("memory_read", prepared, context=context)
+                    missing = tools.run(
+                        "memory_read", {"target": "m-000000000000"},
+                        context=context)
+            finally:
+                os.chdir(old)
+        self.assertIn("老化保留的理由与数字", text)
+        self.assertIn("feedback", text)
+        self.assertIn("没有 memory", missing)
 
     def test_render_index_never_exceeds_exact_budget(self):
         with tempfile.TemporaryDirectory() as tmp:

@@ -40,6 +40,16 @@ def _matches(matcher, tool):
     return tool in [m.strip() for m in str(matcher).split("|") if m.strip()]
 
 
+def _bash():
+    """与 Bash 工具同一个解析器。裸 `"bash"` 在 Windows 上会命中 System32 的
+    WSL 垫片，hook 就跑进了另一个文件系统命名空间（延迟 import 避免环）。"""
+    try:
+        from . import tools
+        return tools.bash_executable()
+    except Exception:          # noqa: BLE001 —— 解析不出来仍按老样子试一次
+        return "bash"
+
+
 def _run_one(spec, payload, timeout=None):
     """跑一个 hook。返回 (放行?, 改写后的参数或 None, 说明)。"""
     cmd = spec.get("command")
@@ -57,7 +67,7 @@ def _run_one(spec, payload, timeout=None):
         env[paths.env_name(suffix)] = value
     try:
         r = subprocess.run(
-            ["bash", "-lc", cmd], input=json.dumps(payload, ensure_ascii=False),
+            [_bash(), "-lc", cmd], input=json.dumps(payload, ensure_ascii=False),
             capture_output=True, text=True, env=env,
             timeout=timeout or spec.get("timeout") or DEFAULT_TIMEOUT)
     except subprocess.TimeoutExpired:

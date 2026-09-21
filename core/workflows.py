@@ -23,7 +23,7 @@ import uuid
 from datetime import datetime, timezone
 from pathlib import Path
 
-from . import agents, memory as memory_db, models, store, tools
+from . import agents, memory as memory_db, models, store, tools, wincompat
 
 
 VERSION = 1
@@ -168,14 +168,8 @@ def _under_protected(path):
 
 
 def _pid_alive(pid):
-    try:
-        pid = int(pid)
-        if pid <= 0:
-            return False
-        os.kill(pid, 0)
-        return True
-    except (OSError, TypeError, ValueError):
-        return False
+    # os.kill(pid, 0) 在 Windows 上是 CTRL_C_EVENT，不是存活探测（见 wincompat）。
+    return wincompat.pid_alive(pid)
 
 
 def _owner_fields():

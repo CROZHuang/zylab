@@ -15,6 +15,11 @@ import zylab as CLI
 from core import agents, client, controller, tools, tui
 from tests.pty_harness import PTYSend, run_pty_child
 
+# ignore_cleanup_errors：Windows 上打开着的文件删不掉（这是平台语义，
+# 不是缺陷）。这些用例把 sqlite 库开在临时目录里、不显式关闭，
+# POSIX 上照样能删，Windows 上会在 tearDown 抛 WinError 32，
+# 把一个通过的断言变成 ERROR。
+
 
 def execution(session="parent-session"):
     return tools.ExecutionContext.capture(
@@ -56,7 +61,7 @@ class TransportApprovalScopeTests(unittest.TestCase):
         return sess
 
     def test_session_installs_persistent_exact_endpoint_allowlist(self):
-        with tempfile.TemporaryDirectory() as d:
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as d:
             sess = self.make_session(Path(d))
             sess.cfg = json.loads(json.dumps(CLI.CFG.DEFAULTS))
             sess.cfg["transport"]["allowed_insecure_endpoints"] = [
@@ -74,7 +79,7 @@ class TransportApprovalScopeTests(unittest.TestCase):
             sess._transport_authorizer)
 
     def test_subagent_transport_is_preflighted_on_owner_thread(self):
-        with tempfile.TemporaryDirectory() as d:
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as d:
             sess = self.make_session(Path(d))
             sess.ag.gateway = "boyue"
             seen = {}
@@ -105,7 +110,7 @@ class TransportApprovalScopeTests(unittest.TestCase):
         self.assertEqual(seen["kwargs"]["purpose"], "subagent_preflight")
 
     def test_background_transport_authorizer_fails_closed_without_ui(self):
-        with tempfile.TemporaryDirectory() as d:
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as d:
             sess = self.make_session(Path(d))
             sess._confirm_insecure_transport = mock.Mock(return_value=True)
             route = client.GatewayRoute(
@@ -125,7 +130,7 @@ class TransportApprovalScopeTests(unittest.TestCase):
         sess._confirm_insecure_transport.assert_not_called()
 
     def test_workflow_preflight_deduplicates_shared_boyue_endpoint(self):
-        with tempfile.TemporaryDirectory() as d:
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as d:
             sess = self.make_session(Path(d))
             sess.workflow_manager = mock.Mock()
             sess.workflow_manager.resolve_lineup.return_value = [
@@ -153,7 +158,7 @@ class TransportApprovalScopeTests(unittest.TestCase):
         self.assertEqual(preflight.call_args.args[0].name, "boyue")
 
     def test_workflow_control_preflights_add_but_not_status(self):
-        with tempfile.TemporaryDirectory() as d:
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as d:
             sess = self.make_session(Path(d))
             sess.workflow_manager = mock.Mock()
             sess.workflow_manager.resolve_lineup.return_value = [
@@ -188,7 +193,7 @@ class TransportApprovalScopeTests(unittest.TestCase):
             sess.workflow_manager.resolve_lineup.call_count, 1)
 
     def test_parent_http_grant_covers_child_provider_attempt(self):
-        with tempfile.TemporaryDirectory() as d:
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as d:
             sess = self.make_session(Path(d))
             sess._confirm_insecure_transport = mock.Mock(return_value=True)
             route = client.GatewayRoute(
@@ -225,7 +230,7 @@ class TransportApprovalScopeTests(unittest.TestCase):
         self.assertEqual(sess._confirm_insecure_transport.call_count, 1)
 
     def test_denied_provider_preflight_prevents_background_spawn(self):
-        with tempfile.TemporaryDirectory() as d:
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as d:
             sess = self.make_session(Path(d))
             sess.ag.gateway = "boyue"
             denied = client.APIError(
@@ -250,7 +255,7 @@ class TransportApprovalScopeTests(unittest.TestCase):
         self.assertEqual(decision["source"], "transport_guard")
 
     def test_grant_is_invalidated_by_base_repo_or_session_change(self):
-        with tempfile.TemporaryDirectory() as d:
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as d:
             root = Path(d, "repo-a")
             other = Path(d, "repo-b")
             root.mkdir()
@@ -274,7 +279,7 @@ class TransportApprovalScopeTests(unittest.TestCase):
         self.assertEqual(prompt.call_count, 4)
 
     def test_declined_http_route_is_not_staged_or_applied(self):
-        with tempfile.TemporaryDirectory() as d:
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as d:
             sess = self.make_session(Path(d))
             sess._confirm_insecure_transport = mock.Mock(return_value=False)
             old_gateway = client.GATEWAY
@@ -348,7 +353,7 @@ class SessionAgentRoutingTests(unittest.TestCase):
         return sess, runtime, journal
 
     def test_attach_routes_to_child_and_restores_main_queue_and_drafts(self):
-        with tempfile.TemporaryDirectory() as tmp:
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as tmp:
             root = Path(tmp) / "runs"
             runtime = agents.AgentRuntime(root)
             child = runtime.spawn(
@@ -396,7 +401,7 @@ class SessionAgentRoutingTests(unittest.TestCase):
                 [event["kind"] for event in journal.events])
 
     def test_cross_parent_attach_and_send_are_rejected(self):
-        with tempfile.TemporaryDirectory() as tmp:
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as tmp:
             root = Path(tmp) / "runs"
             runtime = agents.AgentRuntime(root)
             foreign = runtime.spawn(
@@ -414,7 +419,7 @@ class SessionAgentRoutingTests(unittest.TestCase):
                 runtime.get(foreign["id"])["inbox"], [])
 
     def test_lightweight_agent_summary_never_hides_queued_child_message(self):
-        with tempfile.TemporaryDirectory() as tmp:
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as tmp:
             root = Path(tmp) / "runs"
             runtime = agents.AgentRuntime(root)
             child = runtime.spawn(
@@ -571,7 +576,7 @@ import tempfile
 import threading
 import time
 
-with tempfile.TemporaryDirectory() as home:
+with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as home:
     os.environ["HOME"] = home
     import zylab
     from core import agent as agent_mod

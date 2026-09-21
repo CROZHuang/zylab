@@ -14,6 +14,7 @@ from unittest import mock
 
 import zylab as CLI
 from core import graft, settings, tools
+from tests.platform_support import requires_symlinks  # noqa: E402
 
 
 class HostedGraftTests(unittest.TestCase):
@@ -142,6 +143,7 @@ class HostedGraftTests(unittest.TestCase):
         self.assertFalse(status["available"])
         self.assertIn("netns unavailable", status["error"])
 
+    @requires_symlinks
     def test_target_and_nested_scope_cannot_escape_workspace(self):
         outside = self.base / "outside"
         outside.mkdir()

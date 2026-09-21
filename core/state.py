@@ -26,6 +26,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 from . import model_health as health_policy
+from . import wincompat
 
 
 SCHEMA_VERSION = 1
@@ -161,8 +162,11 @@ def utcnow():
 
 
 def _process_start_ticks(pid=None):
-    """Return Linux proc start ticks, which disambiguate PID reuse."""
+    """Return a process start token, which disambiguates PID reuse."""
     target = int(pid if pid is not None else os.getpid())
+    if wincompat.IS_WINDOWS:
+        # Windows 没有 /proc；等价物是 GetProcessTimes 的创建时间。
+        return wincompat.proc_start(target) or None
     try:
         text = Path(f"/proc/{target}/stat").read_text(encoding="utf-8")
         tail = text[text.rfind(")") + 2:].split()
@@ -189,6 +193,14 @@ def _local_owner_alive(row):
         return False
     if pid <= 0:
         return False
+    if wincompat.IS_WINDOWS:
+        # 存活走 OpenProcess，身份走创建时间。Windows 没有僵尸态
+        # （最后一个句柄关掉进程对象就消失），所以没有 "Z" 对应分支。
+        if not wincompat.pid_alive(pid):
+            return False
+        observed = wincompat.proc_start(pid)
+        expected = row.get("owner_start_ticks")
+        return expected in (None, "") or str(expected) == observed
     try:
         text = Path(f"/proc/{pid}/stat").read_text(encoding="utf-8")
         tail = text[text.rfind(")") + 2:].split()

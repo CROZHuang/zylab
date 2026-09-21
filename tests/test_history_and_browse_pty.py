@@ -9,19 +9,18 @@ Up 取回上一条 prompt、以及向上翻看历史输出。2026-08-27 排查�
 断言用容忍 CSI 的匹配器（同 test_session_picker_pty 的教训）：框式渲染
 会在字符间插样式码，原始字节流里字面量不连续。
 """
-import fcntl
 import os
-import pty
 import re
-import struct
 import subprocess
 import sys
-import termios
 import textwrap
 import time
 import unittest
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+sys.path.insert(0, ROOT)
+
+from tests.pty_harness import RawPTY  # noqa: E402
 
 _CSI_GAP = rb"(?:\x1b\[[0-9;?]*[A-Za-z])*"
 
@@ -75,48 +74,38 @@ with tempfile.TemporaryDirectory(prefix="zylab-histpty-") as root:
 """
 
     def setUp(self):
-        master, slave = pty.openpty()
-        fcntl.ioctl(slave, termios.TIOCSWINSZ,
-                    struct.pack("HHHH", 40, 140, 0, 0))
         env = os.environ.copy()
         env["ZYLAB_TEST_REPO"] = str(ROOT)
         env.setdefault("TERM", "xterm-256color")
-        self.master = master
-        self.proc = subprocess.Popen(
+        # RawPTY：POSIX 用 openpty + TIOCSWINSZ，Windows 用 ConPTY。
+        # 原来这里直接 import pty/fcntl/termios —— Windows 上连 import 都过不去。
+        self.pty = RawPTY(
             [sys.executable, "-c", textwrap.dedent(self.CHILD)],
-            stdin=slave, stdout=slave, stderr=slave,
-            cwd=ROOT, env=env, close_fds=True)
-        os.close(slave)
+            cwd=ROOT, env=env, cols=140, rows=40)
+        self.proc = self.pty
         self.output = bytearray()
 
     def tearDown(self):
-        if self.proc.poll() is None:
-            self.proc.kill()
+        if self.pty.poll() is None:
+            self.pty.kill()
         try:
-            self.proc.wait(timeout=1.0)
-        except subprocess.TimeoutExpired:
-            self.proc.kill()
-            self.proc.wait(timeout=1.0)
-        os.close(self.master)
+            self.pty.wait(timeout=1.0)
+        except Exception:
+            self.pty.kill()
+        self.pty.close()
 
     def _expect(self, text, *, start=0, timeout=8.0):
-        import select
         pattern = tolerant(text)
         deadline = time.monotonic() + timeout
         while time.monotonic() < deadline:
             match = pattern.search(bytes(self.output), start)
             if match:
                 return match.end()
-            ready, _, _ = select.select([self.master], [], [], 0.1)
-            if ready:
-                try:
-                    chunk = os.read(self.master, 65536)
-                except OSError:
-                    chunk = b""
-                if chunk:
-                    self.output.extend(chunk)
-                    continue
-            if self.proc.poll() is not None:
+            chunk = self.pty.read(0.1)
+            if chunk:
+                self.output.extend(chunk)
+                continue
+            if self.pty.poll() is not None:
                 break
         self.fail(
             f"PTY did not render {text!r} after byte {start}; "
@@ -124,9 +113,7 @@ with tempfile.TemporaryDirectory(prefix="zylab-histpty-") as root:
             + self.output.decode("utf-8", "replace"))
 
     def _send(self, payload):
-        if isinstance(payload, str):
-            payload = payload.encode("utf-8")
-        os.write(self.master, payload)
+        self.pty.write(payload)
 
     def _exit(self, cursor):
         self._send(b"\x15/exit\r")

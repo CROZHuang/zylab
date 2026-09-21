@@ -69,7 +69,7 @@ class ContextLimitRecovery(ManagedContextBase):
         def provider(*args, **kwargs):
             if is_summary_request(kwargs, args):
                 summaries.append(1)
-                yield {"t": "text", "v": "## objective\nunknown"}
+                yield {"t": "text", "v": "## objective\nunknown\n## constraints\n- none\n## decisions\n- none\n## files_changed\n- none\n## evidence\n- none\n## pending\n- none\n## risks\n- none"}
                 yield {"t": "done", "reason": "stop", "usage": {}}
                 return
             turns.append(1)
@@ -133,6 +133,103 @@ class ContextLimitRecovery(ManagedContextBase):
 
         self.assertIn("error", [e["t"] for e in events])
         self.assertEqual(len(turns), 2, "只该重试一次")
+
+
+class CompactionFallsBackToAnotherModel(ManagedContextBase):
+    """轮次内的压缩：主模型写不了摘要时，必须真的轮到「换一家来写」。
+
+    2026-09-20 实测：阶梯是 关思考 → 加大额度 → 换模型，循环对「这一步不适用」用的是
+    break，于是主模型 503 时「加大额度」不适用 → 收工，换模型永远走不到。交互式会话走的
+    正是这条路径（09-07 在上下文天花板上烧掉 84.9M token 的那次也是）。
+    """
+
+    FALLBACK = {"gateway": "deepinfer", "model": "glm-5.3", "seat": "GLM"}
+
+    def run_turn(self, first_summary):
+        turns, summaries = [], []
+
+        def provider(*args, **kwargs):
+            if is_summary_request(kwargs, args):
+                summaries.append((kwargs.get("gateway"), args[0]))
+                if len(summaries) == 1:
+                    if isinstance(first_summary, Exception):
+                        raise first_summary
+                    yield from first_summary
+                    return
+                yield {"t": "text", "v": "## objective\nunknown\n## constraints\n- none\n## decisions\n- none\n## files_changed\n- none\n## evidence\n- none\n## pending\n- none\n## risks\n- none"}
+                yield {"t": "done", "reason": "stop", "usage": {}}
+                return
+            turns.append(1)
+            if len(turns) == 1:
+                raise client.APIError(TOO_LONG, kind="invalid_request")
+            yield {"t": "text", "v": "ok"}
+            yield {"t": "done", "reason": "stop", "usage": {}}
+
+        ag = self.agent_with_history()
+        journal, ctrl = self.start()
+        with mock.patch.object(M, "note_context_reject", return_value=131072), \
+             mock.patch.object(ag, "compaction_fallback_route",
+                               return_value=dict(self.FALLBACK)):
+            events = list(ag.run("go", controller=ctrl, stream_factory=provider))
+        return ag, events, turns, summaries
+
+    def assert_rescued(self, ag, events, turns, summaries):
+        self.assertEqual(summaries, [("test", "m"), ("deepinfer", "glm-5.3")])
+        self.assertEqual((ag.context_summary["gateway"], ag.context_summary["model"]),
+                         ("deepinfer", "glm-5.3"))
+        self.assertNotIn("error", [e["t"] for e in events], "压缩被救回，这一轮不该报废")
+        self.assertEqual(len(turns), 2)
+        notices = [e["v"] for e in events if e["t"] == "route_warning"]
+        self.assertTrue(any("改用 fallback:GLM" in note for note in notices), notices)
+
+    def test_a_provider_error_reaches_the_other_model(self):
+        down = client.APIError("HTTP 503 service_error", kind="transient_http",
+                               status=503)
+        self.assert_rescued(*self.run_turn(down))
+
+    def test_a_truly_empty_summary_reaches_the_other_model(self):
+        empty = [{"t": "text", "v": "  "},
+                 {"t": "done", "reason": "stop", "usage": {}}]
+        self.assert_rescued(*self.run_turn(empty))
+
+
+class DeepCompactionReachesTheManagedLoopToo(ManagedContextBase):
+    """压缩链的「续压」标志必须两条循环都带上。
+
+    `run()` 与 `_run_managed()` 是各写一遍的两套主循环，压缩链也各有一份。09-20 的教训正是
+    这个形状：降级阶梯的 `break` → `continue` 在两边各错了一遍。交互式会话走的是 managed 这条，
+    所以深度压缩（压到阈值一半以下）在这里必须同样生效。
+    """
+
+    def test_the_second_pass_of_a_managed_chain_is_a_deep_pass(self):
+        seen = []
+        real_plan = A.Agent._compaction_plan
+
+        def spy(agent, force=False, preview=None, *, deep=False):
+            seen.append({"force": force, "deep": deep})
+            return real_plan(agent, force=force, preview=preview, deep=deep)
+
+        def provider(*args, **kwargs):
+            if is_summary_request(kwargs, args):
+                yield {"t": "text", "v": "## objective\nunknown\n## constraints\n- none\n"
+                                         "## decisions\n- none\n## files_changed\n- none\n"
+                                         "## evidence\n- none\n## pending\n- none\n## risks\n- none"}
+                yield {"t": "done", "reason": "stop", "usage": {}}
+                return
+            yield {"t": "text", "v": "ok"}
+            yield {"t": "done", "reason": "stop", "usage": {}}
+
+        ag = self.agent_with_history(turns=400)
+        ag.compact_at, ag.ctx_limit = 6_000, 40_000
+        journal, ctrl = self.start()
+        with mock.patch.object(A.Agent, "_compaction_plan", spy), \
+             mock.patch.object(A, "COMPACT_SOURCE_TOKENS", 2_000):
+            list(ag.run("go", controller=ctrl, stream_factory=provider))
+
+        self.assertGreaterEqual(len(seen), 2, seen)
+        self.assertFalse(seen[0]["deep"], "第一段不是续压")
+        self.assertTrue(all(call["deep"] for call in seen[1:]),
+                        f"managed 这条循环没把续压标志传下去：{seen}")
 
 
 class TransientIsNotALimit(ManagedContextBase):
