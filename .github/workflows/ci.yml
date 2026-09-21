@@ -47,13 +47,46 @@ jobs:
         shell: bash
         run: echo "ZYLAB_HOME=$RUNNER_TEMP/zylab-home" >> "$GITHUB_ENV"
 
+      # 环境事实先打一行。2026-09-21 第一次跑 CI 时五列全红，而同一个提交在
+      # 维护者机器上（python 3.12）全绿——差异只能是环境，而 job 日志要仓库
+      # admin 权限才下载得到。把判据打出来，别再靠猜。
+      - name: 环境事实
+        shell: bash
+        run: |
+          python -VV
+          python -c "import sys,platform,locale,os;print('platform:',platform.platform());print('encoding:',sys.getdefaultencoding(),locale.getpreferredencoding(False));print('TERM=',os.environ.get('TERM'));print('cwd:',os.getcwd())"
+          git --version
+          bash --version | head -1
+
+      # 失败时把失败的用例名写成 ::error:: 注解。注解可以通过 check-runs API
+      # **无需 admin 权限**读到，而 job 日志不行——这条 CI 的意义就在于让
+      # 只有 Windows 才暴露的问题能被没有 Windows 的人看见。
       - name: 单元测试
-        run: python -m unittest discover -s tests -q
+        shell: bash
+        run: |
+          set +e
+          python -m unittest discover -s tests -q 2>&1 | tee /tmp/unit.log
+          rc=${PIPESTATUS[0]}
+          set -e
+          if [ "$rc" != "0" ]; then
+            grep -E '^(FAIL|ERROR):' /tmp/unit.log | sed 's/^/::error::/' | head -60
+            tail -5 /tmp/unit.log | sed 's/^/::error::尾部 /'
+          fi
+          exit "$rc"
 
       # CC 交互契约记分板。它会在真 PTY（Windows 上是 ConPTY）里跑，
       # 所以这一步同时也是 tests/conpty.py 的冒烟。
       - name: 交互契约记分板
-        run: python scripts/cc_parity.py
+        shell: bash
+        run: |
+          set +e
+          python scripts/cc_parity.py 2>&1 | tee /tmp/parity.log
+          rc=${PIPESTATUS[0]}
+          set -e
+          if [ "$rc" != "0" ]; then
+            grep -E '❌|⁉' /tmp/parity.log | sed 's/^/::error::/' | head -40
+          fi
+          exit "$rc"
 
       # AGENTS.md §3 的硬断言只有一条：**别写进真实状态目录**。
       # "改道目录里有东西"只是旁证（哪个用例碰到它是偶然的），所以只打印不判死。
