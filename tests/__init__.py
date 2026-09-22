@@ -5,6 +5,7 @@
 子进程测试各自显式传 env（见 pty_harness / test_cold_start）。
 """
 import os
+import sys
 import tempfile
 
 _ISOLATED = tempfile.mkdtemp(prefix="zylab-tests-")
@@ -27,3 +28,35 @@ if _WATCHDOG:
         faulthandler.dump_traceback_later(float(_WATCHDOG), exit=True)
     except (ImportError, ValueError):       # 时限写坏了不该挡住测试
         pass
+# Windows 上「删不掉还被人打开着的文件」是平台事实，不是被测对象的缺陷。
+#
+# 2026-09-22 公开仓库 CI 的 Windows 那列：注解里三条 traceback 形状完全一样——
+#
+#     AssertionError / （或什么都没有）
+#     During handling of the above exception, another exception occurred:
+#       tempfile.TemporaryDirectory.__exit__ → shutil._rmtree_unsafe → os.unlink
+#       PermissionError: [WinError 32] The process cannot access the file
+#                        because it is being used by another process
+#
+# 凡是起过子进程、或留着一个没关的 sqlite 连接的用例（尾部那句
+# `ResourceWarning: unclosed database` 就是它），在清理临时目录时都会这样。
+# 于是**通过的用例也被记成 ERROR**，整列 Windows 的读数变得无法解释：
+# 注解里列出的 40 条全是 ERROR，没有一条 FAIL。
+#
+# 标准库自己给了答案（3.10 起的 `ignore_cleanup_errors`）。在这里统一打开，
+# 只在 Windows，POSIX 一字不变——那边删打开着的文件本来就合法，
+# 清理失败在那边是真信号，不该一起吞掉。
+#
+# **这不是把 Windows 的问题扫到地毯下**：没关的连接仍然由 ResourceWarning 报出来，
+# 而用例真正的失败原因（断言）也终于能露出来了。
+if sys.platform == "win32":
+    _real_tmpdir = tempfile.TemporaryDirectory
+
+    class _TolerantTemporaryDirectory(_real_tmpdir):
+        """`TemporaryDirectory`，但在 Windows 上清理失败不抛。"""
+
+        def __init__(self, *args, **kwargs):
+            kwargs.setdefault("ignore_cleanup_errors", True)
+            super().__init__(*args, **kwargs)
+
+    tempfile.TemporaryDirectory = _TolerantTemporaryDirectory

@@ -149,10 +149,16 @@ class TheParentIsToldWhatTheChildHas(unittest.TestCase):
         for tool in ("read_file", "list_dir", "glob", "grep"):
             self.assertIn(tool, text)
 
-    def test_it_says_there_is_no_network_and_no_bash(self):
+    def test_it_says_there_is_no_bash_and_when_there_is_network(self):
+        """用户 2026-09-22 定：child 要能联网，但只继承已授权的。
+
+        所以描述要说清**条件**，不能只说「有」或「没有」——主 agent 得知道
+        「先自己 web_fetch 一次拿到授权，再派 child」这条路。
+        """
         text = self.spec("subagent")["description"]
+        self.assertIn("没有 bash", text)
         self.assertIn("web_fetch", text)
-        self.assertIn("bash", text)
+        self.assertIn("授权", text, "要说清是有条件的")
 
     def test_the_description_matches_the_actual_allowlist(self):
         """描述与代码里的白名单必须对得上，否则它只是另一处会漂移的文档。"""

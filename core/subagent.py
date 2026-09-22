@@ -63,7 +63,7 @@ def _notify(callback, event):
 def run_batch(tasks, *, model=None, gateway=None, execution_context=None,
               cancel=None, on_event=None, on_lifecycle=None,
               parent_tool_call_id=None, context_capsule=None,
-              workspace=None):
+              workspace=None, extra_tools=()):
     """并行运行 2–3 个普通只读 child，等待后返回一个有界报告。"""
     specs = _normalize_batch(tasks)
     owned_workspace = workspace is None
@@ -111,6 +111,7 @@ def run_batch(tasks, *, model=None, gateway=None, execution_context=None,
                     model=model, gateway=gateway, name=spec["name"],
                     parent_tool_call_id=parent_tool_call_id,
                     kind="subagent", context_capsule=context_capsule,
+                    extra_tools=extra_tools,
                     before_provider_attempt=(
                         lambda details, index=index:
                         reserve(index, details)))
@@ -168,7 +169,8 @@ def run_batch(tasks, *, model=None, gateway=None, execution_context=None,
 
 def run(task, context=None, model=None, gateway=None, on_event=None,
         execution_context=None, cancel=None, on_lifecycle=None,
-        parent_tool_call_id=None, runtime=None, context_capsule=None):
+        parent_tool_call_id=None, runtime=None, context_capsule=None,
+        extra_tools=()):
     """创建并运行一个可恢复的只读 child agent，返回带稳定 id 的报告。
 
     on_event: 可选回调，用于把子代理的工具调用透出到 UI（否则用户会觉得卡住）。
@@ -180,4 +182,4 @@ def run(task, context=None, model=None, gateway=None, on_event=None,
         execution_context=execution_context, cancel=cancel,
         on_event=on_event, on_lifecycle=on_lifecycle,
         parent_tool_call_id=parent_tool_call_id,
-        context_capsule=context_capsule)
+        context_capsule=context_capsule, extra_tools=extra_tools)

@@ -36,6 +36,15 @@ TAIL_LINES = 8
 BLOCK = re.compile(
     r"={70}\n(?:FAIL|ERROR):[^\n]*\n-{70}\n.*?(?=\n={70}\n|\n-{70}\nRan |\Z)",
     re.S)
+# faulthandler 的挂起转储。`tests/__init__.py` 在 CI 上武装了
+# `dump_traceback_later(..., exit=True)`，到点会打出所有线程的栈。
+#
+# **它是「最近调用在最前」的**，所以挂在哪儿要看**开头**几十行，而「尾部」那条
+# 注解取的是最后 8 行——那是 unittest 最外层的 runner 帧，一点信息都没有。
+# 2026-09-22 macOS 那列就吃了这个：看门狗准时开火、栈也打出来了，
+# 注解里却只有 `unittest/main.py in runTests`。
+HANG = re.compile(r"^Timeout \([^)]*\)!.*", re.M)
+HANG_LINES = 26
 
 
 def escape(text):
@@ -53,6 +62,10 @@ def annotations(log):
         out.append(("失败清单", "\n".join(names[:MAX_NAMES])))
     for index, block in enumerate(BLOCK.findall(log)[:MAX_BLOCKS], 1):
         out.append((f"traceback {index}", block))
+    hit = HANG.search(log)
+    if hit:
+        head = log[hit.start():].splitlines()[:HANG_LINES]
+        out.append(("挂起处（最近调用在最前）", "\n".join(head)))
     parity = [line for line in log.splitlines() if "❌" in line or "⁉" in line]
     if parity:
         out.append(("记分板回归", "\n".join(parity[:MAX_NAMES])))

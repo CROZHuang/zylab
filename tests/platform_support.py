@@ -77,3 +77,28 @@ requires_namespace_sandbox = unittest.skipUnless(
     NAMESPACE_SANDBOX_POSSIBLE,
     "Linux 命名空间沙箱在 Windows 上不存在（unshare/setpriv）："
     "UnshareSandboxAdapter 按设计恒为 unavailable")
+def patience(seconds):
+    """把在开发机上调出来的等待预算，按这台机器的实际速度放大。
+
+    2026-09-22 公开仓库 CI 的 Windows 那列：`workspace.wait(run_id, timeout=1.0)`
+    连着三处 `False is not true`。那个 1.0 秒是在一台 8 核、开着 50 天、空闲的
+    开发机上调出来的；GitHub 的 Windows runner 是共享的慢核，起一个子进程加
+    MSYS 初始化就比这里贵一个量级。
+
+    **和「等信号而不是调睡眠」不冲突**：这里等的本来就是信号
+    （`workspace.wait` 就是那个原语），只是预算给小了。能等信号的地方都该等信号；
+    等不到才算失败——这个函数只决定「等多久才认输」。
+
+    放大倍数按环境定，不按用例定：`ZYLAB_TEST_PATIENCE` 可显式覆盖。
+    """
+    factor = os.environ.get("ZYLAB_TEST_PATIENCE")
+    if factor:
+        try:
+            return float(seconds) * max(1.0, float(factor))
+        except ValueError:
+            pass
+    if IS_WINDOWS:
+        return float(seconds) * 5.0
+    if os.environ.get("CI"):
+        return float(seconds) * 3.0
+    return float(seconds)

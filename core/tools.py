@@ -2346,6 +2346,21 @@ def t_consult_session(target_session=None, question=None, consult_id=None,
         cancel=cancel, on_lifecycle=lifecycle)
 
 
+def _child_extra_tools():
+    """本次会话允许 child 额外继承哪些能力。
+
+    只问会话层（`HOOK_CTX["child_extra_tools"]`），拿不到就是空——**默认不继承**。
+    这样即使某条路径没接上这个 hook，child 也不会多出网络出口。
+    """
+    resolve = HOOK_CTX.get("child_extra_tools")
+    if not callable(resolve):
+        return ()
+    try:
+        return tuple(resolve() or ())
+    except Exception:                                  # noqa: BLE001
+        return ()
+
+
 def t_subagent(task=None, context=None, tasks=None, _task=None, **_):
     from . import subagent
     if task is not None and tasks is not None:
@@ -2393,6 +2408,9 @@ def t_subagent(task=None, context=None, tasks=None, _task=None, **_):
         "parent_tool_call_id": (
             _task.key if _task is not None else None),
         "context_capsule": capsule,
+        # child 能不能联网，由**会话层**决定（只有它知道本次会话的授权状态）。
+        # 这里只是把答案传下去；agents.create 还会按 CHILD_EXTRA_ALLOWED 过滤一遍。
+        "extra_tools": _child_extra_tools(),
     }
     if tasks is not None:
         return subagent.run_batch(tasks, **common)
@@ -3134,9 +3152,10 @@ def _subagent_schema():
         "普通聊天中可主动启动的只读 child agent，无需 /workflow。单个深度调研用 task；"
         "有 2–3 个互相独立的调查时用 tasks 一次并行启动。child 使用当前模型和网关，"
         "不能写文件、不能嵌套派生；主 agent 负责综合和所有修改。简单任务不要启动 child。"
-        "**child 的工具只有四个：read_file / list_dir / glob / grep。没有 bash，"
-        "也没有 web_fetch —— 任何需要联网或跑命令的调研都不能派给它**，"
-        "派了它只会回一句「我没有这个工具」。要联网自己用 web_fetch。",
+        "**child 的工具是 read_file / list_dir / glob / grep，没有 bash** —— "
+        "任何需要跑命令的调研都不能派给它。**联网要看本次会话有没有授权过 "
+        "web_fetch**：授权过（配置 allow / 按过「总是允许」/ yolo）child 就继承它，"
+        "否则它没有网络出口。不确定就先自己 web_fetch 一次，被批准后再派 child。",
         {
             "task": {
                 "type": "string",
@@ -3375,7 +3394,9 @@ SCHEMA = [
                    "≥3 个节点的 DAG 至少要用 2 个席位；审查与汇总都用普通节点表达"
                    "（如 review 节点 depends_on 被审查的节点，final 节点 depends_on 全部）。"
                    "节点数按任务定，受 max_nodes 与 provider 请求预算约束；"
-                   "启动前会对将用到的模型逐个探活。仅当任务确实能拆成独立调查且值得"
+                   "启动前会对将用到的模型逐个探活，跑到一半某个席位的路线坏掉时"
+                   "会换该席位的下一候选；预算耗尽时也会先把在飞的节点收完再停，"
+                   "已产出的报告一并带回。仅当任务确实能拆成独立调查且值得"
                    "多次 provider 请求时使用；简单问答、单文件小改、顺序步骤不要使用。"
                    "启动后继续主任务，完成报告会自动作为 queued user prompt 返回。",
        {

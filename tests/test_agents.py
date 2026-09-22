@@ -14,7 +14,7 @@ from unittest import mock
 from unittest import mock as _mock
 from core import agent as agent_module
 from core import agents, client, store, subagent, tools
-from tests.platform_support import requires_symlinks  # noqa: E402
+from tests.platform_support import patience, requires_symlinks  # noqa: E402
 
 
 def execution():
@@ -634,7 +634,7 @@ class AgentWorkspaceTests(unittest.TestCase):
             record = workspace.spawn(
                 "inspect independently", execution_context=context,
                 name="Qwen scout", kind="workflow-scout")
-            self.assertTrue(workspace.wait(record["id"], timeout=1.0))
+            self.assertTrue(workspace.wait(record["id"], timeout=patience(1.0)))
             final = workspace.get(record["id"])
             events = workspace.drain()
             workspace.close()
@@ -662,7 +662,7 @@ class AgentWorkspaceTests(unittest.TestCase):
             self.assertTrue(BlockingAgent.started.wait(1.0))
 
             workspace.cancel(record["id"])
-            self.assertTrue(workspace.wait(record["id"], timeout=1.0))
+            self.assertTrue(workspace.wait(record["id"], timeout=patience(1.0)))
             final = workspace.get(record["id"])
             workspace.close()
 
@@ -680,7 +680,7 @@ class AgentWorkspaceTests(unittest.TestCase):
             stdout = io.StringIO()
             with contextlib.redirect_stdout(stdout):
                 item = workspace.send(run_id, "direct correction")
-                self.assertTrue(workspace.wait(run_id, timeout=1.0))
+                self.assertTrue(workspace.wait(run_id, timeout=patience(1.0)))
             record = workspace.get(run_id)
             events = workspace.drain()
 
@@ -768,7 +768,7 @@ class AgentWorkspaceTests(unittest.TestCase):
             boundary = runtime.store.finish(
                 record["id"], "completed", result="draft")
             self.assertEqual(boundary["state"], "waiting")
-            self.assertTrue(workspace.wait(record["id"], timeout=1.0))
+            self.assertTrue(workspace.wait(record["id"], timeout=patience(1.0)))
             final = runtime.get(record["id"])
             workspace.close()
 
@@ -795,7 +795,7 @@ class AgentWorkspaceTests(unittest.TestCase):
             self.assertTrue(workspace.active(run_id))
             workspace.send(run_id, "correction two")
             runtime.resume_gate.set()
-            self.assertTrue(workspace.wait(run_id, timeout=1.0))
+            self.assertTrue(workspace.wait(run_id, timeout=patience(1.0)))
             record = runtime.get(run_id)
             workspace.close()
 
@@ -834,7 +834,7 @@ class AgentWorkspaceTests(unittest.TestCase):
             self.assertTrue(finish_entered.wait(1.0))
             workspace.send(run_id, "correction two at finish")
             release_finish.set()
-            self.assertTrue(workspace.wait(run_id, timeout=1.0))
+            self.assertTrue(workspace.wait(run_id, timeout=patience(1.0)))
             record = runtime.get(run_id)
             events = workspace.drain()
             workspace.close()
@@ -859,7 +859,7 @@ class AgentWorkspaceTests(unittest.TestCase):
                 runtime, poll_interval=0.005)
             workspace.send(run_id, "will be cancelled")
             self.assertTrue(BlockingAgent.started.wait(1.0))
-            self.assertTrue(workspace.close(timeout=1.0))
+            self.assertTrue(workspace.close(timeout=patience(1.0)))
             owned = runtime.get(run_id)
             with self.assertRaisesRegex(
                     agents.AgentRuntimeError, "已关闭"):
@@ -874,7 +874,7 @@ class AgentWorkspaceTests(unittest.TestCase):
             external_workspace = agents.AgentWorkspace(
                 external_runtime, poll_interval=0.005)
             external_workspace.send(external["id"], "keep queued")
-            self.assertTrue(external_workspace.close(timeout=1.0))
+            self.assertTrue(external_workspace.close(timeout=patience(1.0)))
             still_running = external_runtime.get(external["id"])
 
         self.assertEqual(owned["state"], "cancelled")

@@ -241,5 +241,77 @@ class AHangLeavesAStack(unittest.TestCase):
                         "看门狗比 job 超时还晚，栈永远打不出来")
 
 
+class AHangDumpIsReportedFromItsHead(unittest.TestCase):
+    """faulthandler 是「最近调用在最前」——挂在哪儿要看开头，不是尾部。
+
+    2026-09-22 macOS 那列：看门狗准时开火（20:02）、栈也打出来了，而注解里只有
+    `unittest/main.py in runTests` —— 因为「尾部」那条取的是最后 8 行，
+    那是 unittest 最外层的 runner 帧，一点信息都没有。
+    """
+
+    HANG_LOG = (
+        "..F\n"
+        "Timeout (0:20:00)!\n"
+        "Thread 0x00007000 (most recent call first):\n"
+        '  File "/x/tests/test_thing.py", line 42 in test_hang\n'
+        '  File "/lib/unittest/case.py", line 100 in run\n'
+        '  File "/lib/unittest/main.py", line 270 in runTests\n')
+
+    def test_the_hang_annotation_starts_at_the_timeout_line(self):
+        bodies = dict(ci_annotate.annotations(self.HANG_LOG))
+        hang = next(v for k, v in bodies.items() if "挂起" in k)
+        self.assertTrue(hang.startswith("Timeout ("), hang[:60])
+        self.assertIn("test_hang", hang, "最内层那帧才是要看的")
+
+    def test_a_normal_failure_log_has_no_hang_annotation(self):
+        titles = [t for t, _ in ci_annotate.annotations(UNITTEST_LOG)]
+        self.assertFalse([t for t in titles if "挂起" in t])
+
+
+class WindowsCleanupIsTolerant(unittest.TestCase):
+    """Windows 上删不掉还被打开着的文件是平台事实，不该把通过的用例记成 ERROR。
+
+    2026-09-22 公开仓库 CI 的 Windows 那列：注解里列出的 40 条**全是 ERROR、
+    没有一条 FAIL**，每条 traceback 的尾巴都一样——
+    `TemporaryDirectory.__exit__ → _rmtree_unsafe → PermissionError [WinError 32]`。
+    凡是起过子进程、或留着没关的 sqlite 连接的用例都会这样，于是整列读数
+    无法解释：看不出哪些是真失败。
+    """
+
+    def test_the_patch_only_applies_to_windows(self):
+        import tempfile
+        patched = tempfile.TemporaryDirectory.__name__ == \
+            "_TolerantTemporaryDirectory"
+        self.assertEqual(patched, sys.platform == "win32",
+                         "POSIX 上清理失败是真信号，不许吞")
+
+    def test_it_defaults_to_ignoring_cleanup_errors(self):
+        """无论在哪个平台，那个类本身的默认值得是「忽略清理错误」。"""
+        import inspect
+        import tempfile as real
+        source = (Path(ROOT) / "tests" / "__init__.py").read_text(
+            encoding="utf-8")
+        self.assertIn('kwargs.setdefault("ignore_cleanup_errors", True)', source)
+        self.assertIn('if sys.platform == "win32":', source)
+        # 标准库得真的支持这个参数（3.10 起）
+        self.assertIn("ignore_cleanup_errors",
+                      inspect.signature(real.TemporaryDirectory).parameters)
+
+    def test_a_still_open_file_does_not_break_cleanup_where_it_is_patched(self):
+        import tempfile
+        holder = tempfile.TemporaryDirectory(prefix="zylab-open-")
+        stuck = Path(holder.name) / "held.txt"
+        handle = open(stuck, "w", encoding="utf-8")
+        handle.write("x")
+        try:
+            holder.cleanup()          # Windows 上这行原来会抛 WinError 32
+        finally:
+            handle.close()
+            try:
+                holder.cleanup()
+            except OSError:
+                pass
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -876,6 +876,7 @@ class Session:
         tools.HOOK_CTX["subagent_control"] = self.subagent_control_for_tool
         tools.HOOK_CTX["context_capsule"] = self.build_context_capsule
         tools.HOOK_CTX["workspace_changed"] = self._workspace_changed
+        tools.HOOK_CTX["child_extra_tools"] = self.child_extra_tools
         self.ag.checkpoint_prepared = self.checkpoint_prepared
         self.ag.compaction_state = self._compaction_state
         try:
@@ -3472,6 +3473,28 @@ class Session:
                         result[f"{stream}_truncated"] = bool(
                             blob.get("truncated"))
         return result
+
+    def child_extra_tools(self):
+        """child 能额外继承哪些能力。**继承，不是授予。**
+
+        用户 2026-09-22 定：child 要能联网。但 `web_fetch` 的权限默认是 `ask`
+        （它是模型唯一的网络出口），而 child 的 `confirm` 是硬编码 True、
+        又拿不到 decision_gate —— 无条件给它就等于让它无声地绕过那道 ask。
+
+        所以判据是「**父会话对 web_fetch 已经是允许的**」：配置写了 allow、
+        本次会话按过 always、或者在 yolo 里。三者都是用户已经对这一会话表过态，
+        child 继承它不新增同意面、也不构成提权。
+        没表过态时 child 照旧没有网络出口——它会在报告里说「需要联网但没有」，
+        而主 agent 的工具描述里也写着这条（可发现性，见 2026-09-22 报告 §2）。
+        """
+        granted = []
+        for name in sorted(AGENTS.CHILD_EXTRA_ALLOWED):
+            policy_name, perm = _configured_permission(self.cfg, name, {})
+            if perm == "deny":
+                continue                               # 明确禁掉的，谁都不继承
+            if perm == "allow" or self.auto or policy_name in self.always:
+                granted.append(name)
+        return tuple(granted)
 
     def subagent_control_for_tool(self, payload):
         """模型侧的 `/agents list|peek|send` —— 派得出去，也要能对话。

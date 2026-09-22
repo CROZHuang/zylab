@@ -195,6 +195,27 @@ def _owner_alive(record):
     return True
 
 
+# 「这条路线本身不行」而不是「这个任务做不出来」的几种说法。
+#
+# 2026-09-22 的实测现场：一个席位（kimi）把共享的 provider 请求预算耗到 5/5，
+# 另一个（deepseek）403 model_not_available；同一时刻第三个（glm）还在跑，
+# 而 workflow 整体已被判失败——8 个请求、44,523 token、**零有效产出**。
+#
+# 探活本来就会在启动前换候选（见 _preflight），但供应商的可用性会**跑到一半才
+# 抖掉**（deepinfer 的成员资格双向抖动是已知事实）。所以同一套换候选的逻辑也要
+# 能在运行中用一次：与其让一个坏席位把共享预算耗光，不如换它的下一候选。
+_ROUTE_LEVEL_FAILURE = (
+    "model_not_available", "model is not available", "model_unavailable",
+    "provider-attempt limit exhausted", "provider attempt limit",
+)
+
+
+def _is_route_level_failure(error):
+    """这次失败是不是「换条路线可能就好了」。"""
+    low = str(error or "").lower()
+    return any(token in low for token in _ROUTE_LEVEL_FAILURE)
+
+
 class WorkflowStore:
     """每个 workflow 一个私有原子 JSON；支持唯一前缀查询。"""
 
@@ -850,6 +871,14 @@ class WorkflowManager:
         payload["actor"] = str(actor or "")[:256]
         return self._reserve_request(workflow_id, payload)
 
+    def _plan_node(self, workflow_id, key):
+        """按 key 取当前的节点行（要看 attempts 这种会被并发改的字段）。"""
+        for node in ((self.store.get(workflow_id).get("plan") or {})
+                     .get("agents") or []):
+            if node.get("key") == key:
+                return node
+        return None
+
     def _plan_node_update(self, workflow_id, key, **changes):
         def mutate(item):
             for node in (item.get("plan") or {}).get("agents") or []:
@@ -1204,6 +1233,80 @@ class WorkflowManager:
             f"{len(value) - keep} 字符]…\n\n"
             + value[-keep // 3:])
 
+    # 预算耗尽时给在飞节点的收尾预算。不能无界：workflow 已经该停了，
+    # 这里只是不白扔已经花掉的钱。
+    DRAIN_SECONDS = 90.0
+
+    def _drain_active(self, workflow_id, driver, active):
+        """不再启动新节点，只等已经起来的 child 把报告交完。
+
+        `_budget_stop_reason` 命中时原来直接 raise，而 `active` 里还挂着已经花过
+        token、马上就要交报告的 child——它们的产出连同预算一起丢掉。
+        排空是**有界**的（DRAIN_SECONDS），到点还没完的按原样失败。
+        """
+        deadline = time.monotonic() + self.DRAIN_SECONDS
+        while active and time.monotonic() < deadline:
+            if driver.cancel.is_set():
+                break
+            for agent_id, spec in list(active.items()):
+                try:
+                    child = self.workspace.get(agent_id)
+                except agents.AgentRuntimeError:
+                    active.pop(agent_id, None)
+                    self._release_slot(spec["gateway"])
+                    continue
+                if child.get("state") not in agents.TERMINAL_STATES:
+                    continue
+                active.pop(agent_id, None)
+                self._release_slot(spec["gateway"])
+                self._refresh_agent(
+                    workflow_id, child, phase="scout", seat=spec["seat"])
+                self._plan_node_update(
+                    workflow_id, spec["key"],
+                    state=child.get("state"), ended_at=_now(),
+                    report=agents.project_report(
+                        child.get("result"))[:agents.MAX_REPORT],
+                    error=str(child.get("error") or ""))
+            if active:
+                driver.cancel.wait(0.2)
+
+    def _seat_failover(self, workflow_id, node):
+        """节点因**路线**失败时，换该席位的下一候选并重新排队。
+
+        与探活用的是同一套候选顺序（`self.seat_routes`）——区别只是时机：
+        探活在启动前，这个在跑到一半供应商抖掉之后。换过的路线记在
+        `failover_from` 里，报告里看得见「这个席位换过」。
+
+        返回 True 表示已经重新排队；False 表示没有可换的，保持失败。
+        """
+        seat = str(node.get("seat") or "")
+        if not seat:
+            return False
+        tried = {(str(node.get("gateway") or ""), str(node.get("model") or ""))}
+        tried.update(
+            tuple(item) for item in (node.get("failover_from") or ())
+            if isinstance(item, (list, tuple)) and len(item) == 2)
+        try:
+            candidates = list(self.seat_routes(
+                seat, route_allowed=self._route_allowed))
+        except Exception:                              # noqa: BLE001
+            return False
+        for candidate in candidates:
+            alt = (str(candidate.get("gateway") or ""),
+                   str(candidate.get("id") or ""))
+            if not all(alt) or alt in tried:
+                continue
+            self._plan_node_update(
+                workflow_id, node["key"],
+                state="queued", agent_id="", report="", ended_at="",
+                gateway=alt[0], model=alt[1],
+                failover_from=sorted(tried),
+                error=(f"席位 {seat} 换路线："
+                       f"{node.get('model')}@{node.get('gateway')} → "
+                       f"{alt[1]}@{alt[0]}"))
+            return True
+        return False
+
     def _run_plan_nodes(self, workflow_id, driver):
         active = {}
         try:
@@ -1243,10 +1346,29 @@ class WorkflowManager:
                         error=str(child.get("error") or ""),
                     )
                     changed = True
+                    # 路线级失败（模型不可用 / 该席位把重试耗光）——换该席位的
+                    # 下一候选再排一次，而不是让一个坏席位把共享预算耗光。
+                    # 重排也受 max_node_attempts 约束：它在 spawn 时 +1。
+                    if (child.get("state") == "failed"
+                            and _is_route_level_failure(child.get("error"))):
+                        fresh = self._plan_node(workflow_id, spec["key"])
+                        budget = (self.store.get(workflow_id).get("budget")
+                                  or {})
+                        limit = int(budget.get(
+                            "max_node_attempts", MAX_NODE_ATTEMPTS))
+                        if (fresh is not None
+                                and int(fresh.get("attempts") or 0) < limit
+                                and self._seat_failover(workflow_id, fresh)):
+                            continue
 
                 workflow = self.store.get(workflow_id)
                 stopped = self._budget_stop_reason(workflow)
                 if stopped:
+                    # **先把在飞的收完再停。** 以前这里直接 raise，而 active 里
+                    # 还挂着已经花过 token、马上就要交报告的 child ——
+                    # 它们的产出连同预算一起被丢掉。不再启动新节点，只等已经
+                    # 起来的那些，有界。
+                    self._drain_active(workflow_id, driver, active)
                     raise WorkflowError(stopped)
                 node_list = (workflow.get("plan") or {}).get("agents") or []
                 nodes = {node["key"]: node for node in node_list}
