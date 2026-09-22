@@ -382,10 +382,23 @@ def bash_executable():
     return "bash"
 
 
+_BASH_CACHE = {}
+
+
 def _bash_candidates():
-    """PATH 上所有叫 bash 的可执行文件，按 PATH 顺序。"""
+    """PATH 上所有叫 bash 的可执行文件，按 PATH 顺序。按 PATH 值缓存。
+
+    缓存不是过早优化：`bash_executable()` 现在每次请求都被 `agent.shell_facts()`
+    调一次，而 Windows 的 PATH 常有四十来项、每项还要按 PATHEXT 试好几个后缀——
+    不缓存就是每次请求几百次 stat。PATH 变了（`/model` 之类不会改它，但用户
+    可能在会话里改环境）就重新找，所以用 PATH 的值当键而不是无条件只找一次。
+    """
+    path = os.environ.get("PATH", os.defpath)
+    hit = _BASH_CACHE.get(path)
+    if hit is not None:
+        return list(hit)
     seen = []
-    for entry in os.environ.get("PATH", os.defpath).split(os.pathsep):
+    for entry in path.split(os.pathsep):
         if not entry:
             continue
         found = shutil.which("bash", path=entry)
@@ -395,6 +408,9 @@ def _bash_candidates():
         found = shutil.which("bash")
         if found:
             seen.append(found)
+    if len(_BASH_CACHE) > 8:          # 别让它变成一个长不封顶的表
+        _BASH_CACHE.clear()
+    _BASH_CACHE[path] = tuple(seen)
     return seen
 
 

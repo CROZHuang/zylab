@@ -181,7 +181,6 @@ def _run_conpty_child(body, sends, *, cwd, timeout, prefix, child_env):
         cwd=cwd, env=child_env, cols=1000, rows=50)
     output = bytearray()
     try:
-        armed = False
         for item in sends:
             action = item if isinstance(item, PTYSend) else PTYSend(
                 payload=item[1], delay=item[0])
@@ -189,9 +188,11 @@ def _run_conpty_child(body, sends, *, cwd, timeout, prefix, child_env):
                 _read_until_conpty(
                     child, output, action.after,
                     timeout if action.timeout is None else action.timeout)
-            elif not armed:
-                _await_pump(_read_until_conpty, child, output)
-                armed = True
+            # **ConPTY 这边不等 PUMP_ARMED。** 它不透传字节，是按自己的屏幕缓冲
+            # 重新渲染的，而 `\x1b[?2004h` 是一条 DEC 私有模式设置、不是屏幕内容
+            # ——它永远不会出现在输出里，等它只会白等满预算（每个用例加 5 秒，
+            # 还可能把用例自己的超时顶爆）。Windows 上保持移植方验证过的「按秒数
+            # 发」原样。POSIX 侧的等待见 run_pty_child。
             if action.delay:
                 time.sleep(action.delay)
             child.write(action.payload)
@@ -214,7 +215,7 @@ PUMP_ARMED = b"\x1b[?2004h"
 
 
 def _await_pump(read_until, *args, budget=5.0):
-    """等 child 真的进了 raw mode，再按秒数发键。
+    """等 child 真的进了 raw mode，再按秒数发键。**只用于 POSIX 的真 pty。**
 
     一部分用例是「睡 0.12 秒再发」这种写法等 child 起来，而那个数是在
     Python 3.12 + 空闲的 8 核上调出来的。3.10 的解释器启动明显更慢

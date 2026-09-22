@@ -9,3 +9,6 @@ dist/
 
 # 一次性采集日志，不入库
 logs/
+# CI 里 tee 出来的临时日志（ci_annotate.py 读它），不入库
+unit.log
+parity.log

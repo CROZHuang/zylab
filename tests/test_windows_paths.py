@@ -199,12 +199,18 @@ class WslIsNotGitBash(unittest.TestCase):
         from core import tools
         self.tools = tools
 
+    # 假的 bash 在 **Windows 上必须带 .exe**：`shutil.which` 那边按 PATHEXT
+    # 匹配，一个没有扩展名的 `bash` 找不到，用例会在真 Windows 上假红。
+    # （这条是 2026-09-21 写完之后自己 review 出来的，不是 CI 报的——
+    # 用 POSIX 去模拟 Windows 时，最容易漏的就是 PATHEXT 这类只在那边存在的规则。）
+    EXE_NAME = "bash.exe" if WINDOWS else "bash"
+
     def _fake_tree(self, tmp):
         system32 = os.path.join(tmp, "Windows", "System32")
         gitbin = os.path.join(tmp, "Git", "usr", "bin")
         for d in (system32, gitbin):
             os.makedirs(d)
-            exe = os.path.join(d, "bash")
+            exe = os.path.join(d, self.EXE_NAME)
             Path(exe).write_text("#!/bin/sh\n", encoding="utf-8")
             os.chmod(exe, 0o755)
         return system32, gitbin
@@ -217,8 +223,9 @@ class WslIsNotGitBash(unittest.TestCase):
                    "SystemRoot": os.path.join(tmp, "Windows")}
             with mock.patch.object(self.tools.wincompat, "IS_WINDOWS", True), \
                     mock.patch.dict(os.environ, env):
-                self.assertEqual(self.tools.bash_executable(),
-                                 os.path.join(gitbin, "bash"))
+                picked = self.tools.bash_executable()
+            self.assertEqual(os.path.dirname(picked), gitbin,
+                             f"挑中的是 {picked}，应该在 Git 的 bin 里")
 
     def test_only_the_shim_present_is_refused_with_an_actionable_message(self):
         import tempfile
