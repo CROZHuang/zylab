@@ -195,6 +195,64 @@ def fchmod(fd, mode):
         return False
 
 
+def is_link_like(path):
+    """这条路径本身是不是一个**会把操作导向别处**的重定向点？
+
+    纯规则，两个平台都跑（所以 Linux 门禁测得到它）：
+    - 符号链接：`lstat` 的 `S_ISLNK`，两边通用；
+    - **目录 junction**：Windows 独有，`os.path.islink` 对它返回 **False**
+      （CPython 3.8 起刻意如此），但它同样会把后续操作导到别的目录去。
+      认的是 `st_reparse_tag`，POSIX 的 stat 结果没有这个字段，取 0。
+
+    读不到就当「是」——这个函数的调用方都在做安全判断，不确定时收紧。
+    """
+    try:
+        info = os.lstat(path)
+    except OSError:
+        return True
+    if stat.S_ISLNK(info.st_mode):
+        return True
+    mount_point = getattr(stat, "IO_REPARSE_TAG_MOUNT_POINT", None)
+    tag = getattr(info, "st_reparse_tag", 0)
+    return bool(mount_point is not None and tag == mount_point)
+
+
+def chmod_nofollow(path, mode):
+    """`os.chmod(path, mode, follow_symlinks=False)` 的跨平台版。
+
+    **POSIX 一字不变，包括那个有用的 `NotImplementedError`。** Linux 的 glibc
+    对 `fchmodat(AT_SYMLINK_NOFOLLOW)` 只在**目标真是符号链接**时报 ENOTSUP，
+    CPython 把它翻成 `NotImplementedError`（实测 3.12：普通目录/文件成功，
+    符号链接抛，且 `os.chmod not in os.supports_follow_symlinks`）。也就是说
+    在 POSIX 上这个异常的含义是「**这是符号链接，拒绝改它**」，而 checkpoints
+    的符号链接拒绝正是靠它 —— 不能把它吞掉。
+
+    **Windows 上 os.chmod 的 follow_symlinks 直到 3.13 才实现**，之前对**任何**
+    路径都抛 `NotImplementedError`，于是「拒绝符号链接」退化成「什么都拒绝」：
+    `CheckpointStore.__init__` 里的 `_secure_dir` 当场炸，write_file / edit_file /
+    rewind / restore 全部不可用（2026-09-22 公开仓库 CI 的 py3.10 那列：
+    test_checkpoints + test_agent_loop 成片 ERROR，而 py3.13 那列没有）。
+    更糟的是 `NotImplementedError` **不是 OSError**，调用点的 `except OSError`
+    接不住，错误信息里连「哪个目录」都没有。
+
+    Windows 的退化语义（**不按解释器版本分叉** —— 同一个平台上两个 python
+    给出两种行为，比两个平台不一样难查得多）：
+    - 先用 `is_link_like` 自己判重定向点，是就抛同样的 `NotImplementedError`，
+      与 POSIX 行为对齐（**非原子**：那边是内核一次调用，这边是检查 + 调用，
+      中间被换掉的窗口关不掉，没有等价原语）；
+    - 不是，就用普通 `os.chmod`。它在 Windows 上只能翻
+      FILE_ATTRIBUTE_READONLY 一个位，表达不出这里要的 0o700/0o600「只有属主」
+      —— 那要写 ACL。与 `fchmod` 同一条既有退化：状态文件都在用户 profile 下，
+      NTFS ACL 由目录继承。
+    """
+    if not IS_WINDOWS:
+        return os.chmod(path, int(mode), follow_symlinks=False)
+    if is_link_like(path):
+        raise NotImplementedError(
+            f"chmod: 拒绝对重定向点改权限（{path}）")
+    return os.chmod(path, int(mode))
+
+
 # ---------------------------------------------------------------------------
 # 3b. openat/dir_fd 家族：Windows 用绝对路径退化（wincompat.fd_open 等）
 # ---------------------------------------------------------------------------
@@ -343,10 +401,76 @@ def retry_sharing(call, *, attempts=SHARING_RETRIES):
             time.sleep(SHARING_BACKOFF * (2 ** attempt))
 
 
+# Windows 的「只读属性」挡的是**操作**，不是权限位；POSIX 没有这个失败模式。
+#
+# `rename(2)` / `unlink(2)` 只看**目录**的写权限，目标文件自己是 0444 还是 0000
+# 都无所谓 —— 所以 POSIX 上 zylab 能原子替换一个只读文件。Windows 上
+# FILE_ATTRIBUTE_READONLY 会让 `os.replace` / `os.unlink` 直接
+# `PermissionError [WinError 5] Access is denied`，而这**不是**共享冲突：
+# 重试到天亮也一样（2026-09-22 CI 的 py3.13 那列
+# `test_mode_zero_is_preserved_by_durable_compensation` 就是它）。
+#
+# 后果不是一条测试红，而是**Windows 上 checkpoint 盖不回只读文件**，
+# 同一个 write_file / restore 在 Linux 上是成功的。所以这里摘掉只读位再做一次，
+# 把行为拉回 POSIX 语义。
+
+
+def readonly_blocks_write(info):
+    """纯规则：`os.lstat` 的结果里，只读属性会不会挡住 replace / unlink？
+
+    与平台无关（两边都能测），判平台放在调用点。
+    """
+    return not stat.S_IMODE(info.st_mode) & stat.S_IWRITE
+
+
+def clear_readonly(path):
+    """摘掉 path 的只读属性；返回**原来的 mode**，没动过则返回 None。
+
+    返回原 mode 而不是布尔：调用方要能在「摘了但还是没成事」时放回去。
+    重定向点一律不碰 —— 摘属性是写操作，不该穿过符号链接落到别人身上。
+    """
+    try:
+        info = os.lstat(path)
+    except OSError:
+        return None
+    mode = stat.S_IMODE(info.st_mode)
+    if is_link_like(path) or not readonly_blocks_write(info):
+        return None
+    try:
+        os.chmod(path, mode | stat.S_IWRITE)
+    except OSError:
+        return None
+    return mode
+
+
+def _retry_then_unlock(call, target):
+    """有界重试；若最后仍被拒，摘掉目标的只读位再试**一次**。
+
+    顺序刻意是「先重试、后摘位」：共享冲突是瞬态且常见，只读属性是持久且少见。
+    代价是只读那条路要先白花掉 `retry_sharing` 的 0.31 s 上限；换来的是
+    常见路径上一次 lstat 都不多做。
+
+    第二次仍失败就把只读位**放回去**：目标同时只读又被别的进程占着时（Windows
+    上并不罕见），否则就在用户文件上留下一处没成事的改动。
+    """
+    try:
+        return retry_sharing(call)
+    except PermissionError:
+        saved = clear_readonly(target)
+        if saved is None:
+            raise
+        try:
+            return call()
+        except OSError:
+            with contextlib.suppress(OSError):
+                os.chmod(target, saved)
+            raise
+
+
 def fd_unlink(dirfd, name):
     root, full = _join_dir(dirfd, name)
     if root is not None:
-        return retry_sharing(lambda: os.unlink(full))
+        return _retry_then_unlock(lambda: os.unlink(full), full)
     return os.unlink(str(name), dir_fd=int(dirfd))
 
 
@@ -375,7 +499,7 @@ def fd_replace(src_dirfd, src_name, dst_dirfd, dst_name):
     d_root, d_full = _join_dir(dst_dirfd, dst_name)
     if s_root is None or d_root is None:
         raise OSError("fd_replace: Windows 上不接收真 fd")
-    return retry_sharing(lambda: os.replace(s_full, d_full))
+    return _retry_then_unlock(lambda: os.replace(s_full, d_full), d_full)
 
 
 # Win32 把这些名字当**设备**，不当文件名——`echo x > NUL` 写进黑洞，`CON` 读
@@ -601,6 +725,11 @@ class _PosixRaw:
         self.capture_signals = capture_signals
 
     def __enter__(self):
+        # 注：进入这一侧用的是 `tty.setcbreak/setraw` 的默认 `TCSAFLUSH`，
+        # 它**同样**要等输出排空（还会丢弃未读输入，这是进 raw 模式想要的）。
+        # 目前没观察到它挂过——调用点进来时输出队列都是空的。**不顺手改**：
+        # 改成 TCSANOW 会连「丢弃预输入」一起改掉，那是有语义的行为，
+        # 要改得有自己的证据（退出那一侧是实测挂死才改的，见 __exit__）。
         import termios
         self.saved = termios.tcgetattr(self.fd)
         if self.cbreak:
@@ -617,7 +746,28 @@ class _PosixRaw:
 
     def __exit__(self, *exc):
         if self.saved is not None:
-            self._termios.tcsetattr(self.fd, self._termios.TCSADRAIN, self.saved)
+            # **TCSANOW，不是 TCSADRAIN。**
+            #
+            # TCSADRAIN 的语义是「等输出队列排空之后再改」，而「排空」在
+            # macOS/BSD 上是**无界等待**：对端没人读（或用户按过 Ctrl+S，
+            # XOFF 把输出停住）时，tcsetattr 永远不返回。Linux 的 set_termios
+            # 走的是带超时的 tty_wait_until_sent，所以同一行代码在 Linux 上
+            # 从来没挂过 —— 这正是它藏住的原因（这段是 Windows 移植之前的
+            # 原 tui.raw_mode 代码，一直只在 Linux 上跑）。
+            #
+            # 2026-09-22 公开仓库 CI 的 macOS 那列：单元测试步骤跑满 20 分钟
+            # 看门狗，栈顶就是这一行（test_termcaps
+            # `test_probe_on_a_silent_pty_finishes_within_budget`
+            # → termcaps.probe → _Query.__exit__ → 这里）。**不是慢，是挂死**，
+            # 而且前两轮连结论都拿不到，只有 `cancelled`。
+            #
+            # 产品后果不止一条测试：termcaps.probe 在**启动路径**上，
+            # 于是 macOS 用户在一个停住输出的终端里起 zylab，会卡在画面出来之前。
+            #
+            # 代价：恢复不再等在飞的输出落地。TCSADRAIN 想避免的是「模式改动
+            # 插在输出中间」，而这里恢复的是进入时保存的那份属性、只影响之后
+            # 的处理，最坏是退出瞬间一点显示瑕疵 —— 比挂死轻得多。
+            self._termios.tcsetattr(self.fd, self._termios.TCSANOW, self.saved)
         return False
 
 

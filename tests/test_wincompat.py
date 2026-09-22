@@ -10,9 +10,11 @@
 import contextlib
 import os
 import pathlib
+import stat
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 import unittest
 from pathlib import Path
@@ -168,6 +170,206 @@ class FdAtContract(unittest.TestCase):
             self.assertFalse((self.root / "a.txt").exists())
         finally:
             wincompat.close(box)
+
+
+class ModeAndRedirectRules(unittest.TestCase):
+    """两条「为 Windows 写、但在 Linux 上测得到」的规则（AGENTS.md §平台不变量）。
+
+    2026-09-22 公开仓库 CI 的两列 Windows 主因就在这里，而且**两列不一样**：
+    - py3.10：`os.chmod(..., follow_symlinks=False)` 在 Windows 上 3.13 才实现，
+      之前对任何路径都抛 `NotImplementedError`（还不是 OSError），
+      `CheckpointStore.__init__` 当场炸 → test_checkpoints/test_agent_loop 成片；
+    - py3.13：只读属性挡住 `os.replace`，`WinError 5`，而它**不是**共享冲突，
+      重试无用（`test_mode_zero_is_preserved_by_durable_compensation`）。
+    """
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.root = Path(self.tmp.name)
+        self.addCleanup(self.tmp.cleanup)
+
+    # ---- is_link_like：重定向点判据 -------------------------------------
+    def test_a_plain_file_or_dir_is_not_a_redirect(self):
+        target = self.root / "f"
+        target.write_text("x", encoding="utf-8")
+        self.assertFalse(wincompat.is_link_like(target))
+        self.assertFalse(wincompat.is_link_like(self.root))
+
+    def test_a_symlink_is_a_redirect(self):
+        target = self.root / "f"
+        target.write_text("x", encoding="utf-8")
+        link = self.root / "l"
+        link.symlink_to(target)
+        self.assertTrue(wincompat.is_link_like(link))
+
+    def test_an_unreadable_path_is_treated_as_one(self):
+        """调用方都在做安全判断——不确定时收紧，不是放过。"""
+        self.assertTrue(wincompat.is_link_like(self.root / "nope"))
+
+    # ---- chmod_nofollow：POSIX 语义一字不变 ----------------------------
+    def test_it_applies_the_mode_to_a_real_path(self):
+        target = self.root / "f"
+        target.write_text("x", encoding="utf-8")
+        wincompat.chmod_nofollow(target, 0o600)
+        self.assertEqual(stat.S_IMODE(target.lstat().st_mode), 0o600)
+        wincompat.chmod_nofollow(self.root, 0o700)
+        self.assertEqual(stat.S_IMODE(self.root.lstat().st_mode), 0o700)
+
+    def test_it_refuses_to_chmod_through_a_symlink(self):
+        """checkpoints 的符号链接拒绝就靠这个异常——不能被包装吞掉。
+
+        Linux 上 `os.chmod not in os.supports_follow_symlinks`，但对**非**符号
+        链接照样成功、只在真是符号链接时抛 `NotImplementedError`（glibc 的
+        `fchmodat(AT_SYMLINK_NOFOLLOW)` 报 ENOTSUP）。所以这个异常在 POSIX 上
+        的含义是「这是符号链接，拒绝」，不是「本平台不支持」。
+        """
+        target = self.root / "f"
+        target.write_text("x", encoding="utf-8")
+        os.chmod(target, 0o644)
+        link = self.root / "l"
+        link.symlink_to(target)
+        with self.assertRaises(NotImplementedError):
+            wincompat.chmod_nofollow(link, 0o777)
+        self.assertEqual(stat.S_IMODE(target.stat().st_mode), 0o644,
+                         "目标的权限一位都不该动")
+
+    # ---- 只读属性：规则与摘除 ------------------------------------------
+    def test_the_readonly_rule_reads_the_write_bit(self):
+        target = self.root / "f"
+        target.write_text("x", encoding="utf-8")
+        os.chmod(target, 0o444)
+        self.assertTrue(wincompat.readonly_blocks_write(target.lstat()))
+        os.chmod(target, 0o000)
+        self.assertTrue(wincompat.readonly_blocks_write(target.lstat()))
+        os.chmod(target, 0o644)
+        self.assertFalse(wincompat.readonly_blocks_write(target.lstat()))
+
+    def test_clear_readonly_only_touches_what_it_must(self):
+        target = self.root / "f"
+        target.write_text("x", encoding="utf-8")
+        os.chmod(target, 0o400)
+        self.assertEqual(wincompat.clear_readonly(target), 0o400,
+                         "要把原 mode 交回去，调用方才放得回")
+        self.assertTrue(stat.S_IMODE(target.lstat().st_mode) & stat.S_IWRITE)
+        self.assertIsNone(wincompat.clear_readonly(target),
+                          "已经可写就不该再动它")
+        self.assertIsNone(wincompat.clear_readonly(self.root / "nope"))
+
+    def test_clear_readonly_never_goes_through_a_symlink(self):
+        target = self.root / "f"
+        target.write_text("x", encoding="utf-8")
+        os.chmod(target, 0o400)
+        link = self.root / "l"
+        link.symlink_to(target)
+        self.assertIsNone(wincompat.clear_readonly(link))
+        self.assertEqual(stat.S_IMODE(target.stat().st_mode), 0o400)
+
+    def test_the_fallback_unlocks_then_retries_once(self):
+        """顺序：先有界重试（瞬态的共享冲突），再摘只读位（持久的属性）。"""
+        target = self.root / "f"
+        target.write_text("x", encoding="utf-8")
+        os.chmod(target, 0o400)
+        calls = []
+
+        def call():
+            calls.append(stat.S_IMODE(target.lstat().st_mode))
+            if len(calls) == 1:
+                raise PermissionError(5, "Access is denied")
+            return "done"
+
+        self.assertEqual(
+            wincompat._retry_then_unlock(call, str(target)), "done")
+        self.assertEqual(len(calls), 2)
+        self.assertFalse(calls[0] & stat.S_IWRITE, "第一次是只读时调的")
+        self.assertTrue(calls[1] & stat.S_IWRITE, "第二次之前已经摘掉只读位")
+
+    def test_the_fallback_re_raises_when_there_is_nothing_to_unlock(self):
+        """不是只读属性挡的，就该把原异常原样抛出去——不许无限试。"""
+        target = self.root / "f"
+        target.write_text("x", encoding="utf-8")
+        calls = []
+
+        def call():
+            calls.append(1)
+            raise PermissionError(13, "真的没权限")
+
+        with self.assertRaises(PermissionError):
+            wincompat._retry_then_unlock(call, str(target))
+        self.assertEqual(len(calls), 1, "POSIX 上只该调一次")
+
+    def test_a_failed_second_try_puts_the_readonly_bit_back(self):
+        """目标既只读、又被别的进程占着时：不该在用户文件上留下没成事的改动。"""
+        target = self.root / "f"
+        target.write_text("x", encoding="utf-8")
+        os.chmod(target, 0o400)
+
+        def always_denied():
+            raise PermissionError(5, "Access is denied")
+
+        with self.assertRaises(PermissionError):
+            wincompat._retry_then_unlock(always_denied, str(target))
+        self.assertEqual(stat.S_IMODE(target.lstat().st_mode), 0o400,
+                         "第二次也失败了，只读位要放回去")
+
+
+class RawModeDoesNotWaitForOutput(unittest.TestCase):
+    """退出 raw 模式不能等输出排空——那在 macOS/BSD 上是**无界等待**。
+
+    2026-09-22 公开仓库 CI 的 macOS 那列：单元测试步骤跑满 20 分钟看门狗，
+    栈顶是 `wincompat` 的 `_PosixRaw.__exit__` 那行 `tcsetattr(..., TCSADRAIN)`
+    （经 `termcaps.probe` → `_Query.__exit__` 进来）。Linux 的 `set_termios`
+    走带超时的 `tty_wait_until_sent`，所以同一行代码在这边从来没挂过——
+    **这就是它藏了这么久的原因**，也是为什么这条用例要在两个平台上都跑。
+    """
+
+    def test_leaving_raw_mode_does_not_wait_for_unread_output(self):
+        try:
+            import pty
+        except ImportError:                      # Windows 没有 pty
+            self.skipTest("需要 POSIX pty")
+        master, slave = pty.openpty()
+        done = threading.Event()
+
+        def cycle():
+            # 进入时队列是空的（与 termcaps.probe 的顺序一致）；写完这几百字节
+            # 再退出——没有任何人读 master，它们永远排不空。
+            with wincompat.raw_mode(slave, cbreak=True):
+                os.write(slave, b"x" * 512)
+            done.set()
+
+        # 放进线程里跑：挂住时这条用例**快速红**，而不是把整个套件拖到看门狗
+        # 开火（那一轮 macOS 连结论都没给出来，只有 cancelled）。
+        worker = threading.Thread(target=cycle, daemon=True)
+        worker.start()
+        worker.join(10.0)
+        try:
+            self.assertTrue(
+                done.is_set(),
+                "退出 raw 模式卡住了：它在等输出队列排空（TCSADRAIN 语义），"
+                "而对端没人读时那是无界等待")
+        finally:
+            if done.is_set():
+                os.close(slave)
+            os.close(master)
+
+    def test_the_source_never_drains_on_restore(self):
+        """规则钉在源码层：两个平台都执行得到，不依赖手上有没有那台机器。
+
+        按 AST 找 `*.TCSADRAIN` 这个**属性访问**，不是按字符串找——正文里
+        正好有一段注释在解释「为什么不能用 TCSADRAIN」，纯子串断言会被自己
+        的注释绊倒（第一版就是）。
+        """
+        import ast
+        tree = ast.parse(
+            (Path(ROOT) / "core" / "wincompat.py").read_text(encoding="utf-8"))
+        lines = sorted(node.lineno for node in ast.walk(tree)
+                       if isinstance(node, ast.Attribute)
+                       and node.attr == "TCSADRAIN")
+        self.assertEqual(
+            lines, [],
+            f"wincompat.py:{lines} 用了 TCSADRAIN。恢复终端属性只能用 TCSANOW："
+            "TCSADRAIN 要等输出排空，macOS/BSD 上对端不读就永远不返回，"
+            "而 termcaps.probe 在启动路径上")
 
 
 class RawModeContract(unittest.TestCase):

@@ -974,7 +974,7 @@ def _secure_dir(path: Path) -> None:
     for directory in reversed(missing):
         try:
             os.mkdir(directory, 0o700)
-            os.chmod(directory, 0o700, follow_symlinks=False)
+            wincompat.chmod_nofollow(directory, 0o700)
             _fsync_dir(directory.parent)
         except FileExistsError:
             # A concurrent creator is acceptable only after the same strict
@@ -989,7 +989,7 @@ def _secure_dir(path: Path) -> None:
     if stat.S_ISLNK(lst.st_mode) or not stat.S_ISDIR(lst.st_mode):
         raise ManifestError(f"checkpoint 路径不是安全目录: {path}")
     try:
-        os.chmod(path, 0o700, follow_symlinks=False)
+        wincompat.chmod_nofollow(path, 0o700)
     except OSError as exc:
         raise ManifestError(f"无法收紧 checkpoint 目录权限 {path}: {exc}") from exc
 
@@ -1116,7 +1116,7 @@ def _atomic_private(path: Path, data: bytes) -> None:
             os.fsync(handle.fileno())
         os.replace(temp_name, path)
         temp_name = None
-        os.chmod(path, 0o600, follow_symlinks=False)
+        wincompat.chmod_nofollow(path, 0o600)
         _fsync_dir(path.parent)
     except OSError as exc:
         raise ManifestError(f"无法持久化 checkpoint 文件 {path}: {exc}") from exc
@@ -1381,7 +1381,7 @@ class CheckpointStore:
             actual = _read_private(path)
             if _sha(actual) != digest:
                 raise ManifestError(f"content-addressed blob 已损坏: {path}")
-            os.chmod(path, 0o600, follow_symlinks=False)
+            wincompat.chmod_nofollow(path, 0o600)
             return path
         _atomic_private(path, data)
         return path

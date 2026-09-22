@@ -13,8 +13,13 @@ MSYS 的 `/tmp`，而紧接着运行的是 **Windows 的 python**，它把 `"/tm
 zylab 自己有 `tools._from_shell_path` 专门处理，我在 workflow 里又踩了一遍。
 收成脚本 + 相对路径之后，两个平台解析的是同一个字符串。
 
-注解每步只显示 10 条，所以**打包**：一条失败清单、最多两条完整 traceback、
-一条输出尾部。一行一个失败名只够看见名字，看不到为什么。
+注解每步只显示 10 条，所以**打包**：一条根因汇总、一条失败清单、最多三条完整
+traceback、一条输出尾部。一行一个失败名只够看见名字，看不到为什么。
+
+**根因汇总是这里最贵的一条。** 2026-09-22 的 Windows 那列带回 40 个失败名 + 2 条
+traceback，而那 2 条**是同一个根因**（py3.10 的 `chmod: follow_symlinks`）——
+等于 40 条失败只换到 1 份信息，还看不出是 1 个根因还是 40 个。按 traceback 的
+**最后一行异常**归并之后，一眼就能定性，选 traceback 时也改成**每个根因只取一条**。
 """
 from __future__ import annotations
 
@@ -23,7 +28,8 @@ import sys
 
 MAX_BODY = 3500          # 单条注解的正文上限，留足余量给 %0A 转义
 MAX_NAMES = 40
-MAX_BLOCKS = 2
+MAX_BLOCKS = 3
+MAX_CAUSES = 12
 TAIL_LINES = 8
 # unittest 的一个失败块长这样：
 #   ====== (70 个 =)
@@ -53,14 +59,57 @@ def escape(text):
             .replace("%", "%25").replace("\r", "%0D").replace("\n", "%0A"))
 
 
+# 归并键要把「同一个根因在不同用例上的不同现场」抹平：临时目录、绝对路径、
+# 对象地址、长数字每次都不一样，留着它们等于不归并。
+_NOISE = re.compile(r"""['"]?(?:[A-Za-z]:[\\/]|/)[^\s'"]+['"]?|0x[0-9a-fA-F]+|\d{3,}""")
+
+
+def _last_line(block):
+    lines = [line for line in block.splitlines() if line.strip()]
+    return lines[-1].strip() if lines else ""
+
+
+def cause_key(line):
+    """把一行异常收敛成「根因」——纯函数，测得到。"""
+    return _NOISE.sub("…", str(line))[:200]
+
+
+def group_by_cause(blocks):
+    """按根因归并失败块，保序返回 [(根因行, 条数, 首个失败名, 首个块)]。
+
+    「首个」而不是「最后」：第一次出现的那条最可能是**触发**它的用例，
+    后面的多半是同一个 setUp 连带的。
+    """
+    order = []
+    seen = {}
+    for block in blocks:
+        head = block.splitlines()[1] if len(block.splitlines()) > 1 else ""
+        key = cause_key(_last_line(block))
+        if key not in seen:
+            seen[key] = {"line": _last_line(block), "count": 0,
+                         "name": head.strip(), "block": block}
+            order.append(key)
+        seen[key]["count"] += 1
+    return [(seen[k]["line"], seen[k]["count"], seen[k]["name"], seen[k]["block"])
+            for k in order]
+
+
 def annotations(log):
     """返回 [(标题, 正文)]，最多 4 条。没有可报的就返回空。"""
     out = []
     names = [line for line in log.splitlines()
              if line.startswith(("FAIL:", "ERROR:"))]
+    causes = group_by_cause(BLOCK.findall(log))
+    if causes:
+        head = f"{len(causes)} 类根因 / {sum(c for _, c, _, _ in causes)} 个失败块"
+        body = [head]
+        for line, count, name, _ in causes[:MAX_CAUSES]:
+            body.append(f"{count:4d}×  {line}")
+            body.append(f"       首例 {name}")
+        out.append(("根因汇总", "\n".join(body)))
     if names:
         out.append(("失败清单", "\n".join(names[:MAX_NAMES])))
-    for index, block in enumerate(BLOCK.findall(log)[:MAX_BLOCKS], 1):
+    for index, (_, _, _, block) in enumerate(causes[:MAX_BLOCKS], 1):
         out.append((f"traceback {index}", block))
     hit = HANG.search(log)
     if hit:

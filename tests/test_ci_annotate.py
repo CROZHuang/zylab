@@ -54,7 +54,8 @@ class Packing(unittest.TestCase):
     def test_a_failing_log_gives_list_tracebacks_and_tail(self):
         got = ci_annotate.annotations(UNITTEST_LOG)
         self.assertEqual([t for t, _ in got],
-                         ["失败清单", "traceback 1", "traceback 2", "尾部"])
+                         ["根因汇总", "失败清单", "traceback 1", "traceback 2",
+                          "尾部"])
         bodies = dict(got)
         self.assertIn("test_alpha", bodies["失败清单"])
         self.assertIn("test_beta", bodies["失败清单"])
@@ -78,6 +79,81 @@ class Packing(unittest.TestCase):
     def test_a_green_log_says_nothing_alarming(self):
         green = "..........\n" + "-" * 70 + "\nRan 10 tests in 0.1s\n\nOK\n"
         self.assertEqual(self.titles(green), ["尾部"])
+
+
+class RootCauses(unittest.TestCase):
+    """40 条 ERROR 是 1 个根因还是 40 个 —— 不归并就看不出来。
+
+    2026-09-22 公开仓库 CI 的 Windows py3.10 那列：失败清单 40 条，两条
+    traceback **是同一个** `chmod: follow_symlinks unavailable`。
+    40 条失败只换到 1 份信息，而且当时无法判断另外 38 条是不是同一件事。
+    """
+
+    def block(self, name, exc, *, tmp="tmpabc123"):
+        return (f"{'=' * 70}\n"
+                f"ERROR: {name} (tests.test_thing.Cases.{name})\n"
+                f"{'-' * 70}\n"
+                "Traceback (most recent call last):\n"
+                f'  File "tests/test_thing.py", line 9, in {name}\n'
+                f"    store.open(r'C:\\Users\\RUNNER~1\\AppData\\Local\\Temp\\{tmp}\\x')\n"
+                f"{exc}\n")
+
+    def log(self, *blocks):
+        return ("..EEE\n" + "\n".join(blocks) + "\n" + "-" * 70
+                + "\nRan 5 tests in 1s\n\nFAILED (errors=3)\n")
+
+    def test_one_shared_cause_is_reported_once_with_a_count(self):
+        same = "NotImplementedError: chmod: follow_symlinks unavailable"
+        log = self.log(*[self.block(f"test_{i}", same, tmp=f"tmp{i}zz")
+                         for i in range(12)])
+        bodies = dict(ci_annotate.annotations(log))
+        self.assertIn("1 类根因 / 12 个失败块", bodies["根因汇总"])
+        self.assertIn("12×", bodies["根因汇总"])
+        self.assertIn("首例 ERROR: test_0", bodies["根因汇总"])
+
+    def test_each_cause_gets_at_most_one_traceback(self):
+        """选 traceback 按**根因**去重，否则两条注解讲同一件事。"""
+        log = self.log(
+            self.block("test_a", "NotImplementedError: chmod: nofollow"),
+            self.block("test_b", "NotImplementedError: chmod: nofollow"),
+            self.block("test_c", "PermissionError: [WinError 5] Access is denied"))
+        got = dict(ci_annotate.annotations(log))
+        self.assertIn("2 类根因 / 3 个失败块", got["根因汇总"])
+        self.assertIn("NotImplementedError", got["traceback 1"])
+        self.assertIn("WinError 5", got["traceback 2"])
+        self.assertNotIn("traceback 3", got)
+
+    def test_the_key_ignores_paths_and_numbers_but_not_the_exception(self):
+        self.assertEqual(
+            ci_annotate.cause_key(
+                r"PermissionError: [WinError 5] denied: 'C:\Temp\tmp12ab\x'"),
+            ci_annotate.cause_key(
+                r"PermissionError: [WinError 5] denied: 'C:\Temp\tmp99zz\y'"),
+            "同一个根因在不同临时目录上不该算两类")
+        self.assertNotEqual(
+            ci_annotate.cause_key("PermissionError: [WinError 5] denied"),
+            ci_annotate.cause_key("PermissionError: [WinError 32] in use"),
+            "winerror 不同就是不同的根因，不能一起抹掉")
+
+    def test_the_cause_is_the_last_exception_not_the_first(self):
+        """链式异常（`During handling of…`）里，最后那个才是落地的根因。"""
+        chained = (f"{'=' * 70}\n"
+                   "ERROR: test_x (tests.test_thing.Cases.test_x)\n"
+                   f"{'-' * 70}\n"
+                   "Traceback (most recent call last):\n"
+                   "  File \"a.py\", line 1, in test_x\n"
+                   "PermissionError: [WinError 5] denied\n"
+                   "\nDuring handling of the above exception, "
+                   "another exception occurred:\n\n"
+                   "Traceback (most recent call last):\n"
+                   "  File \"b.py\", line 2, in test_x\n"
+                   "ManifestError: 无法收紧 checkpoint 目录权限\n")
+        bodies = dict(ci_annotate.annotations(self.log(chained)))
+        self.assertIn("ManifestError", bodies["根因汇总"])
+
+    def test_a_green_log_has_no_cause_annotation(self):
+        green = "....\n" + "-" * 70 + "\nRan 4 tests in 0.1s\n\nOK\n"
+        self.assertNotIn("根因汇总", dict(ci_annotate.annotations(green)))
 
 
 class Escaping(unittest.TestCase):
@@ -105,15 +181,32 @@ class AsACommand(unittest.TestCase):
         self.tmp = Path(holder.name)
 
     def run_it(self, *args):
+        # 显式 PIPE 而不是 capture_output=True：两者等价，但少一个「被哪一层
+        # 吞掉了关键字」的可能（见 shape() 里那次 Windows 上的 stdout=None）。
         return subprocess.run(
             [sys.executable, str(ROOT / "scripts" / "ci_annotate.py"), *args],
-            capture_output=True, text=True, timeout=60)
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+            text=True, timeout=60)
+
+    def shape(self, done):
+        """把 CompletedProcess 的形状写进断言消息里。
+
+        2026-09-22 Windows CI 上这两条用例是
+        `AttributeError: 'NoneType' object has no attribute 'splitlines'`——
+        `capture_output=True` 却拿到 `stdout is None`，而 AttributeError 的栈里
+        看不出 CompletedProcess 到底长什么样，只能靠猜。**猜不动就让它自己说。**
+        """
+        return (f"returncode={done.returncode!r} "
+                f"stdout={type(done.stdout).__name__} {done.stdout!r:.300} "
+                f"stderr={type(done.stderr).__name__} {done.stderr!r:.300} "
+                f"run={subprocess.run!r:.200}")
 
     def test_it_prints_error_commands(self):
         log = self.tmp / "unit.log"
         log.write_text(UNITTEST_LOG, encoding="utf-8")
         done = self.run_it(str(log))
-        self.assertEqual(done.returncode, 0, done.stderr)
+        self.assertEqual(done.returncode, 0, self.shape(done))
+        self.assertIsNotNone(done.stdout, self.shape(done))
         lines = [l for l in done.stdout.splitlines() if l.startswith("::error")]
         self.assertGreaterEqual(len(lines), 3)
         for line in lines:
@@ -122,7 +215,8 @@ class AsACommand(unittest.TestCase):
     def test_a_missing_log_warns_but_never_masks_the_real_failure(self):
         """报告器自己坏掉，不该把被报告的那个失败盖住——所以退出码是 0。"""
         done = self.run_it(str(self.tmp / "nope.log"))
-        self.assertEqual(done.returncode, 0, done.stderr)
+        self.assertEqual(done.returncode, 0, self.shape(done))
+        self.assertIsNotNone(done.stdout, self.shape(done))
         self.assertIn("::warning::", done.stdout)
 
     def test_wrong_usage_is_a_usage_error(self):
