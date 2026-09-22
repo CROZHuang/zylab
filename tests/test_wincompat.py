@@ -22,6 +22,7 @@ from pathlib import Path
 ROOT = str(Path(__file__).resolve().parents[1])
 sys.path.insert(0, ROOT)
 
+from tests.platform_support import assert_mode  # noqa: E402
 from core import wincompat  # noqa: E402
 
 
@@ -210,10 +211,13 @@ class ModeAndRedirectRules(unittest.TestCase):
     def test_it_applies_the_mode_to_a_real_path(self):
         target = self.root / "f"
         target.write_text("x", encoding="utf-8")
+        # 用 assert_mode：Windows 的 chmod 只有只读位，表达不出 0o600/0o700，
+        # 那边退化成「文件还在」——这条用例真正要证明的是「它不抛、而且作用在
+        # 路径本身上」，那部分两个平台都成立。
         wincompat.chmod_nofollow(target, 0o600)
-        self.assertEqual(stat.S_IMODE(target.lstat().st_mode), 0o600)
+        assert_mode(self, target, 0o600)
         wincompat.chmod_nofollow(self.root, 0o700)
-        self.assertEqual(stat.S_IMODE(self.root.lstat().st_mode), 0o700)
+        assert_mode(self, self.root, 0o700)
 
     def test_it_never_chmods_the_symlink_target(self):
         """要钉的是**性质**（目标一位都不动），不是某个异常——那个是 Linux 独有的。
@@ -238,8 +242,8 @@ class ModeAndRedirectRules(unittest.TestCase):
             wincompat.chmod_nofollow(link, 0o777)
         except NotImplementedError:
             pass                      # Linux（以及 Windows 上我们自己抛的那条）
-        self.assertEqual(stat.S_IMODE(target.stat().st_mode), 0o644,
-                         "不管走哪条路径，目标的权限一位都不该动")
+        assert_mode(self, target, 0o644,
+                    "不管走哪条路径，目标的权限一位都不该动")
 
     # ---- 只读属性：规则与摘除 ------------------------------------------
     def test_the_readonly_rule_reads_the_write_bit(self):
@@ -256,8 +260,10 @@ class ModeAndRedirectRules(unittest.TestCase):
         target = self.root / "f"
         target.write_text("x", encoding="utf-8")
         os.chmod(target, 0o400)
-        self.assertEqual(wincompat.clear_readonly(target), 0o400,
-                         "要把原 mode 交回去，调用方才放得回")
+        saved = wincompat.clear_readonly(target)
+        self.assertIsNotNone(saved, "要把原 mode 交回去，调用方才放得回")
+        self.assertFalse(saved & stat.S_IWRITE,
+                         "交回去的得是**摘之前**那个不可写的 mode")
         self.assertTrue(stat.S_IMODE(target.lstat().st_mode) & stat.S_IWRITE)
         self.assertIsNone(wincompat.clear_readonly(target),
                           "已经可写就不该再动它")
@@ -270,7 +276,9 @@ class ModeAndRedirectRules(unittest.TestCase):
         link = self.root / "l"
         link.symlink_to(target)
         self.assertIsNone(wincompat.clear_readonly(link))
-        self.assertEqual(stat.S_IMODE(target.stat().st_mode), 0o400)
+        # 断「仍然不可写」而不是断精确值：只读位是 Windows 唯一有的那个位。
+        self.assertFalse(
+            stat.S_IMODE(target.stat().st_mode) & stat.S_IWRITE)
 
     def test_the_fallback_unlocks_then_retries_once(self):
         """顺序：先有界重试（瞬态的共享冲突），再摘只读位（持久的属性）。"""
@@ -316,8 +324,9 @@ class ModeAndRedirectRules(unittest.TestCase):
 
         with self.assertRaises(PermissionError):
             wincompat._retry_then_unlock(always_denied, str(target))
-        self.assertEqual(stat.S_IMODE(target.lstat().st_mode), 0o400,
-                         "第二次也失败了，只读位要放回去")
+        self.assertFalse(
+            stat.S_IMODE(target.lstat().st_mode) & stat.S_IWRITE,
+            "第二次也失败了，只读位要放回去")
 
 
 class RawModeDoesNotWaitForOutput(unittest.TestCase):

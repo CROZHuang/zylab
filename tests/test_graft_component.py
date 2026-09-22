@@ -8,6 +8,7 @@ import tempfile
 import unittest
 from pathlib import Path
 
+from tests.platform_support import assert_mode  # noqa: E402
 from core import graft_component
 from tests.platform_support import requires_symlinks  # noqa: E402
 
@@ -98,7 +99,7 @@ class ManagedGraftComponentTests(unittest.TestCase):
         after = graft_component.repair_launcher(self.lock)
         self.assertTrue(after["ready"])
         self.assertTrue(after["full_verified"])
-        self.assertEqual(stat.S_IMODE(self.launcher.stat().st_mode), 0o755)
+        assert_mode(self, self.launcher, 0o755)
         text = self.launcher.read_text(encoding="utf-8")
         self.assertIn(str(self.node), text)
         self.assertIn(str(self.repo / "dist" / "cli.js"), text)

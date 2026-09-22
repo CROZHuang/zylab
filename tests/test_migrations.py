@@ -13,7 +13,7 @@ from unittest import mock
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from unittest import mock as _mock
-from tests.platform_support import (  # noqa: E402
+from tests.platform_support import (assert_mode,   # noqa: E402
     HARD_KILL_SIGNAL, hard_kill_returncode)
 from core import migrations, state
 
@@ -141,7 +141,7 @@ class MigrationTests(unittest.TestCase):
         self.assertTrue(self.target.is_file())
         self.assertFalse(Path(str(self.target) + ".tmp").exists())
         self.assertFalse(Path(str(self.target) + ".migrate.lock").exists())
-        self.assertEqual(stat.S_IMODE(self.target.stat().st_mode), 0o600)
+        assert_mode(self, self.target, 0o600)
         self.assertEqual(
             stat.S_IMODE(self.target.parent.stat().st_mode), 0o700)
         self.assertEqual(self.digest(source), before_session)

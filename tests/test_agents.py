@@ -12,6 +12,7 @@ from pathlib import Path
 from unittest import mock
 
 from unittest import mock as _mock
+from tests.platform_support import assert_mode  # noqa: E402
 from core import agent as agent_module
 from core import agents, client, store, subagent, tools
 from tests.platform_support import patience, requires_symlinks  # noqa: E402
@@ -224,8 +225,7 @@ class AgentRuntimeTests(unittest.TestCase):
             self.assertEqual(before_hash, after["transcript"]["raw_sha256"])
             self.assertNotIn(
                 "parent secret", str(after["transcript"]["messages"]))
-            self.assertEqual(
-                stat.S_IMODE(root.stat().st_mode), 0o700)
+            assert_mode(self, root, 0o700)
             self.assertEqual(
                 stat.S_IMODE(state_path.stat().st_mode), 0o600)
 

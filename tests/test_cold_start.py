@@ -19,6 +19,7 @@ import unittest
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 ENTRY = os.path.join(ROOT, "zylab.py")
 sys.path.insert(0, ROOT)
+from tests.platform_support import assert_mode  # noqa: E402
 import zylab  # noqa: E402
 
 
@@ -84,7 +85,7 @@ class ColdStartTests(unittest.TestCase):
         self.assertIn("与 key 无关", p.stdout)
         self.assertNotIn("sk-not-a-real-key", p.stdout + p.stderr, "key 永不回显")
         keys = os.path.join(self.home, "keys.env")
-        self.assertEqual(stat.S_IMODE(os.stat(keys).st_mode), 0o600)
+        assert_mode(self, keys, 0o600)
         with open(keys, encoding="utf-8") as f:
             self.assertEqual(f.read(), "DEEPINFER_API_KEY=sk-not-a-real-key\n")
 

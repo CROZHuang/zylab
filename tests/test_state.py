@@ -17,6 +17,7 @@ ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, ROOT)
 
 from unittest import mock as _mock
+from tests.platform_support import assert_mode  # noqa: E402
 from core import agent as agent_mod
 from core import client, state, store
 from tests.platform_support import requires_symlinks  # noqa: E402
@@ -55,7 +56,7 @@ class StateStoreTests(unittest.TestCase):
                 db.counts(),
                 {"sessions": 0, "events": 0, "requests": 0,
                  "legacy_imports": 0, "migration_errors": 0})
-        self.assertEqual(stat.S_IMODE(self.db_path.stat().st_mode), 0o600)
+        assert_mode(self, self.db_path, 0o600)
 
     @requires_symlinks
     def test_rejects_symlink_database_without_touching_target(self):
@@ -99,7 +100,7 @@ class StateStoreTests(unittest.TestCase):
             state.StateStore(future)
 
         self.assertEqual(future.read_bytes(), before)
-        self.assertEqual(stat.S_IMODE(future.stat().st_mode), 0o640)
+        assert_mode(self, future, 0o640)
         con = sqlite3.connect(future)
         try:
             tables = {row[0] for row in con.execute(
@@ -855,7 +856,7 @@ class FileCacheConcurrencyTests(unittest.TestCase):
             self.assertEqual(peak, 1)
             self.assertEqual(payload["totalCalls"], 1)
             self.assertEqual(payload["totalTokens"], 10)
-            self.assertEqual(stat.S_IMODE(cache.stat().st_mode), 0o600)
+            assert_mode(self, cache, 0o600)
             self.assertEqual(
                 list(root.glob(".stats-cache.json.*.tmp")), [])
 
