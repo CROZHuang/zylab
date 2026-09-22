@@ -215,23 +215,31 @@ class ModeAndRedirectRules(unittest.TestCase):
         wincompat.chmod_nofollow(self.root, 0o700)
         self.assertEqual(stat.S_IMODE(self.root.lstat().st_mode), 0o700)
 
-    def test_it_refuses_to_chmod_through_a_symlink(self):
-        """checkpoints 的符号链接拒绝就靠这个异常——不能被包装吞掉。
+    def test_it_never_chmods_the_symlink_target(self):
+        """要钉的是**性质**（目标一位都不动），不是某个异常——那个是 Linux 独有的。
 
-        Linux 上 `os.chmod not in os.supports_follow_symlinks`，但对**非**符号
-        链接照样成功、只在真是符号链接时抛 `NotImplementedError`（glibc 的
-        `fchmodat(AT_SYMLINK_NOFOLLOW)` 报 ENOTSUP）。所以这个异常在 POSIX 上
-        的含义是「这是符号链接，拒绝」，不是「本平台不支持」。
+        我第一版把「抛 `NotImplementedError`」当成 POSIX 的行为写进了断言，
+        2026-09-22 CI 的 macOS 那列当场打脸：**BSD/macOS 有 `lchmod`**，
+        `os.chmod in os.supports_follow_symlinks` 为真，于是 `follow_symlinks=False`
+        **成功**，改的是链接自己的权限位。Linux 反过来——glibc 的
+        `fchmodat(AT_SYMLINK_NOFOLLOW)` 报 ENOTSUP，CPython 翻成
+        `NotImplementedError`。
+
+        两条路径的**共同**保证只有一条：**目标不会被改**。那才是这个包装要守的东西
+        （`core/checkpoints.py` 的符号链接拒绝另有自己的判断，不依赖这个异常）。
+        「把一个平台的行为当成整类平台的行为」是这一条用例上真实犯过的错。
         """
         target = self.root / "f"
         target.write_text("x", encoding="utf-8")
         os.chmod(target, 0o644)
         link = self.root / "l"
         link.symlink_to(target)
-        with self.assertRaises(NotImplementedError):
+        try:
             wincompat.chmod_nofollow(link, 0o777)
+        except NotImplementedError:
+            pass                      # Linux（以及 Windows 上我们自己抛的那条）
         self.assertEqual(stat.S_IMODE(target.stat().st_mode), 0o644,
-                         "目标的权限一位都不该动")
+                         "不管走哪条路径，目标的权限一位都不该动")
 
     # ---- 只读属性：规则与摘除 ------------------------------------------
     def test_the_readonly_rule_reads_the_write_bit(self):

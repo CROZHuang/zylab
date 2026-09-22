@@ -13,6 +13,7 @@
 把「跳过」读成「没问题」。
 """
 import os
+import signal
 import stat
 import sys
 import tempfile
@@ -46,7 +47,15 @@ def _probe_posix_modes():
 
 SYMLINKS_AVAILABLE = _probe_symlinks()
 POSIX_MODES_AVAILABLE = _probe_posix_modes()
-NAMESPACE_SANDBOX_POSSIBLE = not IS_WINDOWS
+# 「有没有 Linux 命名空间」**不等于**「不是 Windows」——macOS 也没有。
+# 这条判据原来写成 `not IS_WINDOWS`，于是 2026-09-22 CI 的 macOS 那列 5 条
+# test_sandbox 照样跑了起来，撞在 `sandbox.prepare()` 真的去读
+# `/proc/self/ns/net` 上（`SandboxUnavailable: FileNotFoundError`）。
+# 和之前那条 fork 守卫同一个毛病：只问「不是那个平台吗」，
+# 而不是问「**我要的那个东西在不在**」。
+NAMESPACE_SANDBOX_POSSIBLE = (
+    sys.platform.startswith("linux")
+    and os.path.exists("/proc/self/ns/net"))
 
 requires_symlinks = unittest.skipUnless(
     SYMLINKS_AVAILABLE,
@@ -75,8 +84,10 @@ def assert_mode(case, path, expected, msg=None):
 
 requires_namespace_sandbox = unittest.skipUnless(
     NAMESPACE_SANDBOX_POSSIBLE,
-    "Linux 命名空间沙箱在 Windows 上不存在（unshare/setpriv）："
-    "UnshareSandboxAdapter 按设计恒为 unavailable")
+    "本机没有 Linux 命名空间（Windows 与 macOS 都没有 unshare/setpriv，也没有 /proc/self/ns/net）："
+    "UnshareSandboxAdapter 在那些平台上按设计恒为 unavailable")
+
+
 def patience(seconds):
     """把在开发机上调出来的等待预算，按这台机器的实际速度放大。
 
@@ -121,3 +132,37 @@ def canonical_tempdir(prefix=None):
     """
     holder = tempfile.TemporaryDirectory(prefix=prefix)
     return holder, Path(os.path.realpath(holder.name))
+
+
+# 「进程被硬杀」在两个平台上的**退出码表示不一样**，而契约是同一个。
+#
+# POSIX 用负数编码「被信号杀死」（SIGKILL → -9）。Windows 没有信号：
+# `os.kill(pid, 9)` 实际走 `TerminateProcess(handle, 9)`，于是退出码就是 **9**
+# （CPython 文档原话：除 CTRL_C_EVENT/CTRL_BREAK_EVENT 之外，sig 被当成退出码）。
+# 而 `signal.SIGKILL` 在 Windows 的 signal 模块里**根本不存在**。
+#
+# 2026-09-22 CI 两列 Windows 的 `test_sigkill_before_switch_leaves_valid_temp_
+# and_no_target` 就是它：`AttributeError: module 'signal' has no attribute
+# 'SIGKILL'`。改的只是「怎么杀」和「退出码怎么写」——**恢复逻辑一行没动**，
+# 那是数据安全路径。
+HARD_KILL_SIGNAL = getattr(signal, "SIGKILL", 9)
+
+
+def hard_kill_returncode():
+    return HARD_KILL_SIGNAL if IS_WINDOWS else -HARD_KILL_SIGNAL
+
+
+# 取消一个**忽略 SIGINT 的**任务（比如 bash）之后，快照里的 signal 该是什么。
+#
+# POSIX：`TaskState.record_returncode` 记的是 `-returncode`，也就是**真正杀死
+# 进程的那个信号**。bash 忽略 SIGINT，所以升级阶梯一定走到 SIGKILL —— 可以钉死。
+#
+# Windows：没有「被信号杀死」的负退出码（终止走 Job Object / taskkill，退出码是
+# 1），记的是**我们停到了哪一级**（`_stop_stage`：SIGINT → SIGTERM → SIGKILL）。
+# Git Bash 在第一级 CTRL_C 就退掉是**更好**的结果，所以那边只能断言「在阶梯里」，
+# 不能钉某个数字（2026-09-22 CI 两列 Windows：`<Signals.SIGINT: 2> != 9`）。
+STOP_LADDER = (signal.SIGINT, signal.SIGTERM, HARD_KILL_SIGNAL)
+
+
+def expected_stop_signals():
+    return STOP_LADDER if IS_WINDOWS else (HARD_KILL_SIGNAL,)

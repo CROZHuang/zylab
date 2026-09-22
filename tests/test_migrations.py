@@ -1,7 +1,6 @@
 """Legacy JSON/JSONL -> SQLite migration 的 dry-run、幂等与切换安全测试。"""
 import json
 import os
-import signal
 import sqlite3
 import stat
 import subprocess
@@ -14,6 +13,8 @@ from unittest import mock
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from unittest import mock as _mock
+from tests.platform_support import (  # noqa: E402
+    HARD_KILL_SIGNAL, hard_kill_returncode)
 from core import migrations, state
 
 
@@ -255,14 +256,17 @@ class MigrationTests(unittest.TestCase):
     def test_sigkill_before_switch_leaves_valid_temp_and_no_target(self):
         self.write_session()
         repo = Path(__file__).resolve().parents[1]
+        # 硬杀用数字信号号，不写 signal.SIGKILL —— Windows 的 signal 模块
+        # 没有它；os.kill(pid, 9) 在那边走 TerminateProcess(handle, 9)，
+        # 「进程没跑完就消失」这个契约两边一致，只是退出码编码不同
+        # （见 tests/platform_support.hard_kill_returncode）。
         code = f"""
 import os
-import signal
 from core import migrations
 
 def kill_after_import(stage, temp, target, report):
     if stage == "after_import":
-        os.kill(os.getpid(), signal.SIGKILL)
+        os.kill(os.getpid(), {HARD_KILL_SIGNAL})
 
 migrations.migrate_v1_to_new_db(
     {str(self.sessions)!r}, {str(self.usage)!r}, {str(self.target)!r},
@@ -271,7 +275,8 @@ migrations.migrate_v1_to_new_db(
         proc = subprocess.run(
             [sys.executable, "-c", code],
             cwd=repo, capture_output=True, encoding="utf-8", errors="replace", text=True, timeout=20)
-        self.assertEqual(proc.returncode, -signal.SIGKILL, proc.stderr)
+        self.assertEqual(proc.returncode, hard_kill_returncode(),
+                         proc.stderr)
         self.assertFalse(self.target.exists())
         temp = Path(str(self.target) + ".tmp")
         lock = Path(str(self.target) + ".migrate.lock")

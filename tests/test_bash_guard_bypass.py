@@ -54,10 +54,21 @@ class LexicalGuardClosesTheProbes(unittest.TestCase):
         self.assertIn("cwd=", str(c.exception))
 
     def test_relative_traversal_resolves_before_check(self):
+        # cwd 刻意用**不存在的**路径：realpath 对不存在的路径是恒等的，于是
+        # `..` 的算术在三个平台上都一样。
+        #
+        # 原来这里写 `cwd="/tmp/workspace"`，注释说
+        # `/tmp/workspace/../../protected/archive = /protected/archive`。
+        # **这个算术在 macOS 上是错的**：那边 `/tmp` 是指向 `/private/tmp` 的系统
+        # 软链，内核解析 `..` 走的是物理路径，于是 `/tmp/workspace/../..` 是
+        # `/private`，整条路径落在 `/private/protected/archive`。守卫不拦**是对的**
+        # ——那次写入确实没落进受保护路径。2026-09-22 CI 的 macOS 那列
+        # `AssertionError: Denied not raised` 就是这条夹具的算术，不是守卫漏了。
         with self.assertRaises(tools.Denied):
-            lexical("echo x > ../../protected/archive/probe.txt", cwd="/tmp/workspace")   # /tmp/workspace/../../protected/archive = /protected/archive
+            lexical("echo x > ../../protected/archive/probe.txt",
+                    cwd="/no-such-root/workspace")
         with self.assertRaises(tools.Denied):
-            lexical("touch ../protected/archive/a", cwd="/root")
+            lexical("touch ../protected/archive/a", cwd="/no-such-root")
 
     def test_interpreter_writes_are_out_of_lexical_scope(self):
         """沙箱内由只读挂载兜底；词法守卫**不假装**能看见这个。"""

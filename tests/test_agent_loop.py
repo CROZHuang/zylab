@@ -15,6 +15,8 @@ from pathlib import Path
 from unittest import mock
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+from tests.platform_support import (  # noqa: E402
+    expected_stop_signals)
 from core import (agent as A, checkpoints, client, controller as C, memory,
                 state, tasks as task_runtime, tools)
 
@@ -1506,7 +1508,9 @@ class ManagedController(unittest.TestCase):
         self.assertFalse(snapshot.timed_out)
         self.assertIsNotNone(snapshot.cancel_requested_at)
         self.assertIsNotNone(snapshot.ended_at)
-        self.assertEqual(snapshot.signal, 9)
+        # 停到哪一级是平台 + 时序的事，契约是「这是被我们停掉的，而且说得出
+        # 停到哪一级」——不是某个具体数字。见 platform_support 里的原委。
+        self.assertIn(snapshot.signal, expected_stop_signals())
         self.assertLess(
             kinds.index("tool_cancel_requested"),
             kinds.index("tool_finished"))

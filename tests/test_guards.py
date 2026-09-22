@@ -572,7 +572,11 @@ class SettingsLayering(unittest.TestCase):
 
     def test_nested_cwd_loads_config_from_git_root(self):
         with tempfile.TemporaryDirectory() as tmp:
-            root = Path(tmp) / "repo"
+            # 路径先解析：产品侧走 `git rev-parse --show-toplevel`，拿回来的是
+            # **物理**路径。macOS 的 TMPDIR 在 /var/folders 下，而
+            # /var→/private/var 是系统软链，于是拿未解析的 tmp 拼出来的期望值
+            # 与产品报出来的永远差一个 /private（2026-09-22 CI 的 macOS 那列）。
+            root = Path(os.path.realpath(tmp)) / "repo"
             nested = root / "src" / "pkg"
             nested.mkdir(parents=True)
             subprocess.run(["git", "init", "-q"], cwd=root, check=True)

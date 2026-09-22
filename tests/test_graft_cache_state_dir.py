@@ -12,10 +12,18 @@ from unittest import mock
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
+from tests.platform_support import (  # noqa: E402
+    requires_posix_modes)
 from core import graft, paths, store
 
 
 class GraftCacheStateDirTests(unittest.TestCase):
+    # graft 的信任检查全靠 POSIX 权限位（属主 + group/other 不可写）。
+    # Windows 上 `os.stat().st_mode` 是合成值（目录一律 0o777），
+    # `S_IWGRP|S_IWOTH` 永远置位，于是这套检查**恒不成立** —— 夹具造不出
+    # 「私有目录」这个载体。而 graft 本身要 unshare + /proc/self/ns/net，
+    # 在 Windows 上根本不可用，所以这里是 skip 而不是放宽产品侧的判据。
+    @requires_posix_modes
     def test_state_dir_inside_repo_is_an_allowed_cache_root(self):
         with tempfile.TemporaryDirectory() as tmp:
             repo = Path(tmp) / "app"

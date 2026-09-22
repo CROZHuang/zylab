@@ -220,12 +220,17 @@ def is_link_like(path):
 def chmod_nofollow(path, mode):
     """`os.chmod(path, mode, follow_symlinks=False)` 的跨平台版。
 
-    **POSIX 一字不变，包括那个有用的 `NotImplementedError`。** Linux 的 glibc
-    对 `fchmodat(AT_SYMLINK_NOFOLLOW)` 只在**目标真是符号链接**时报 ENOTSUP，
-    CPython 把它翻成 `NotImplementedError`（实测 3.12：普通目录/文件成功，
-    符号链接抛，且 `os.chmod not in os.supports_follow_symlinks`）。也就是说
-    在 POSIX 上这个异常的含义是「**这是符号链接，拒绝改它**」，而 checkpoints
-    的符号链接拒绝正是靠它 —— 不能把它吞掉。
+    **POSIX 一字不变** —— 包括两边不一样的那部分：
+    - **Linux**：glibc 对 `fchmodat(AT_SYMLINK_NOFOLLOW)` 只在**目标真是符号链接**
+      时报 ENOTSUP，CPython 翻成 `NotImplementedError`（实测 3.12：普通目录/文件
+      成功、符号链接抛，且 `os.chmod not in os.supports_follow_symlinks`）。
+      这个异常的含义是「**这是符号链接，拒绝改它**」，不是「本平台不支持」。
+    - **macOS/BSD**：有 `lchmod`，`os.chmod in os.supports_follow_symlinks` 为真，
+      于是**成功**，改的是链接自己的位。（我一度把 Linux 的行为当成了「POSIX 的
+      行为」，2026-09-22 CI 的 macOS 那列打了脸。）
+
+    两条路径唯一的**共同**保证是：**符号链接的目标不会被改**。这才是这个包装要守的
+    东西；`core/checkpoints.py` 的符号链接拒绝另有自己的判断，不依赖那个异常。
 
     **Windows 上 os.chmod 的 follow_symlinks 直到 3.13 才实现**，之前对**任何**
     路径都抛 `NotImplementedError`，于是「拒绝符号链接」退化成「什么都拒绝」：

@@ -14,7 +14,8 @@ from unittest import mock
 
 import zylab as CLI
 from core import graft, settings, tools
-from tests.platform_support import requires_symlinks  # noqa: E402
+from tests.platform_support import (  # noqa: E402
+    requires_posix_modes, requires_symlinks)
 
 
 class HostedGraftTests(unittest.TestCase):
@@ -183,6 +184,12 @@ class HostedGraftTests(unittest.TestCase):
         with self.assertRaisesRegex(graft.GraftError, "可信"):
             graft.resolve_executable(policy)
 
+    # graft 的信任检查全靠 POSIX 权限位（属主 + group/other 不可写）。
+    # Windows 上 `os.stat().st_mode` 是合成值（目录一律 0o777），
+    # `S_IWGRP|S_IWOTH` 永远置位，于是这套检查**恒不成立** —— 夹具造不出
+    # 「私有目录」这个载体。而 graft 本身要 unshare + /proc/self/ns/net，
+    # 在 Windows 上根本不可用，所以这里是 skip 而不是放宽产品侧的判据。
+    @requires_posix_modes
     def test_cache_root_mode_is_validated_without_chmodding_parent(self):
         broad = self.base / "existing-cache-root"
         broad.mkdir(mode=0o755)
@@ -208,6 +215,12 @@ class HostedGraftTests(unittest.TestCase):
             self.root.resolve(), settings.graft_policy(self.cfg))
         self.assertEqual(stats["files"], 2)
 
+    # graft 的信任检查全靠 POSIX 权限位（属主 + group/other 不可写）。
+    # Windows 上 `os.stat().st_mode` 是合成值（目录一律 0o777），
+    # `S_IWGRP|S_IWOTH` 永远置位，于是这套检查**恒不成立** —— 夹具造不出
+    # 「私有目录」这个载体。而 graft 本身要 unshare + /proc/self/ns/net，
+    # 在 Windows 上根本不可用，所以这里是 skip 而不是放宽产品侧的判据。
+    @requires_posix_modes
     def test_lazy_hosted_worker_uses_external_cache_and_scrubbed_env(self):
         with mock.patch.dict(os.environ, {"OPENAI_API_KEY": "fictional-secret"}):
             envelope = graft.execute(
@@ -265,6 +278,12 @@ class HostedGraftTests(unittest.TestCase):
             [event["payload"]["state"] for event in events],
             ["running", "ready"])
 
+    # graft 的信任检查全靠 POSIX 权限位（属主 + group/other 不可写）。
+    # Windows 上 `os.stat().st_mode` 是合成值（目录一律 0o777），
+    # `S_IWGRP|S_IWOTH` 永远置位，于是这套检查**恒不成立** —— 夹具造不出
+    # 「私有目录」这个载体。而 graft 本身要 unshare + /proc/self/ns/net，
+    # 在 Windows 上根本不可用，所以这里是 skip 而不是放宽产品侧的判据。
+    @requires_posix_modes
     def test_execute_prepends_the_mandatory_network_namespace(self):
         prefix = ("/usr/bin/unshare", "--net", "--")
         response = json.dumps({
@@ -350,13 +369,19 @@ class HostedGraftTests(unittest.TestCase):
                 return self.returncode
 
         process = Process()
+        # 钉的是**产品实际用的那个接缝**：graft 走 wincompat.signal_process_group，
+        # 不再直接调 os.killpg。原来这里 patch 的是 `graft.os` 的 killpg——它在
+        # Linux 上能过，只是因为 `graft.os` 就是 stdlib 的 os 模块对象，顺带拦到了
+        # wincompat POSIX 分支里的那次调用；而 Windows 上 `os` **没有 killpg**，
+        # `mock.patch.object` 当场 AttributeError（2026-09-22 CI 两列 Windows）。
+        # 换成 patch 那个接缝之后，两个平台测的是同一件事。
         with (
                 mock.patch.object(graft.subprocess, "Popen", return_value=process),
-                mock.patch.object(graft.os, "killpg") as killpg,
+                mock.patch.object(graft.wincompat, "signal_process_group") as kill,
                 self.assertRaises(KeyboardInterrupt)):
             graft._direct_worker(
                 ["worker"], cwd=str(self.root), env={}, timeout=30)
-        killpg.assert_called_once_with(process.pid, graft.signal.SIGTERM)
+        kill.assert_called_once_with(process.pid, graft.signal.SIGTERM)
 
     def test_no_graft_tool_escapes_the_hidden_set(self):
         """sidecar 缺席时靠 TOOL_NAMES 整体摘掉 graft 工具；漏一个就等于给模型

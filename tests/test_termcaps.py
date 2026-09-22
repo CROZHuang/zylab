@@ -33,7 +33,14 @@ class TermCapsTests(unittest.TestCase):
                 self.assertIsNone(termcaps.load_cached("other|1|xterm"))
 
     def test_probe_on_a_silent_pty_finishes_within_budget(self):
-        import pty
+        try:
+            import pty
+        except ImportError:                 # Windows：pty 依赖 termios，不存在
+            # **skip 不等于通过**（AGENTS.md §7）：这条量的是「没人应答时探测会
+            # 在预算内返回」，而 Windows 上造不出「静默 pty」这个载体——ConPTY
+            # 由控制台驱动，没有「挂在那儿不读」的对端。同样的契约在 Windows 上
+            # 由 tests/conpty.py 的真 ConPTY 冒烟覆盖。
+            self.skipTest("需要 POSIX pty（Windows 上没有 termios）")
         master, slave = pty.openpty()
         try:
             fin = os.fdopen(slave, "rb", buffering=0)
