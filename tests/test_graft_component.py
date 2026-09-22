@@ -50,7 +50,7 @@ class ManagedGraftComponentTests(unittest.TestCase):
             check=True)
         head = subprocess.run(
             ["git", "-C", str(self.repo), "rev-parse", "HEAD"],
-            check=True, capture_output=True, text=True).stdout.strip()
+            check=True, capture_output=True, encoding="utf-8", errors="replace", text=True).stdout.strip()
         tree = graft_component.tree_digest(self.dependencies)
 
         self.launcher = self.persistent / ".local" / "bin" / "graft"

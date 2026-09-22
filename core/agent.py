@@ -384,7 +384,8 @@ def env_context():
     cwd = os.getcwd()
     try:
         git = subprocess.run(["git", "rev-parse", "--abbrev-ref", "HEAD"],
-                             capture_output=True, text=True, timeout=5, cwd=cwd)
+                             capture_output=True, text=True, timeout=5,
+                             encoding="utf-8", errors="replace", cwd=cwd)
         branch = git.stdout.strip() if git.returncode == 0 else None
     except Exception:
         branch = None

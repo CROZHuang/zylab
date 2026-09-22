@@ -33,7 +33,7 @@ def _from_git():
         repo = Path(__file__).resolve().parent.parent
         done = subprocess.run(
             ["git", "-C", str(repo), "log", "-1", "--format=%H%n%cI"],
-            capture_output=True, text=True, timeout=5)
+            capture_output=True, encoding="utf-8", errors="replace", text=True, timeout=5)
     except (OSError, subprocess.SubprocessError):
         return None
     if done.returncode != 0:

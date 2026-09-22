@@ -68,7 +68,7 @@ def _run_one(spec, payload, timeout=None):
     try:
         r = subprocess.run(
             [_bash(), "-lc", cmd], input=json.dumps(payload, ensure_ascii=False),
-            capture_output=True, text=True, env=env,
+            capture_output=True, encoding="utf-8", errors="replace", text=True, env=env,
             timeout=timeout or spec.get("timeout") or DEFAULT_TIMEOUT)
     except subprocess.TimeoutExpired:
         return True, None, f"hook 超时（{cmd[:40]}），已放行"

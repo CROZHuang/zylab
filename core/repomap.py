@@ -258,7 +258,8 @@ def discover_files(root, *, max_files=MAX_FILES):
         out = subprocess.run(
             ["git", "ls-files", "--cached", "--others",
              "--exclude-standard"],
-            cwd=root, capture_output=True, text=True, timeout=10)
+            cwd=root, capture_output=True, text=True, timeout=10,
+            encoding="utf-8", errors="replace")
         if out.returncode == 0:
             git_discovery_succeeded = True
             files = [line for line in out.stdout.splitlines() if line.strip()]

@@ -74,6 +74,29 @@ def cause_key(line):
     return _NOISE.sub("…", str(line))[:200]
 
 
+def exception_class(line):
+    """从异常行里取出类名（`pkg.mod.Name: msg` → `Name`）；取不到就返回原样。
+
+    归并的**第二层**。2026-09-22 的 Windows 那列报了 59 类根因，而一条注解只放得下
+    十来条 —— 剩下 44 类连形状都看不见。多数尾巴是只出现一次的单例，按异常类再收
+    一次，就能用一行说清「这 59 类里有多少是断言失败、多少是 OSError」。
+    """
+    head = str(line).split(":", 1)[0].strip()
+    if not head or " " in head:
+        return "（无异常行）"
+    return head.rsplit(".", 1)[-1] or head
+
+
+def class_histogram(causes):
+    """[(根因行, 条数, …)] → 「AssertionError×31 · OSError×12」这样的一行。"""
+    tally = {}
+    for line, count, *_ in causes:
+        name = exception_class(line)
+        tally[name] = tally.get(name, 0) + count
+    ordered = sorted(tally.items(), key=lambda kv: (-kv[1], kv[0]))
+    return " · ".join(f"{name}×{count}" for name, count in ordered)
+
+
 def group_by_cause(blocks):
     """按根因归并失败块，保序返回 [(根因行, 条数, 首个失败名, 首个块)]。
 
@@ -102,7 +125,7 @@ def annotations(log):
     causes = group_by_cause(BLOCK.findall(log))
     if causes:
         head = f"{len(causes)} 类根因 / {sum(c for _, c, _, _ in causes)} 个失败块"
-        body = [head]
+        body = [head, f"按异常类：{class_histogram(causes)}"]
         for line, count, name, _ in causes[:MAX_CAUSES]:
             body.append(f"{count:4d}×  {line}")
             body.append(f"       首例 {name}")

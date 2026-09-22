@@ -1017,7 +1017,7 @@ def _git_status_evidence(invocation, *, cwd):
     try:
         result = subprocess.run(
             argv, cwd=cwd, stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE, text=True, errors="replace",
+            stderr=subprocess.PIPE, encoding="utf-8", text=True, errors="replace",
             timeout=3, check=False)
     except (OSError, subprocess.SubprocessError) as exc:
         return (

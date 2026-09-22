@@ -73,7 +73,7 @@ class ImportSafetyTests(unittest.TestCase):
             env = dict(os.environ, HOME=tmp, PYTHONPATH=ROOT, ZYLAB_APP_ROOT=tmp)
             env.pop("ZYLAB_HOME", None)
             p = subprocess.run([sys.executable, "-c", "import zylab"], env=env, cwd=ROOT,
-                               capture_output=True, text=True, timeout=90)
+                               capture_output=True, encoding="utf-8", errors="replace", text=True, timeout=90)
             self.assertEqual(p.returncode, 0, p.stderr[-500:])
             self.assertEqual(sorted(os.listdir(tmp)), [], "import 不许在家目录里建任何东西")
 
@@ -89,7 +89,7 @@ class InitPortableTests(unittest.TestCase):
             env = {"HOME": tmp, "PATH": "/usr/bin:/bin", "TERM": "dumb", "PYTHONIOENCODING": "utf-8",
                    "ZYLAB_APP_ROOT": str(app), "ZYLAB_KEYS_FILE": os.path.join(tmp, "keys.env")}
             p = subprocess.run([sys.executable, os.path.join(ROOT, "zylab.py"), "init", "--portable", "--yes"],
-                               env=env, cwd=ROOT, capture_output=True, text=True, timeout=120, stdin=subprocess.DEVNULL)
+                               env=env, cwd=ROOT, capture_output=True, encoding="utf-8", errors="replace", text=True, timeout=120, stdin=subprocess.DEVNULL)
             self.assertNotIn("Traceback", p.stderr, p.stderr[-800:])
             self.assertIn("已收编", p.stdout)
             self.assertEqual(p.returncode, 2, "收编之后继续 init：没 key → 2")
@@ -100,7 +100,7 @@ class InitPortableTests(unittest.TestCase):
             self.assertIn("自包含", p.stdout)
             # 之后的运行（不带 --portable）用的就是应用目录里的状态
             q = subprocess.run([sys.executable, os.path.join(ROOT, "zylab.py"), "init", "--yes"],
-                               env=env, cwd=ROOT, capture_output=True, text=True, timeout=120, stdin=subprocess.DEVNULL)
+                               env=env, cwd=ROOT, capture_output=True, encoding="utf-8", errors="replace", text=True, timeout=120, stdin=subprocess.DEVNULL)
             self.assertIn(str(portable), q.stdout)
             self.assertFalse(default.exists(), "默认目录不该被重建")
 

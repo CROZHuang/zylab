@@ -123,7 +123,7 @@ class PathsTests(unittest.TestCase):
                  "print(tools.PROTECTED)\n"
                  "print(tools.PROTECTED_REMOTES)\n"
                  "print(tools._under_protected('/declared/archive/x'))" % ROOT],
-                capture_output=True, text=True, env=env, cwd=ROOT, timeout=120)
+                capture_output=True, encoding="utf-8", errors="replace", text=True, env=env, cwd=ROOT, timeout=120)
             self.assertEqual(out.returncode, 0, out.stderr)
             declared, protected, remotes, under = out.stdout.strip().split("\n")
             self.assertIn("/declared/archive", declared)

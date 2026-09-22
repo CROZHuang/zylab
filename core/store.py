@@ -985,7 +985,7 @@ def repo_context(cwd=None, *, refresh=False):
                 "--show-toplevel", "--abbrev-ref", "HEAD",
             ],
             capture_output=True,
-            text=True,
+            encoding="utf-8", errors="replace", text=True,
             timeout=3,
             check=False,
         )
@@ -1002,7 +1002,7 @@ def repo_context(cwd=None, *, refresh=False):
                     "--porcelain=v1", "--untracked-files=normal",
                 ],
                 capture_output=True,
-                text=True,
+                encoding="utf-8", errors="replace", text=True,
                 timeout=3,
                 check=False,
             )
@@ -1907,7 +1907,13 @@ def migrate_legacy():
                 _write_session_and_index_unlocked(
                     new_path, rec, environment=environment)
         migrated = SESSIONS / f"last.{sid}.json.migrated"
-        old.rename(migrated)
+        # **replace 而不是 rename。** POSIX 的 rename 覆盖已存在的目标，Windows 的
+        # 不覆盖，直接 `FileExistsError [WinError 183]`。这段迁移刻意是幂等的
+        # （上面那段注释就是为此写的），第二次跑必然撞上已存在的 .migrated，
+        # 于是同一个「再跑一次」在 Linux 上成功、在 Windows 上炸
+        # （2026-09-22 CI 两列 Windows 的 test_legacy_migration_is_idempotent…）。
+        # os.replace 在 POSIX 上与 rename 同义，两边这才是同一个行为。
+        os.replace(old, migrated)
         _private(migrated)
         return sid
 

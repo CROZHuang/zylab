@@ -878,7 +878,7 @@ class HealthAndQueryTests(unittest.TestCase):
         process = subprocess.Popen(
             [sys.executable, "-c", code, str(crash_db)],
             cwd=str(Path(__file__).resolve().parents[1]),
-            stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE, encoding="utf-8", errors="replace", text=True)
         try:
             self.assertEqual(process.stdout.readline().strip(), "ready")
             process.kill()

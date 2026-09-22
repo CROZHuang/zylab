@@ -691,7 +691,7 @@ class DeterministicMap(unittest.TestCase):
             exclude.read_text(encoding="utf-8").splitlines())
         status = subprocess.run(
             ["git", "status", "--porcelain", "--", ".zylab"],
-            cwd=self.root, capture_output=True, text=True, check=True)
+            cwd=self.root, capture_output=True, encoding="utf-8", errors="replace", text=True, check=True)
         self.assertEqual(status.stdout, "")
 
     @requires_symlinks

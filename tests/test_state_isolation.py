@@ -37,7 +37,7 @@ class RunnerIsolationTests(unittest.TestCase):
             env.update(extra_env or {})
             proc = subprocess.run(
                 argv or [sys.executable, "-m", "unittest", "test_probe_isolation"],
-                cwd=tmp, env=env, capture_output=True, text=True, timeout=120)
+                cwd=tmp, env=env, capture_output=True, encoding="utf-8", errors="replace", text=True, timeout=120)
             out = proc.stdout + proc.stderr
             self.assertIn("STATE_HOME=", out, out[-600:])
             home = out.split("STATE_HOME=", 1)[1].splitlines()[0].strip()
@@ -71,7 +71,7 @@ class RunnerIsolationTests(unittest.TestCase):
             code = ("import sys; sys.path.insert(0, %r); import core; from core import paths; "
                     "print(core.TEST_ISOLATION_ROOT, paths.state_home())" % ROOT)
             out = subprocess.run([sys.executable, "-c", code], env=env, cwd=tmp,
-                                 capture_output=True, text=True, timeout=60).stdout.strip()
+                                 capture_output=True, encoding="utf-8", errors="replace", text=True, timeout=60).stdout.strip()
             self.assertEqual(out, f"None {os.path.join(tmp, '.zylab')}")
 
 

@@ -483,6 +483,8 @@ class UnshareSandboxAdapter:
                     cwd=prepared.cwd,
                     capture_output=True,
                     text=True,
+                    encoding="utf-8",
+                    errors="replace",
                     timeout=self.probe_timeout,
                 )
                 returncode = int(getattr(result, "returncode", 1))
@@ -521,6 +523,8 @@ class UnshareSandboxAdapter:
                             cwd=network_prepared.cwd,
                             capture_output=True,
                             text=True,
+                            encoding="utf-8",
+                            errors="replace",
                             timeout=self.probe_timeout,
                         )
                         network_returncode = int(getattr(

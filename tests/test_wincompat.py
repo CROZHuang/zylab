@@ -59,7 +59,7 @@ class FlockContract(unittest.TestCase):
             ).format(root=ROOT, path=str(self.lockpath))
             # 子进程对同一文件加非阻塞锁，必须拿不到
             probe = subprocess.run(
-                [sys.executable, "-c", code], capture_output=True, text=True,
+                [sys.executable, "-c", code], capture_output=True, encoding="utf-8", errors="replace", text=True,
                 timeout=10)
             self.assertEqual(probe.returncode, 0, probe.stderr)
             self.assertIn("BLOCKED", probe.stdout)
@@ -82,7 +82,7 @@ class FlockContract(unittest.TestCase):
                 "wincompat.flock(fd, wincompat.LOCK_UN); os.close(fd); print(ok)"
             ).format(root=ROOT, path=str(self.lockpath))
             probe = subprocess.run(
-                [sys.executable, "-c", code], capture_output=True, text=True,
+                [sys.executable, "-c", code], capture_output=True, encoding="utf-8", errors="replace", text=True,
                 timeout=10)
             self.assertEqual(probe.returncode, 0, probe.stderr)
             self.assertIn("True", probe.stdout)
@@ -437,7 +437,7 @@ class WindowsImportSimulation(unittest.TestCase):
             "    raise SystemExit('IMPORT-FAILED: ' + str(exc))\n"
         ).format(root=ROOT, mod=modname)
         return subprocess.run(
-            [sys.executable, "-c", body], capture_output=True, text=True,
+            [sys.executable, "-c", body], capture_output=True, encoding="utf-8", errors="replace", text=True,
             timeout=30)
 
     def test_core_modules_import_without_posix_stdlib(self):

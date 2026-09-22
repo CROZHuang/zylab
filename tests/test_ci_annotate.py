@@ -186,7 +186,7 @@ class AsACommand(unittest.TestCase):
         return subprocess.run(
             [sys.executable, str(ROOT / "scripts" / "ci_annotate.py"), *args],
             stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-            text=True, timeout=60)
+            encoding="utf-8", errors="replace", text=True, timeout=60)
 
     def shape(self, done):
         """把 CompletedProcess 的形状写进断言消息里。
@@ -308,7 +308,7 @@ class AHangLeavesAStack(unittest.TestCase):
                 "time.sleep(5)\n"
                 "print('NOT REACHED')\n") % str(ROOT)
         return subprocess.run([sys.executable, "-c", code],
-                              capture_output=True, text=True, timeout=60,
+                              capture_output=True, encoding="utf-8", errors="replace", text=True, timeout=60,
                               env=dict(__import__("os").environ, **env))
 
     def test_ci_arms_the_watchdog_and_a_hang_dumps_threads(self):
@@ -406,6 +406,47 @@ class WindowsCleanupIsTolerant(unittest.TestCase):
             except OSError:
                 pass
 
+
+
+class TheExceptionClassHistogram(unittest.TestCase):
+    """59 类根因、注解只放得下十来条 —— 剩下 44 类得有个说法。
+
+    2026-09-22 Windows 那列就是这样：看得见 12 类，另外 44 类连形状都不知道。
+    按异常类再收一层，一行就能说清「多少是断言失败、多少是 OSError」。
+    """
+
+    def test_it_strips_the_module_path_and_the_message(self):
+        self.assertEqual(
+            ci_annotate.exception_class(
+                "core.checkpoints.ManifestError: root 路径含符号链接: /var"),
+            "ManifestError")
+        self.assertEqual(
+            ci_annotate.exception_class("AssertionError: 1 != 2"),
+            "AssertionError")
+
+    def test_a_line_that_is_not_an_exception_is_labelled_as_such(self):
+        """traceback 尾巴有时是一行输出残片，不该被当成异常类名。"""
+        for line in ("", "   ", "+ external", "  ✻ 思考中 0s"):
+            with self.subTest(line=line):
+                self.assertEqual(
+                    ci_annotate.exception_class(line), "（无异常行）")
+
+    def test_the_histogram_counts_blocks_not_causes(self):
+        """一类根因命中 12 次，直方图里就该是 12，而不是 1。"""
+        causes = [("AssertionError: a", 12, "n1", "b1"),
+                  ("AssertionError: b", 3, "n2", "b2"),
+                  ("OSError: x", 1, "n3", "b3")]
+        self.assertEqual(ci_annotate.class_histogram(causes),
+                         "AssertionError\u00d715 · OSError\u00d71")
+
+    def test_it_rides_along_in_the_summary(self):
+        log = ("..E\n" + "=" * 70 + "\n"
+               "ERROR: test_x (m.C.test_x)\n" + "-" * 70 + "\n"
+               "Traceback (most recent call last):\n"
+               "OSError: boom\n\n" + "-" * 70 + "\nRan 3 tests in 1s\n\n"
+               "FAILED (errors=1)\n")
+        body = dict(ci_annotate.annotations(log))["根因汇总"]
+        self.assertIn("按异常类：OSError\u00d71", body)
 
 if __name__ == "__main__":
     unittest.main()

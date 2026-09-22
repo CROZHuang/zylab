@@ -15,7 +15,8 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from unittest import mock as _mock
 from core import checkpoints
-from tests.platform_support import assert_mode, requires_symlinks  # noqa: E402
+from tests.platform_support import (  # noqa: E402
+    assert_mode, canonical_tempdir, requires_symlinks)
 
 
 def _name(path):
@@ -35,8 +36,11 @@ def _name(path):
 
 class CheckpointCase(unittest.TestCase):
     def setUp(self):
-        self.tmp = tempfile.TemporaryDirectory()
-        self.root = Path(self.tmp.name)
+        # 路径先解析：macOS 的 TMPDIR 是 /var/folders/…，而 /var 是指向
+        # /private/var 的系统符号链接。checkpoints 刻意拒绝「祖先里有符号链接」
+        # 的 root（防止软链把 checkpoint 内容重定向走），拿未解析的临时目录去测
+        # 等于在测夹具。详见 tests/platform_support.canonical_tempdir。
+        self.tmp, self.root = canonical_tempdir()
         self.workspace = self.root / "workspace"
         self.workspace.mkdir()
         self.store = checkpoints.CheckpointStore(self.root / "state")

@@ -14,7 +14,7 @@ ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
 def sh(args, **kw):
     return subprocess.run(["bash", os.path.join(ROOT, "install.sh"), *args], cwd=ROOT,
-                          capture_output=True, text=True, timeout=60, **kw)
+                          capture_output=True, encoding="utf-8", errors="replace", text=True, timeout=60, **kw)
 
 
 class InstallShTests(unittest.TestCase):
@@ -36,7 +36,7 @@ class InstallShTests(unittest.TestCase):
             env = {"HOME": tmp, "PATH": "/usr/bin:/bin", "TERM": "dumb", "ZYLAB_APP_ROOT": tmp,
                    "ZYLAB_KEYS_FILE": os.path.join(tmp, "keys.env"), "PYTHONIOENCODING": "utf-8"}
             run = subprocess.run([sys.executable, stub, "--help"], cwd=tmp, env=env,
-                                 capture_output=True, text=True, timeout=60, stdin=subprocess.DEVNULL)
+                                 capture_output=True, encoding="utf-8", errors="replace", text=True, timeout=60, stdin=subprocess.DEVNULL)
             self.assertEqual(run.returncode, 0, run.stderr[-500:])
             self.assertIn("usage: zylab", run.stdout)
             p3 = sh(["--bin-dir", bin_dir, "--uninstall"])
@@ -81,7 +81,7 @@ class WindowsLauncherTests(unittest.TestCase):
                        ZYLAB_KEYS_FILE=os.path.join(tmp, "keys.env"),
                        PYTHONIOENCODING="utf-8")
             run = subprocess.run([self.path, "--help"], cwd=tmp, env=env,
-                                 capture_output=True, text=True, timeout=120)
+                                 capture_output=True, encoding="utf-8", errors="replace", text=True, timeout=120)
             self.assertEqual(run.returncode, 0, run.stderr)
             self.assertIn("zylab", run.stdout)
 
@@ -114,7 +114,7 @@ class EntryPointsStayExecutable(unittest.TestCase):
     def modes(self):
         probe = subprocess.run(
             ["git", "ls-files", "-s"],
-            cwd=ROOT, capture_output=True, text=True, timeout=30)
+            cwd=ROOT, capture_output=True, encoding="utf-8", errors="replace", text=True, timeout=30)
         if probe.returncode != 0:
             self.skipTest(f"这里跑不了 git：{probe.stderr.strip()[:80]}")
         out = {}

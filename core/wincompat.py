@@ -413,6 +413,13 @@ def retry_sharing(call, *, attempts=SHARING_RETRIES):
 # 后果不是一条测试红，而是**Windows 上 checkpoint 盖不回只读文件**，
 # 同一个 write_file / restore 在 Linux 上是成功的。所以这里摘掉只读位再做一次，
 # 把行为拉回 POSIX 语义。
+#
+# **覆盖边界（刻意画在这里）：** 只修 `fd_replace` / `fd_unlink` 这条路，也就是
+# checkpoints 改**用户项目文件**的那条 —— 仓库里存在只读文件是常事，这条真会碰到。
+# zylab 自己的状态文件（settings.json / models 缓存 / termcaps / store / repomap /
+# tasks，共 15 处直接 `os.replace`）**没有一起改**：理论上用户把 settings.json 设成
+# 只读也会撞上，但至今没有任何读数说它发生过。照 AGENTS.md §7 那条纪律——
+# 有实测证据的那一侧才动，另一侧只把边界写下来，免得下次从零重查。
 
 
 def readonly_blocks_write(info):

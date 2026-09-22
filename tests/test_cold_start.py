@@ -29,7 +29,7 @@ def run(args, home, extra=None, timeout=90):
            "ZYLAB_KEYS_FILE": os.path.join(home, "keys.env")}
     env.update(extra or {})
     return subprocess.run(
-        [sys.executable, ENTRY, *args], env=env, cwd=ROOT, text=True,
+        [sys.executable, ENTRY, *args], env=env, cwd=ROOT, encoding="utf-8", errors="replace", text=True,
         capture_output=True, timeout=timeout, stdin=subprocess.DEVNULL)
 
 

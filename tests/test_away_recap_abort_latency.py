@@ -64,7 +64,7 @@ class AbortLatencyTests(unittest.TestCase):
         try:
             proc = subprocess.run(
                 [sys.executable, "-c", CHILD], cwd=ROOT, env=env,
-                capture_output=True, text=True, timeout=30)
+                capture_output=True, encoding="utf-8", errors="replace", text=True, timeout=30)
         finally:
             server.shutdown()
             server.server_close()

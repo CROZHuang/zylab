@@ -236,7 +236,7 @@ def project_root(cwd=None):
         probe = subprocess.run(
             ["git", "-C", str(absolute), "rev-parse", "--show-toplevel"],
             capture_output=True,
-            text=True,
+            encoding="utf-8", errors="replace", text=True,
             timeout=3,
             check=False,
         )

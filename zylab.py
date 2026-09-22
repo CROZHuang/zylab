@@ -10231,7 +10231,7 @@ def _build_id():
     try:
         done = subprocess.run(
             ["git", "-C", root, "rev-parse", "--short", "HEAD"],
-            capture_output=True, text=True, timeout=1.0)
+            capture_output=True, encoding="utf-8", errors="replace", text=True, timeout=1.0)
     except Exception:
         return ""
     return done.stdout.strip() if done.returncode == 0 else ""

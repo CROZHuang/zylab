@@ -102,3 +102,22 @@ def patience(seconds):
     if os.environ.get("CI"):
         return float(seconds) * 3.0
     return float(seconds)
+
+
+def canonical_tempdir(prefix=None):
+    """`TemporaryDirectory`，但目录路径是**规范路径**（没有符号链接组件）。
+
+    macOS 的 `TMPDIR` 是 `/var/folders/…`，而 `/var` 是系统给的、指向
+    `/private/var` 的符号链接（`/tmp`、`/etc` 同理）。于是任何「路径里不许有
+    符号链接」的契约，在 macOS 上拿标准临时目录去测就**必然**失败——失败的是
+    夹具，不是被测的规则。
+
+    2026-09-22 公开仓库 CI 的 macOS 那列：71 个失败块里 **48 个**是同一条
+    `checkpoint root 路径含符号链接: /var`。而 checkpoints 那条规则是刻意的安全
+    立场（防止有人塞一条软链，把 checkpoint 里的用户文件内容重定向到别处），
+    **不该为了让一列变绿去削弱它**——该改的是这里：把夹具的路径先解析好。
+
+    返回 `(holder, path)`：holder 要保活（它析构时才删目录），path 已解析。
+    """
+    holder = tempfile.TemporaryDirectory(prefix=prefix)
+    return holder, Path(os.path.realpath(holder.name))

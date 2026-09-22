@@ -68,7 +68,7 @@ def pep701_offences(path):
 class OnlySyntaxTheFloorUnderstands(unittest.TestCase):
     def tracked(self):
         done = subprocess.run(["git", "ls-files", "*.py"], cwd=ROOT,
-                              capture_output=True, text=True, timeout=30)
+                              capture_output=True, encoding="utf-8", errors="replace", text=True, timeout=30)
         if done.returncode != 0:
             self.skipTest(f"这里跑不了 git：{done.stderr.strip()[:80]}")
         files = [ROOT / name for name in done.stdout.split()]
@@ -140,7 +140,7 @@ class TheFloorInterpreterAgrees(unittest.TestCase):
             "    except SyntaxError as e: bad.append(f'{f}:{e.lineno} {e.msg}')\n"
             "print('\\n'.join(bad))\n")
         done = subprocess.run([exe, "-c", probe], cwd=ROOT,
-                              capture_output=True, text=True, timeout=180)
+                              capture_output=True, encoding="utf-8", errors="replace", text=True, timeout=180)
         self.assertEqual(done.returncode, 0, done.stderr[-400:])
         self.assertEqual(done.stdout.strip(), "", done.stdout)
 

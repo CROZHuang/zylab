@@ -270,7 +270,7 @@ migrations.migrate_v1_to_new_db(
 """
         proc = subprocess.run(
             [sys.executable, "-c", code],
-            cwd=repo, capture_output=True, text=True, timeout=20)
+            cwd=repo, capture_output=True, encoding="utf-8", errors="replace", text=True, timeout=20)
         self.assertEqual(proc.returncode, -signal.SIGKILL, proc.stderr)
         self.assertFalse(self.target.exists())
         temp = Path(str(self.target) + ".tmp")

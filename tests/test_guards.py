@@ -843,7 +843,7 @@ class SettingsWrites(unittest.TestCase):
                 subprocess.Popen(
                     [sys.executable, "-c", script, str(path), tool, value],
                     cwd=root, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-                    text=True)
+                    encoding="utf-8", errors="replace", text=True)
                 for tool, value in tools_and_values.items()
             ]
             failures = []

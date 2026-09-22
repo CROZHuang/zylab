@@ -649,7 +649,9 @@ class ManagedController(unittest.TestCase):
 
     def test_write_uses_final_hook_args_and_checkpoint_before_tool_start(self):
         with tempfile.TemporaryDirectory() as tmp:
-            root = Path(tmp)
+            # 解析后再用：macOS 的 /var 是符号链接，而 CheckpointStore 刻意
+            # 拒绝祖先里有符号链接的 root（tests/platform_support 里有原委）。
+            root = Path(os.path.realpath(tmp))
             target = root / "sample.txt"
             backup_dir = root / "backups"
             target.write_text("before\n", encoding="utf-8")
@@ -711,7 +713,9 @@ class ManagedController(unittest.TestCase):
 
     def test_external_change_after_preview_aborts_before_tool_started(self):
         with tempfile.TemporaryDirectory() as tmp:
-            root = Path(tmp)
+            # 解析后再用：macOS 的 /var 是符号链接，而 CheckpointStore 刻意
+            # 拒绝祖先里有符号链接的 root（tests/platform_support 里有原委）。
+            root = Path(os.path.realpath(tmp))
             target = root / "sample.txt"
             target.write_text("before\n", encoding="utf-8")
             authority = checkpoints.CheckpointStore(root / "state")
