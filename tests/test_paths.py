@@ -86,38 +86,53 @@ class PathsTests(unittest.TestCase):
             self.assertFalse(paths.is_protected("/anywhere"))
 
     def test_a_declaration_behind_a_symlink_is_still_guarded(self):
-        """**声明经过软链时，两种形态都要守。**
+        """**声明经过软链时，写守卫必须仍然拦得住。**
 
-        比较本身（`paths.path_under`）是纯字符串比较，而调用点各有各的形态：
-        `tools._guard` 比的是 realpath 过的候选，`_guard_bash` 的词法守卫比的是
-        命令原文（它没法解析任意 shell）。原来 `protected_paths()` 只留声明形态，
-        于是前一类在「声明经过软链」时**恒不成立**——2026-09-22 实测：声明一条
-        指向真实目录的软链之后，经软链写和经真实路径写**都被放行**，
-        而界面上看不出任何异常。
+        `paths.path_under` 是纯字符串比较，而调用点形态不一：
+        `tools._guard` 比的是 **realpath 过**的候选，`_guard_bash` 的词法守卫比的
+        是命令原文（它没法解析任意 shell）。原来 `protected_paths()` 只留声明形态，
+        于是前一类在「声明经过软链」时恒不成立 —— 实测：声明一条指向真实目录的
+        软链之后，**经软链写和经真实路径写都被放行**，而界面上看不出任何异常。
 
-        这是 `paths.path_under` 当初被建出来的那类事故的另一道门（那次是
-        Windows 上 `startswith(root + "/")` 恒为 False）。macOS 上尤其容易碰到：
-        `/tmp`→`/private/tmp`、`/var`→`/private/var` 都是系统软链。
+        **夹具刻意整棵放在一条软链后面**：不这样做，这条用例在 Linux 上所有路径
+        都是恒等的，测不到那个不对称。macOS 天然如此（TMPDIR 在 /var/folders 下，
+        `/var`→`/private/var` 是系统软链），2026-09-22 的 CI 就是在那一列上把
+        **这条用例第一版的过度断言**打回来的：它当时断言
+        `is_protected(<真实路径>/x)`，而 `is_protected` 按契约不解析候选，
+        任何纯词法比较都不可能认出一个等价但写法不同的路径。
+        **安全性质属于会解析候选的那道守卫，不属于词法便捷函数。**
         """
         with tempfile.TemporaryDirectory() as tmp:
-            real = Path(tmp) / "real"
-            real.mkdir()
-            link = Path(tmp) / "link"
+            anchor = Path(tmp) / "anchor"
+            anchor.mkdir()
+            base = Path(tmp) / "via-link"
             try:
+                base.symlink_to(anchor, target_is_directory=True)
+                real = base / "real"
+                real.mkdir()
+                link = base / "link"
                 link.symlink_to(real, target_is_directory=True)
             except (OSError, NotImplementedError):
                 self.skipTest("本机不能创建符号链接（Windows 需管理员/开发者模式）")
             with mock.patch.dict(
                     os.environ, {"ZYLAB_PROTECTED_PATHS": str(link)}):
                 roots = paths.protected_paths()
-                # 两种形态都在
+                # 两种形态都登记
                 self.assertIn(str(link), roots)
                 self.assertIn(os.path.realpath(link), roots)
-                # 两条路都拦得住
+                # 词法便捷函数只保证「声明的那个形态」——这就是它的契约
                 self.assertTrue(paths.is_protected(str(link / "x")))
-                self.assertTrue(paths.is_protected(str(real / "x")))
-                # 守多了不行：不相干的兄弟目录不该被误拦
-                self.assertFalse(paths.is_protected(str(Path(tmp) / "other")))
+
+                # ---- 安全性质：会解析候选的那道守卫，三种写法都得拦 ----
+                from core import tools
+                with mock.patch.object(tools, "PROTECTED", tuple(roots)):
+                    for candidate in (link / "x", real / "x",
+                                      Path(os.path.realpath(real)) / "x"):
+                        with self.subTest(candidate=str(candidate)):
+                            with self.assertRaises(tools.Denied):
+                                tools._guard(str(candidate))
+                    # 守多了也不行：不相干的兄弟目录必须照常放行
+                    self.assertTrue(tools._guard(str(base / "other" / "y")))
 
     def test_a_plain_declaration_stays_a_single_entry(self):
         """realpath 恒等时不该冒出重复项——「守多了」也要有边界。"""
