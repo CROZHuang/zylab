@@ -380,7 +380,7 @@ def shell_facts():
     ]
 
 
-def env_context():
+def env_context(model=None, gateway=None):
     cwd = os.getcwd()
     try:
         git = subprocess.run(["git", "rev-parse", "--abbrev-ref", "HEAD"],
@@ -391,7 +391,16 @@ def env_context():
         branch = None
     lines = [f"工作目录: {cwd}", f"平台: {platform.system()} {platform.release()}",
              f"日期: {time.strftime('%Y-%m-%d')}",
-             f"模型: {MODEL} ({client.GATEWAY})"]
+             # **必须是本次会话实际在用的那一对，不是 import 时的模块常量。**
+             # 原来写 `MODEL` / `client.GATEWAY` —— 两者都在 import 时绑死，于是
+             # 无论用户配了什么、`/model` 中途换成什么，模型都被告知自己是出厂
+             # 默认的 `kimi-k3-256k (deepinfer)`。2026-09-22 实跑陌生人流程时
+             # 当场露出来：会话跑在 deepseek-flash@deepseek 上，而模型回答
+             # 「本次会话运行在 kimi-k3-256k 上（网关为 deepseek）」。
+             #
+             # 这不只是显示错：模型会拿这个身份推断自己的上下文上限与能力，
+             # 而 `<env>` 是它唯一的自知来源。
+             f"模型: {model or MODEL} ({gateway or client.GATEWAY})"]
     lines.extend(site_facts())
     lines.extend(shell_facts())
     if branch:
@@ -471,12 +480,12 @@ def system_prompt(load_md=True, *, load_user_md=None, load_project_md=None,
                   load_skills=None, memory_context="", skills_context="",
                   repo_map_context="",
                   architecture_context="", context_capsule=None,
-                  goal_context=""):
+                  goal_context="", model=None, gateway=None):
     """Build fresh runtime/project instructions for the process's current cwd."""
     flags = instruction_flags(
         load_md, load_user_md=load_user_md,
         load_project_md=load_project_md, load_skills=load_skills)
-    sys_parts = [SYSTEM, env_context()]
+    sys_parts = [SYSTEM, env_context(model=model, gateway=gateway)]
     # 用户级在前、项目级在后；后者更具体，可以覆盖前者。
     if flags["load_user_md"]:
         user_md = user_instructions()
@@ -629,7 +638,9 @@ class Agent:
                 repo_map_context=self.repo_map_context,
                 architecture_context=self.architecture_context,
                 context_capsule=self.context_capsule,
-                goal_context=self.goal_context),
+                goal_context=self.goal_context,
+                # __init__ 走到这里时 self.model 还没赋值，用局部参数
+                model=model, gateway=self.gateway),
         }]
         self.tokens_in = 0
         self.tokens_out = 0
@@ -693,7 +704,10 @@ class Agent:
                 architecture_context=getattr(
                     self, "architecture_context", ""),
                 context_capsule=getattr(self, "context_capsule", None),
-                goal_context=getattr(self, "goal_context", "")),
+                goal_context=getattr(self, "goal_context", ""),
+                # 这条是刷新路径：`/model` 换完之后靠它把 <env> 里的身份改对。
+                model=getattr(self, "model", None),
+                gateway=getattr(self, "gateway", None)),
         }
         if self.messages and self.messages[0].get("role") == "system":
             self.messages[0] = message

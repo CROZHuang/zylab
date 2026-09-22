@@ -1799,3 +1799,51 @@ class DeniedCallVisibility(unittest.TestCase):
         header = self._assert_header_precedes_denial(self._events(managed=True))
         self.assertEqual(header["name"], "bash")
         self.assertIn("wc -l x.py", str(header["args"]))
+
+class TheEnvBlockNamesTheRealModel(unittest.TestCase):
+    """`<env>` 是模型**唯一的自知来源**，里面的型号必须是本次会话真在用的那个。
+
+    2026-09-22 实跑陌生人流程时当场露出来：会话跑在 `deepseek-flash@deepseek` 上，
+    而模型回答「本次会话运行在 **kimi-k3-256k** 上（网关为 deepseek）」。
+    根因是 `env_context()` 写的是 `MODEL` / `client.GATEWAY` —— 两个都在 import
+    时绑死，与会话无关；`/model` 中途换模型也不会跟着变。
+
+    这不只是显示错：模型会拿这个身份推断自己的上下文上限与能力。
+    """
+
+    def model_line(self, text):
+        return next((l for l in text.splitlines() if l.startswith("模型:")), "")
+
+    def test_env_context_uses_what_it_is_given(self):
+        line = self.model_line(
+            A.env_context(model="deepseek-flash", gateway="deepseek"))
+        self.assertEqual(line, "模型: deepseek-flash (deepseek)")
+
+    def test_it_falls_back_to_the_module_constants(self):
+        """老调用点（含测试）不传参时行为不变。"""
+        self.assertTrue(self.model_line(A.env_context()))
+
+    def test_an_agent_tells_the_model_its_own_identity(self):
+        ag = mk()
+        ag.model = "some-model-x"
+        ag.gateway = "some-gateway-y"
+        ag.refresh_environment()
+        system = ag.messages[0]["content"]
+        self.assertIn("模型: some-model-x (some-gateway-y)", system)
+        self.assertNotIn("kimi-k3-256k", system)
+
+    def test_both_call_sites_pass_the_identity(self):
+        """漏一个调用点就是「新会话对、换模型后错」这种更难查的半通状态。"""
+        source = (Path(__file__).resolve().parents[1]
+                  / "core" / "agent.py").read_text(encoding="utf-8")
+        self.assertEqual(
+            source.count("env_context(model=model, gateway=gateway)"), 1,
+            "system_prompt 里只该有这一处组装 <env>")
+        self.assertEqual(source.count("model=model, gateway=self.gateway),"), 1,
+                         "__init__ 那条：self.model 还没赋值，必须用局部参数")
+        self.assertEqual(
+            source.count('gateway=getattr(self, "gateway", None)),'), 1,
+            "refresh_environment 那条：/model 换完靠它改对身份")
+        self.assertNotIn("env_context()]", source,
+                         "不许有不带身份的调用点")
+

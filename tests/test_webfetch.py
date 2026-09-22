@@ -16,7 +16,11 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from core import settings, tools, webfetch
 
-CRED_PROXY = "http://user:S3CR3T@10.1.20.50:23128/"
+# 夹具用 RFC 5737 的文档保留段（198.51.100.0/24），不用任何真实网段：
+# 凭据本来就是假的，但 IP+端口曾是维护者机器上代理的真实内网地址，
+# 留在公开仓库里是白送的内网拓扑信息。**泄漏扫描要扫夹具**——
+# 这条纪律在 09-21 就付过学费（测试夹具里混进过真实会话抽出的记忆条目）。
+CRED_PROXY = "http://user:S3CR3T@198.51.100.7:23128/"
 
 
 class FakeResponse:

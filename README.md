@@ -1277,6 +1277,17 @@ ZYLAB_GATEWAY=boyue zylab
 默认导出的代理常常只放行一部分域名，打到自家网关上返回 403 —— 看起来像 key 失效，
 实际是路由错了。这个坑排查起来极贵，所以客户端不碰环境里的代理设置。
 
+**如果你的 endpoint 必须经代理才够得着**，显式声明一条：
+
+```bash
+export ZYLAB_API_PROXY='http://<user>:<pass>@<host>:<port>/'
+```
+
+只认这一个变量，**不读** `http_proxy` / `https_proxy`（理由同上），也不复用
+网页抓取那条 `web.proxy` —— 这条路会把 key、prompt、代码和工具结果都送过去，
+所以要你为它单独表态。值的形态不对（比如误填了一条 shell 命令）就当没声明、
+照常直连，不会把一个非 URL 交给 urllib。凭据在任何输出里都会被脱敏成 `…@host`。
+
 **明文 HTTP 的 endpoint 默认被拒绝**，因为 key、prompt 和代码都会明文过链路。
 确实需要时用 `transport.allowed_insecure_endpoints` 精确授权那**一个** endpoint，
 而不是 `--allow-insecure-http` 那个进程级大开关。

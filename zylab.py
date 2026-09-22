@@ -75,7 +75,8 @@ from core import (agent as A, agent_events as AGENT_EVENTS, agents as AGENTS,
                 plans as PLANS, goals as GOALS, recipes as RECIPES, skills as SKILLS,
                 settings as CFG, store, version as VERSION,
                 tasks as TASKS, workflows as WORKFLOWS,
-                tools, tui, repomap as REPOMAP)    # noqa: E402
+                tools, tui, repomap as REPOMAP,
+                webfetch)    # noqa: E402
 
 HOME = store.HOME
 SESSIONS = store.SESSIONS
@@ -14884,7 +14885,12 @@ def cmd_init_cli(a, cfg):
                   f"找过文件 {', '.join(client._key_files())}"))
         return 2
     # 5. 一次真实探测：三种失败读起来不一样
-    proxies = {k: v for k, v in os.environ.items()
+    # **值必须脱敏。** 代理 URL 常内嵌 `user:pass@`，而这行诊断会原样进终端、
+    # 进日志、进用户粘给同事的那段输出。`webfetch.redact()` 的注释原话就是
+    # 「代理凭据绝不能进任何输出」，这里之前没用上 —— 本机的 PJLab 代理正好带
+    # 用户名密码，于是任何人在这台机器上 init 探测失败就会把凭据打出来
+    # （2026-09-22 实跑陌生人流程时撞到）。
+    proxies = {k: webfetch.redact(v) for k, v in os.environ.items()
                if k.lower() in ("http_proxy", "https_proxy", "all_proxy") and v}
     other = next((n for n in sorted(client.GATEWAYS) if n != route.name),
                  route.name)
@@ -14912,6 +14918,11 @@ def cmd_init_cli(a, cfg):
         bad(f"网关 {route.name} 不可达：{exc} —— 与 key 无关")
         print(DIM(f"    直连 {client._display_url(route.base)}；"
                   f"本机代理变量：{proxies or '未设'}（zylab 直连，不走它们）"))
+        # 「我不读你的环境变量」如果不给出路，对**必须走代理才够得着端点**的用户
+        # 就是一条死路（2026-09-22 实跑陌生人流程撞到）。给出显式入口。
+        print(DIM(f"    这个端点必须经代理才够得着？显式声明一条："
+                  f"export {paths.env_name('API_PROXY')}="
+                  "'http://<user>:<pass>@<host>:<port>/'"))
         print(DIM(f"    稍后重试，或换网关：zylab init --gateway {other}"))
         return 1
     # 6. 默认模型能不能答话 —— 目录里列得出 ≠ 这把 key 调得通。
@@ -14928,12 +14939,24 @@ def cmd_init_cli(a, cfg):
             if event["t"] == "text")
         ok(f"默认模型 {want} 可调用"
            + (f"（回复 {answered.strip()[:12]!r}）" if answered.strip() else ""))
-        if a.model:
-            try:
-                CFG.write_user({"model": want})
-                ok(f"已写入 settings：model = {want}")
-            except CFG.SettingsError as exc:
-                warn(f"模型可用，但写入 settings 失败：{exc}")
+        # **成功也要落盘 —— 这条以前漏了，后果正好把 init 的承诺变成假的。**
+        #
+        # 失败分支（`_init_pick_model`）一直是 `{"model": …, "gateway": …}` 两个
+        # 都写的；而这条成功路径原来只在用户显式给了 `--model` 时写 model，
+        # **gateway 一次都不写**。于是「默认模型能用」的人结局比「默认模型不能用」
+        # 的人更差：init 报六个 ✓ 并说「下一步：zylab -p '你好'」，而下一步退回
+        # 内置默认网关、当场报「还没选网关」。
+        #
+        # 2026-09-22 实跑陌生人流程撞到（deepseek + 自己的 key）：
+        #   init：✓ 网关 deepseek / ✓ 默认模型 deepseek-flash 可调用（回复 'ok'）
+        #   下一条命令：✗ 网关 deepinfer 还没有 API key —— 还没选网关
+        #
+        # 用户是显式 `--gateway` 选的、而且刚刚**实测调通**，这就是该记住的状态。
+        try:
+            CFG.write_user({"model": want, "gateway": route.name})
+            ok(f"已写入 settings：model = {want}、gateway = {route.name}")
+        except CFG.SettingsError as exc:
+            warn(f"模型可用，但写入 settings 失败：{exc}")
     except client.APIError as exc:
         bad(f"默认模型 {want} 这把 key 调不通：{exc}")
         try:

@@ -419,9 +419,53 @@ class _CancellableHTTPSHandler(urllib.request.HTTPSHandler):
             _CancellableHTTPSConnection, req, context=self._context)
 
 
+# 直连 opener：`ProxyHandler({})` 是**显式**给空映射，等于关掉 urllib 对
+# http(s)_proxy 的自动接管。README 有原委：企业网络里默认导出的代理常常只放行
+# 一部分域名，打到自家网关上返回 403 —— 看起来像 key 失效，实际是路由错了。
 _OPENER = urllib.request.build_opener(
     urllib.request.ProxyHandler({}), _SameOriginRedirects(),
     _CancellableHTTPHandler(), _CancellableHTTPSHandler())
+
+# 但「永不走代理」曾经是**一条死路**：端点只能经代理到达的用户完全没法用
+# （2026-09-22 实跑陌生人流程撞到 —— DeepSeek 官方端点在那台机器上只有一条代理
+# 通，init 探测超时，而提示里只说「我不读你的环境变量」，没给任何出路）。
+# `core/webfetch.py` 对同一个问题早有答案：**显式声明**一条代理，绝不从环境推断。
+# 这里照它的形状补上入口，只是**只认显式声明这一级**——这条路携带 API key，
+# 不该从 shell 环境里猜。
+_PROXY_OPENERS = {}
+
+
+def api_proxy():
+    """模型请求要走的代理；没有显式声明就返回 None（直连）。
+
+    只认 `ZYLAB_API_PROXY`。**刻意不读 http(s)_proxy**（理由同 _OPENER），
+    也刻意不复用 `web.proxy`：那条给网页抓取，信任面不同 —— 这条会把
+    API key、prompt、代码与工具结果都送过去，必须由用户为这条路单独表态。
+
+    值要过 `looks_like_proxy_url`：09-20 有过事故，`_PROXY_CLEAR='unset …'`
+    这种 shell 命令被当成代理交给 ProxyHandler，urllib 抛
+    `InvalidURL: URL can't contain control characters`，代理这条腿当场失效。
+    形态不对就当没声明（返回 None），不是报错 —— 直连仍然可用。
+    """
+    value = paths.env_get("API_PROXY", "").strip()
+    if not value:
+        return None
+    from . import webfetch                  # 惰性 import：避免模块级环依赖
+    return value if webfetch.looks_like_proxy_url(value) else None
+
+
+def _opener_for(proxy):
+    """按代理 URL 取 opener；无代理时返回 `_OPENER` 本身（测试就 patch 它）。"""
+    if not proxy:
+        return _OPENER
+    hit = _PROXY_OPENERS.get(proxy)
+    if hit is None:
+        hit = urllib.request.build_opener(
+            urllib.request.ProxyHandler({"http": proxy, "https": proxy}),
+            _SameOriginRedirects(),
+            _CancellableHTTPHandler(), _CancellableHTTPSHandler())
+        _PROXY_OPENERS[proxy] = hit
+    return hit
 
 
 def _safe_diagnostic(value, limit):
@@ -1659,7 +1703,7 @@ def _stream_once(model, messages, tools=None, max_tokens=8192, temperature=0.3,
     _mark_phase(phases, "started", attempt)
     _ACTIVE_CANCEL.handle = cancel      # connect() 里把 socket 绑到这个句柄上
     try:
-        resp = _OPENER.open(req, timeout=timeout)
+        resp = _opener_for(api_proxy()).open(req, timeout=timeout)
     except urllib.error.HTTPError as e:
         _mark_phase(phases, "ended", attempt)
         raise _http_error(e, route, model) from None
@@ -1810,5 +1854,5 @@ def list_models(gateway=None, route=None):
     req = urllib.request.Request(
         f"{route.base}/models",
         headers={"Authorization": f"Bearer {api_key(route)}"})
-    with _OPENER.open(req, timeout=60) as r:
+    with _opener_for(api_proxy()).open(req, timeout=60) as r:
         return json.loads(r.read()).get("data", [])

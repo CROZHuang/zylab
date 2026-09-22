@@ -10,6 +10,7 @@ import os
 import sys
 import tempfile
 import unittest
+import urllib.request
 from pathlib import Path
 from unittest import mock
 
@@ -1094,3 +1095,91 @@ class DSMLLeakFilterTests(unittest.TestCase):
                 "glm-5.3", [{"role": "user", "content": "x"}]))
         self.assertEqual("".join(e["v"] for e in events if e["t"] == "text"),
                          self.JSON_FORM, "只对已知会泄漏的模型族启用过滤")
+
+class ApiProxyIsOptInOnly(unittest.TestCase):
+    """模型请求的代理入口：**只认显式声明**。
+
+    2026-09-22 实跑陌生人流程时撞到的死路：`ProxyHandler({})` 是刻意的
+    （企业网络里默认导出的代理常常只放行一部分域名，打到自家网关上返回 403，
+    看起来像 key 失效），但它此前**没有任何出路** —— 端点只能经代理到达的用户
+    完全没法用 zylab，而 init 的提示只说「我不读你的环境变量」。
+
+    刻意**不**复用 `web.proxy`：那条给网页抓取，信任面不同 —— 这条会把 API key、
+    prompt、代码与工具结果都送过去，必须由用户为这条路单独表态。
+    """
+
+    def setUp(self):
+        client._PROXY_OPENERS.clear()
+        self.addCleanup(client._PROXY_OPENERS.clear)
+
+    def env(self, value):
+        return mock.patch.dict(os.environ, {"ZYLAB_API_PROXY": value})
+
+    def test_undeclared_means_direct(self):
+        with mock.patch.dict(os.environ, {}, clear=False):
+            os.environ.pop("ZYLAB_API_PROXY", None)
+            self.assertIsNone(client.api_proxy())
+
+    def test_a_declared_url_is_used(self):
+        with self.env("http://u:p@proxy.invalid:3128/"):
+            self.assertEqual(client.api_proxy(),
+                             "http://u:p@proxy.invalid:3128/")
+
+    def test_a_value_that_is_not_a_url_is_treated_as_undeclared(self):
+        """09-20 的事故形态：一条 shell 命令被当成代理交给 ProxyHandler，
+        urllib 抛 InvalidURL，代理这条腿当场失效。形态不对就当没声明，
+        **不是报错** —— 直连仍然可用。"""
+        for value in ("unset http_proxy https_proxy", "yes", "1",
+                      "proxy.invalid:3128", ""):
+            with self.subTest(value=value), self.env(value):
+                self.assertIsNone(client.api_proxy())
+
+    def test_the_direct_opener_is_the_module_level_one(self):
+        """无代理时必须返回 `_OPENER` 本身 —— 整套测试都 patch 它的 open。"""
+        self.assertIs(client._opener_for(None), client._OPENER)
+        self.assertIs(client._opener_for(""), client._OPENER)
+
+    def test_a_proxy_gets_its_own_cached_opener(self):
+        first = client._opener_for("http://proxy.invalid:3128/")
+        self.assertIsNot(first, client._OPENER)
+        self.assertIs(first, client._opener_for("http://proxy.invalid:3128/"),
+                      "同一个代理不该每次重建 opener")
+        self.assertIsNot(first, client._opener_for("http://other.invalid:1/"))
+        handlers = [h for h in first.handlers
+                    if isinstance(h, urllib.request.ProxyHandler)]
+        self.assertTrue(handlers)
+        self.assertEqual(handlers[0].proxies.get("https"),
+                         "http://proxy.invalid:3128/")
+
+    def test_both_request_paths_go_through_it(self):
+        """两条发请求的路都要用 `_opener_for(api_proxy())`，漏一条就是
+        「聊天走代理、列模型不走」这种更难查的半通状态。"""
+        source = (Path(__file__).resolve().parents[1]
+                  / "core" / "client.py").read_text(encoding="utf-8")
+        self.assertEqual(source.count("_opener_for(api_proxy()).open("), 2)
+        self.assertNotIn("_OPENER.open(", source)
+
+
+class InitDiagnosticNeverPrintsProxyCredentials(unittest.TestCase):
+    """`zylab init` 探测失败时会打印本机代理变量 —— 值必须脱敏。
+
+    代理 URL 常内嵌 `user:pass@`，而那行诊断会进终端、进日志、进用户粘给同事的
+    那段输出。`webfetch.redact()` 的注释原话就是「代理凭据绝不能进任何输出」，
+    这里之前没用上。2026-09-22 实跑陌生人流程时撞到：那台机器的代理正好带
+    用户名密码。
+    """
+
+    def test_the_values_go_through_redact(self):
+        source = (Path(__file__).resolve().parents[1]
+                  / "zylab.py").read_text(encoding="utf-8")
+        self.assertIn("proxies = {k: webfetch.redact(v)", source)
+        self.assertNotIn(
+            "proxies = {k: v for k, v in os.environ.items()", source)
+
+    def test_redact_actually_removes_the_credentials(self):
+        from core import webfetch
+        out = webfetch.redact("http://someone:s3cr3t@10.0.0.1:23128/")
+        self.assertNotIn("s3cr3t", out)
+        self.assertNotIn("someone", out)
+        self.assertIn("10.0.0.1:23128", out)
+
