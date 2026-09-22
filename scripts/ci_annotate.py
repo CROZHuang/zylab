@@ -122,6 +122,26 @@ def group_by_cause(blocks):
             for k in order]
 
 
+def pick_blocks(causes, limit=None):
+    """从根因里挑 traceback：**首尾交替**，不是取前 N 个。
+
+    unittest 的执行顺序是按模块名字母序，于是「取前 N 个根因」会系统性地偏向
+    字母靠前的模块——2026-09-22 实测：macOS 那列 13 类根因取 5 条，全落在
+    test_agent_* / test_app_* / test_client / test_ctrl_o / test_metrics 上，
+    而我正想看的 test_sessions 与 test_windows_paths 在字母末尾，**永远轮不到**。
+
+    首尾交替（第 1、最后、第 2、倒数第 2…）让两端都有代表，代价是零。
+    """
+    limit = MAX_BLOCKS if limit is None else limit
+    remaining = list(causes)
+    out = []
+    while remaining and len(out) < limit:
+        out.append(remaining.pop(0))
+        if remaining and len(out) < limit:
+            out.append(remaining.pop())
+    return out
+
+
 def annotations(log):
     """返回 [(标题, 正文)]；条数受 MAX_BLOCKS 约束，没有可报的就返回空。"""
     out = []
@@ -137,7 +157,7 @@ def annotations(log):
         out.append(("根因汇总", "\n".join(body)))
     if names:
         out.append(("失败清单", "\n".join(names[:MAX_NAMES])))
-    for index, (_, _, _, block) in enumerate(causes[:MAX_BLOCKS], 1):
+    for index, (_, _, _, block) in enumerate(pick_blocks(causes), 1):
         out.append((f"traceback {index}", block))
     hit = HANG.search(log)
     if hit:

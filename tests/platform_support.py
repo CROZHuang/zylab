@@ -12,6 +12,7 @@
 **skip 不等于通过。** 每个 skip 都写清楚为什么无法断言，免得下次有人
 把「跳过」读成「没问题」。
 """
+import contextlib
 import os
 import signal
 import stat
@@ -166,3 +167,17 @@ STOP_LADDER = (signal.SIGINT, signal.SIGTERM, HARD_KILL_SIGNAL)
 
 def expected_stop_signals():
     return STOP_LADDER if IS_WINDOWS else (HARD_KILL_SIGNAL,)
+
+
+@contextlib.contextmanager
+def canonical_tmp():
+    """`with canonical_tmp() as root:` —— 临时目录，且路径**已解析**。
+
+    与 `canonical_tempdir()` 同一个理由（macOS 的 `/var`→`/private/var`），
+    只是形态适合 `with` 块。这一条在需要 `chdir` 的用例上尤其要紧：
+    `os.getcwd()` 返回的是**物理**路径，拿未解析的 root 拼出来的期望值与产品
+    报出来的永远差一个 `/private`（2026-09-22 CI 的 macOS 那列，
+    `test_session_picker.ResumeCwdTransactionTests` 两条）。
+    """
+    with tempfile.TemporaryDirectory() as root:
+        yield os.path.realpath(root)

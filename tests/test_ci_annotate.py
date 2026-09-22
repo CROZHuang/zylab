@@ -448,5 +448,35 @@ class TheExceptionClassHistogram(unittest.TestCase):
         body = dict(ci_annotate.annotations(log))["根因汇总"]
         self.assertIn("按异常类：OSError\u00d71", body)
 
+class TracebackSelection(unittest.TestCase):
+    """挑 traceback 不能系统性偏向字母靠前的模块。
+
+    unittest 按模块名字母序跑，于是「取前 N 个根因」会让 test_sessions /
+    test_windows_paths 这类字母末尾的模块**永远拿不到 traceback**——
+    2026-09-22 macOS 那列实测就是这样，我想看的两块一次都没出现过。
+    """
+
+    def causes(self, n):
+        return [(f"E{i}: msg", 1, f"name{i}", f"block{i}") for i in range(n)]
+
+    def test_it_alternates_head_and_tail(self):
+        picked = ci_annotate.pick_blocks(self.causes(9), limit=5)
+        self.assertEqual([c[3] for c in picked],
+                         ["block0", "block8", "block1", "block7", "block2"])
+
+    def test_it_never_repeats_or_overruns(self):
+        for total in range(0, 12):
+            for limit in (1, 3, 5):
+                picked = ci_annotate.pick_blocks(self.causes(total), limit=limit)
+                with self.subTest(total=total, limit=limit):
+                    self.assertLessEqual(len(picked), min(total, limit))
+                    self.assertEqual(len({c[3] for c in picked}), len(picked))
+
+    def test_fewer_causes_than_the_budget_are_all_taken(self):
+        picked = ci_annotate.pick_blocks(self.causes(3), limit=5)
+        self.assertEqual(sorted(c[3] for c in picked),
+                         ["block0", "block1", "block2"])
+
+
 if __name__ == "__main__":
     unittest.main()

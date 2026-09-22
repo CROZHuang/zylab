@@ -29,6 +29,7 @@ from unittest import mock
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
+from tests.platform_support import canonical_tmp  # noqa: E402
 from core import tui
 import zylab as CLI
 
@@ -384,7 +385,7 @@ def _canonical(record, *, on_load=None):
 
 class ResumeCwdTransactionTests(unittest.TestCase):
     def test_commit_failure_restores_cwd_health_policy_and_metrics_facade(self):
-        with tempfile.TemporaryDirectory() as root:
+        with canonical_tmp() as root:
             current = Path(root) / "current"
             saved = Path(root) / "saved"
             current.mkdir()
@@ -454,7 +455,7 @@ class ResumeCwdTransactionTests(unittest.TestCase):
         self.assertIn(("rollback", "target"), sess.calls)
 
     def test_current_policy_rebinds_without_chdir_and_commits_lease(self):
-        with tempfile.TemporaryDirectory() as root:
+        with canonical_tmp() as root:
             current = Path(root) / "current"
             saved = Path(root) / "saved"
             current.mkdir()
@@ -481,7 +482,7 @@ class ResumeCwdTransactionTests(unittest.TestCase):
                 "target", owner_id="test-owner", cwd=str(current))
 
     def test_saved_policy_chdirs_after_runtime_check_and_commits_lease(self):
-        with tempfile.TemporaryDirectory() as root:
+        with canonical_tmp() as root:
             current = Path(root) / "current"
             saved = Path(root) / "saved"
             current.mkdir()
@@ -510,7 +511,7 @@ class ResumeCwdTransactionTests(unittest.TestCase):
             update.assert_not_called()
 
     def test_cancel_policy_has_no_session_or_lease_side_effects(self):
-        with tempfile.TemporaryDirectory() as root:
+        with canonical_tmp() as root:
             current = Path(root) / "current"
             saved = Path(root) / "saved"
             current.mkdir()
@@ -533,7 +534,7 @@ class ResumeCwdTransactionTests(unittest.TestCase):
             self.assertEqual(sess._leased_session_id, "current")
 
     def test_saved_policy_missing_directory_releases_target_lease(self):
-        with tempfile.TemporaryDirectory() as root:
+        with canonical_tmp() as root:
             current = Path(root) / "current"
             current.mkdir()
             missing = Path(root) / "missing"
@@ -553,7 +554,7 @@ class ResumeCwdTransactionTests(unittest.TestCase):
             self.assertEqual(sess.ag.session_id, "current")
 
     def test_saved_policy_active_runtime_releases_target_lease(self):
-        with tempfile.TemporaryDirectory() as root:
+        with canonical_tmp() as root:
             current = Path(root) / "current"
             saved = Path(root) / "saved"
             current.mkdir()
@@ -576,7 +577,7 @@ class ResumeCwdTransactionTests(unittest.TestCase):
             self.assertEqual(sess.ag.session_id, "current")
 
     def test_live_target_lease_blocks_before_current_session_is_saved(self):
-        with tempfile.TemporaryDirectory() as root:
+        with canonical_tmp() as root:
             current = Path(root) / "current"
             saved = Path(root) / "saved"
             current.mkdir()
@@ -601,7 +602,7 @@ class ResumeCwdTransactionTests(unittest.TestCase):
             self.assertEqual(sess._leased_session_id, "current")
 
     def test_failure_after_target_acquire_rolls_back_target_not_current(self):
-        with tempfile.TemporaryDirectory() as root:
+        with canonical_tmp() as root:
             current = Path(root) / "current"
             saved = Path(root) / "saved"
             current.mkdir()
@@ -624,7 +625,7 @@ class ResumeCwdTransactionTests(unittest.TestCase):
             self.assertNotIn(("commit", "target"), sess.calls)
 
     def test_acquire_is_followed_by_fresh_canonical_read(self):
-        with tempfile.TemporaryDirectory() as root:
+        with canonical_tmp() as root:
             current = Path(root) / "current"
             saved = Path(root) / "saved"
             current.mkdir()
@@ -650,7 +651,7 @@ class ResumeCwdTransactionTests(unittest.TestCase):
             self.assertEqual(sess.ag.messages[1]["content"], "FRESH")
 
     def test_commit_failure_restores_old_runtime_and_rolls_back_target(self):
-        with tempfile.TemporaryDirectory() as root:
+        with canonical_tmp() as root:
             current = Path(root) / "current"
             saved = Path(root) / "saved"
             current.mkdir()
@@ -671,7 +672,7 @@ class ResumeCwdTransactionTests(unittest.TestCase):
             self.assertNotIn(("reset-agents",), sess.calls)
 
     def test_legacy_record_does_not_inherit_plan_mode(self):
-        with tempfile.TemporaryDirectory() as root:
+        with canonical_tmp() as root:
             sess = FakeResumeSession(root)
             sess.plan_mode = True
             record = _resume_record(root)
@@ -727,7 +728,7 @@ class ResumeCwdTransactionTests(unittest.TestCase):
 
 class NewSessionTransactionTests(unittest.TestCase):
     def test_commit_failure_restores_old_runtime_before_cleanup(self):
-        with tempfile.TemporaryDirectory() as root:
+        with canonical_tmp() as root:
             sess = FakeResumeSession(root)
             old_agent = sess.ag
             old_controller = sess.controller
@@ -752,7 +753,7 @@ class NewSessionTransactionTests(unittest.TestCase):
         ])
 
     def test_cleanup_runs_only_after_successful_commit(self):
-        with tempfile.TemporaryDirectory() as root:
+        with canonical_tmp() as root:
             sess = FakeResumeSession(root)
             new_agent = FakeAgent("new")
 

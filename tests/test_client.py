@@ -193,7 +193,7 @@ class InsecureTransportGate(unittest.TestCase):
         client.configure_transport_policy(authorizer=authorize)
         trace = {
             "session_id": "session-a",
-            "cwd": "/tmp/repo-a/../repo-a",
+            "cwd": "/no-such-root/repo-a/../repo-a",
             "raw": {"purpose": "chat"},
         }
         with mock.patch.object(client, "api_key", return_value="synthetic"), \
@@ -205,7 +205,7 @@ class InsecureTransportGate(unittest.TestCase):
                 route=route, retries=1, metrics=None, trace_context=trace))
         request = authorize.call_args.args[0]
         self.assertEqual(request["base"], "http://example.invalid/v1")
-        self.assertEqual(request["repo"], "/tmp/repo-a")
+        self.assertEqual(request["repo"], "/no-such-root/repo-a")
         self.assertEqual(request["session"], "session-a")
         self.assertEqual(request["gateway"], "boyue")
         opened.assert_called_once()
@@ -216,7 +216,7 @@ class InsecureTransportGate(unittest.TestCase):
         request = client.transport_request(route, trace_context={
             "session_id": "child-session",
             "transport_session_id": "parent-session",
-            "cwd": "/tmp/repo-a",
+            "cwd": "/no-such-root/repo-a",
         })
 
         self.assertEqual(request["session"], "parent-session")
