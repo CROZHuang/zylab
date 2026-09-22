@@ -18,6 +18,21 @@ from core import checkpoints
 from tests.platform_support import assert_mode, requires_symlinks  # noqa: E402
 
 
+def _name(path):
+    """取路径的最后一段。
+
+    崩溃注入的谓词原来直接比整串，而那只在 POSIX 上成立：那边 checkpoints 调的是
+    `os.replace(相对名, 相对名, src_dir_fd=…, dst_dir_fd=…)`；Windows 上
+    `wincompat.fd_replace` 先拼成绝对路径再调，谓词一条都命中不了——注入不发生、
+    子进程正常退出，断言读到的是 `0 != 96` 这种莫名其妙的失败
+    （移植方 2026-09-17 在 Windows 上就撞上这四条，当时的结论是「不改恢复逻辑，
+    宁可留红」——对的，但**要改的是用例的谓词，不是恢复逻辑**）。
+    比 basename 两个平台同一套。
+    """
+    import os as _os
+    return _os.path.basename(str(path))
+
+
 class CheckpointCase(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
@@ -727,14 +742,14 @@ class CheckpointStoreTests(CheckpointCase):
 
         def replace_once(source, destination, *args, **kwargs):
             if (not state["exdev"]
-                    and source == created.name
-                    and str(destination).startswith("file-")):
+                    and _name(source) == created.name
+                    and _name(destination).startswith("file-")):
                 state["exdev"] = True
                 raise OSError(checkpoints.errno.EXDEV, "cross-device")
             return real_replace(source, destination, *args, **kwargs)
 
         def fail_source_unlink_once(path, *args, **kwargs):
-            if not state["unlink_failed"] and path == created.name:
+            if not state["unlink_failed"] and _name(path) == created.name:
                 state["unlink_failed"] = True
                 raise OSError("injected source unlink failure")
             return real_unlink(path, *args, **kwargs)
@@ -766,16 +781,18 @@ import errno
 import os
 import sys
 from core import checkpoints
+# 比 basename：POSIX 上 checkpoints 传相对名，Windows 上 wincompat 传绝对路径。
+_name = lambda p: os.path.basename(str(p))
 store = checkpoints.CheckpointStore(sys.argv[1])
 real_replace = os.replace
 state = {'exdev': False}
 def crash_between_copy_and_rename(source, destination, *args, **kwargs):
-    if (not state['exdev'] and source == sys.argv[3]
-            and str(destination).startswith('file-')):
+    if (not state['exdev'] and _name(source) == sys.argv[3]
+            and _name(destination).startswith('file-')):
         state['exdev'] = True
         raise OSError(errno.EXDEV, 'forced cross-device')
-    if (str(source).startswith('.kct-')
-            and str(destination).startswith('file-')):
+    if (_name(source).startswith('.kct-')
+            and _name(destination).startswith('file-')):
         os._exit(96)
     return real_replace(source, destination, *args, **kwargs)
 checkpoints.os.replace = crash_between_copy_and_rename
@@ -817,12 +834,14 @@ import errno
 import os
 import sys
 from core import checkpoints
+# 比 basename：POSIX 上 checkpoints 传相对名，Windows 上 wincompat 传绝对路径。
+_name = lambda p: os.path.basename(str(p))
 store = checkpoints.CheckpointStore(sys.argv[1])
 real_replace = os.replace
 state = {'exdev': False}
 def force_cross_device(source, destination, *args, **kwargs):
-    if (not state['exdev'] and source == sys.argv[3]
-            and str(destination).startswith('file-')):
+    if (not state['exdev'] and _name(source) == sys.argv[3]
+            and _name(destination).startswith('file-')):
         state['exdev'] = True
         raise OSError(errno.EXDEV, 'forced cross-device')
     return real_replace(source, destination, *args, **kwargs)
@@ -880,12 +899,14 @@ import errno
 import os
 import sys
 from core import checkpoints
+# 比 basename：POSIX 上 checkpoints 传相对名，Windows 上 wincompat 传绝对路径。
+_name = lambda p: os.path.basename(str(p))
 store = checkpoints.CheckpointStore(sys.argv[1])
 real_replace = os.replace
 def crash_between_copy_and_rename(source, destination, *args, **kwargs):
-    if source == sys.argv[3] and destination == sys.argv[4]:
+    if _name(source) == sys.argv[3] and _name(destination) == sys.argv[4]:
         raise OSError(errno.EXDEV, 'forced cross-device')
-    if str(source).startswith('.kcr-') and destination == sys.argv[4]:
+    if _name(source).startswith('.kcr-') and _name(destination) == sys.argv[4]:
         os._exit(97)
     return real_replace(source, destination, *args, **kwargs)
 checkpoints.os.replace = crash_between_copy_and_rename
@@ -935,10 +956,12 @@ import errno
 import os
 import sys
 from core import checkpoints
+# 比 basename：POSIX 上 checkpoints 传相对名，Windows 上 wincompat 传绝对路径。
+_name = lambda p: os.path.basename(str(p))
 store = checkpoints.CheckpointStore(sys.argv[1])
 real_replace = os.replace
 def force_cross_device(source, destination, *args, **kwargs):
-    if source == sys.argv[3] and destination == sys.argv[4]:
+    if _name(source) == sys.argv[3] and _name(destination) == sys.argv[4]:
         raise OSError(errno.EXDEV, 'forced cross-device')
     return real_replace(source, destination, *args, **kwargs)
 def crash_mid_copy(incoming, outgoing, length):

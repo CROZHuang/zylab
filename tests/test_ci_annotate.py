@@ -129,6 +129,50 @@ class AsACommand(unittest.TestCase):
         self.assertEqual(self.run_it().returncode, 2)
 
 
+class ItSurvivesALegacyCodePage(unittest.TestCase):
+    """Windows 上写管道时 Python 用本地代码页，cp1252/cp936 编不出中文标题。
+
+    2026-09-21 **连续两轮** CI 就栽在这里：报告器 `UnicodeEncodeError` 当场死掉，
+    workflow 里那句 `|| true` 把它咽掉，于是「红了但一条注解都没有」。
+    zylab 自己有 `wincompat.configure_stdio()` 干同一件事——同一个坑我在 CI 上
+    又踩了一遍。
+    """
+
+    def cp1252_stream(self):
+        return io.TextIOWrapper(io.BytesIO(), encoding="cp1252", errors="strict")
+
+    def test_a_legacy_code_page_stream_gets_reconfigured(self):
+        stream = self.cp1252_stream()
+        self.assertEqual(stream.encoding, "cp1252")
+        ci_annotate.force_utf8_stdout(stream)
+        self.assertEqual(stream.encoding, "utf-8")
+        stream.write("失败清单\n")                 # 不崩就是通过
+
+    def test_chinese_titles_still_get_printed_on_a_legacy_code_page(self):
+        """端到端：整条 main() 在 cp1252 的 stdout 上也要把注解打出来。"""
+        import tempfile
+        from unittest import mock
+        with tempfile.TemporaryDirectory() as tmp:
+            log = Path(tmp) / "unit.log"
+            log.write_text(UNITTEST_LOG, encoding="utf-8")
+            stream = self.cp1252_stream()
+            with mock.patch.object(ci_annotate.sys, "stdout", stream):
+                rc = ci_annotate.main(["ci_annotate.py", str(log)])
+        self.assertEqual(rc, 0)
+        stream.flush()
+        written = stream.buffer.getvalue().decode("utf-8", "replace")
+        self.assertIn("::error title=", written)
+        self.assertIn("test_alpha", written)
+
+    def test_an_unreconfigurable_stream_does_not_crash_it(self):
+        """被换成别的对象（没有 reconfigure）时也得活着。"""
+        class Plain:
+            def __init__(self): self.text = ""
+            def write(self, s): self.text += s
+        plain = Plain()
+        self.assertIs(ci_annotate.force_utf8_stdout(plain), plain)
+
+
 class TheWorkflowUsesIt(unittest.TestCase):
     """workflow 与脚本得对得上：路径写错就等于没有报告器（已经发生过一次）。"""
 
@@ -147,9 +191,54 @@ class TheWorkflowUsesIt(unittest.TestCase):
         self.assertIn("tee parity.log", self.text)
         self.assertNotIn("/tmp/unit.log", self.text)
 
+    def test_the_job_forces_utf8_for_python(self):
+        """测试名与断言消息全是中文；Windows 的管道默认是本地代码页。"""
+        self.assertIn("PYTHONIOENCODING: utf-8", self.text)
+
     def test_the_real_exit_code_survives(self):
         self.assertIn('exit "$rc"', self.text)
         self.assertIn("|| true", self.text)
+
+
+class AHangLeavesAStack(unittest.TestCase):
+    """挂住的用例要自己把栈打出来，而不是让 job 挂到上限被判 cancelled。
+
+    2026-09-22：CI 的 macOS 那列单元测试步骤一直不结束（上一轮 cancelled）。
+    一个挂住的 job 比一个红的 job 难查得多——它连结论都不给，而 job 日志又要
+    仓库 admin 权限才下得到。
+    """
+
+    def arm(self, env):
+        code = ("import sys; sys.path.insert(0, %r)\n"
+                "import tests, time\n"
+                "time.sleep(5)\n"
+                "print('NOT REACHED')\n") % str(ROOT)
+        return subprocess.run([sys.executable, "-c", code],
+                              capture_output=True, text=True, timeout=60,
+                              env=dict(__import__("os").environ, **env))
+
+    def test_ci_arms_the_watchdog_and_a_hang_dumps_threads(self):
+        done = self.arm({"CI": "true", "ZYLAB_TEST_WATCHDOG": "1"})
+        self.assertNotIn("NOT REACHED", done.stdout)
+        self.assertIn("Timeout", done.stderr, done.stderr[-300:])
+        self.assertIn("most recent call first", done.stderr)
+
+    def test_a_local_run_is_not_armed(self):
+        """本地跑测试不该被一个看门狗打断。"""
+        done = self.arm({"CI": "", "ZYLAB_TEST_WATCHDOG": ""})
+        self.assertIn("NOT REACHED", done.stdout, done.stderr[-300:])
+
+    def test_the_watchdog_budget_is_under_the_job_timeout(self):
+        """时限要小于 workflow 的 timeout-minutes，否则 job 先被杀、栈就没了。"""
+        text = (ROOT / ".github" / "workflows" / "ci.yml").read_text(
+            encoding="utf-8")
+        import re
+        minutes = int(re.search(r"timeout-minutes:\s*(\d+)", text).group(1))
+        source = (ROOT / "tests" / "__init__.py").read_text(encoding="utf-8")
+        seconds = int(re.search(r'"(\d+)" if os\.environ\.get\("CI"\)',
+                                source).group(1))
+        self.assertLess(seconds, minutes * 60,
+                        "看门狗比 job 超时还晚，栈永远打不出来")
 
 
 if __name__ == "__main__":

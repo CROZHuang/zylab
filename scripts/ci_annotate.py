@@ -62,7 +62,30 @@ def annotations(log):
     return out
 
 
+def force_utf8_stdout(stream=None):
+    """把 stdout 改成 UTF-8。**不改就一条注解都出不来。**
+
+    Windows 上写**管道**（GitHub 的 bash step 就是管道）时，Python 用的是本地
+    代码页——cp1252 / cp936 编不出中文，`print("::error title=失败清单::…")`
+    当场 `UnicodeEncodeError`，而 workflow 里那句 `|| true` 把它咽掉，于是
+    「CI 红了但一条注解都没有」（2026-09-21 连续两轮都栽在这里）。
+
+    zylab 自己有 `wincompat.configure_stdio()` 干同一件事，但这个脚本刻意不
+    import core——它要在测试套件跑挂了之后还能工作，不该依赖被测的那棵树。
+    """
+    target = sys.stdout if stream is None else stream
+    reconfigure = getattr(target, "reconfigure", None)
+    if reconfigure is None:                       # 被替换成了别的对象
+        return target
+    try:
+        reconfigure(encoding="utf-8", errors="replace")
+    except (OSError, ValueError):                 # 不支持就算了，下面还有兜底
+        pass
+    return target
+
+
 def main(argv):
+    force_utf8_stdout()
     if len(argv) != 2:
         print("用法: ci_annotate.py <日志文件>", file=sys.stderr)
         return 2
@@ -74,7 +97,12 @@ def main(argv):
         print(f"::warning::读不到 {argv[1]}：{exc}")
         return 0
     for title, body in annotations(log):
-        print(f"::error title={title}::{escape(body)}")
+        line = f"::error title={title}::{escape(body)}"
+        try:
+            print(line)
+        except UnicodeEncodeError:
+            # 兜底：编不出就退成 ASCII。少几个汉字也比一条注解都没有好。
+            print(line.encode("ascii", "backslashreplace").decode("ascii"))
     return 0
 
 

@@ -2246,8 +2246,15 @@ def t_expand_output(target="", page=1, **kwargs):
     if not isinstance(result, dict) or result.get("error") or "text" not in result:
         return json.dumps(result, ensure_ascii=False, sort_keys=True)
     # 原文按原样给，不裹进 JSON：整页文本转义后换行全变成 \n，既费 token 又难读。
-    more = (f"还有下一页：page={result.get('next_page')}" if result.get("has_more")
-            else "已到末尾")
+    # 下一页的提示写成**能照抄的整条调用**。P2 的教训就是这个：指针写成
+    # 「page=2」时模型不会接着翻（2026-09-22 的功能测试报告 §4 说「expand_output
+    # 有时也返回不完整内容」——其实是分页，只是那句提示不像一条命令）；
+    # 写成完整调用之后 expand_output 的真实调用率从 0/9 变成 18/20。
+    more = (
+        f'还有下一页，照抄这条接着取：'
+        f'expand_output(target="{result.get("target")}", '
+        f'page={result.get("next_page")})'
+        if result.get("has_more") else "已到末尾（这就是全文）")
     missing = result.get("missing_streams") or []
     lost = f"；这些流的落盘文件已不在：{'、'.join(map(str, missing))}" if missing else ""
     return (f"[expand_output target={result.get('target')} page={result.get('page')} "
@@ -3126,7 +3133,10 @@ def _subagent_schema():
         "subagent",
         "普通聊天中可主动启动的只读 child agent，无需 /workflow。单个深度调研用 task；"
         "有 2–3 个互相独立的调查时用 tasks 一次并行启动。child 使用当前模型和网关，"
-        "不能写文件、不能嵌套派生；主 agent 负责综合和所有修改。简单任务不要启动 child。",
+        "不能写文件、不能嵌套派生；主 agent 负责综合和所有修改。简单任务不要启动 child。"
+        "**child 的工具只有四个：read_file / list_dir / glob / grep。没有 bash，"
+        "也没有 web_fetch —— 任何需要联网或跑命令的调研都不能派给它**，"
+        "派了它只会回一句「我没有这个工具」。要联网自己用 web_fetch。",
         {
             "task": {
                 "type": "string",

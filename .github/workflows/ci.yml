@@ -25,6 +25,18 @@ jobs:
     runs-on: ${{ matrix.os }}
     # macOS 从未有人实跑过，先作为探路列：红了要看，但不挡 Windows/Linux。
     continue-on-error: ${{ matrix.os == 'macos-latest' }}
+    # **挂住要快速失败，不要占着 runner 到 6 小时上限。** 2026-09-22 实测：
+    # macOS 那列的单元测试步骤一直不结束，上一轮因此被判 cancelled——
+    # 一个挂住的 job 比一个红的 job 难查得多，因为它连结论都不给。
+    # 本机全量 4–6 分钟，Windows 约 10 分钟；25 分钟留足余量还能在半小时内收敛。
+    timeout-minutes: 25
+    env:
+      # **Windows 上非它不可。** 那边写管道时 Python 用本地代码页（runner 的
+      # 控制台是 cp437/cp1252），而这个仓库的测试名、断言消息、工具输出里全是
+      # 中文——编不出来就是 UnicodeEncodeError，而不是把话说完。
+      # zylab 自己有 `wincompat.configure_stdio()` 干同一件事，但那只管产品进程；
+      # `python -m unittest` 与 `scripts/ci_annotate.py` 的 stdout 得靠这一行。
+      PYTHONIOENCODING: utf-8
     strategy:
       fail-fast: false
       matrix:
@@ -54,7 +66,7 @@ jobs:
         shell: bash
         run: |
           python -VV
-          python -c "import sys,platform,locale,os;print('platform:',platform.platform());print('encoding:',sys.getdefaultencoding(),locale.getpreferredencoding(False));print('TERM=',os.environ.get('TERM'));print('cwd:',os.getcwd())"
+          python -c "import sys,platform,locale,os;print('platform:',platform.platform());print('stdout:',sys.stdout.encoding,'| preferred:',locale.getpreferredencoding(False),'| fs:',sys.getfilesystemencoding());print('TERM=',os.environ.get('TERM'),'| PYTHONIOENCODING=',os.environ.get('PYTHONIOENCODING'));print('cwd:',os.getcwd())"
           git --version
           bash --version | head -1
 

@@ -758,7 +758,12 @@ class SessionStoreTests(unittest.TestCase):
         ])
 
     @unittest.skipUnless(
-        "fork" in multiprocessing.get_all_start_methods(),
+        sys.platform.startswith("linux")
+        and "fork" in multiprocessing.get_all_start_methods(),
+        # 守卫原来只问「有没有 fork」，而 macOS **有** fork（只是不是默认）——
+        # 于是这条用例在那边照跑，而 macOS 上 fork 一个带线程的进程是
+        # 官方标注不安全的（3.12 起还会告警）。理由行里本来就写着
+        # 「Linux process identity」，守卫跟上它（2026-09-22）。
         "lease liveness uses Linux process identity",
     )
     def test_multiprocess_second_writer_is_rejected_by_live_lease(self):
@@ -791,7 +796,12 @@ class SessionStoreTests(unittest.TestCase):
         outcomes = {item[0]: item[1:] for item in (
             results.get(timeout=2), results.get(timeout=2))}
         results.close()
-        results.join_thread()
+        # join_thread() 没有超时参数：feeder 线程卡住就是永久挂着。
+        # 放到后台线程里等，主线程有界收场——挂住也是失败，不是 cancelled。
+        joiner = threading.Thread(target=results.join_thread, daemon=True)
+        joiner.start()
+        joiner.join(10)
+        self.assertFalse(joiner.is_alive(), "results 队列的 feeder 线程没收干净")
         self.assertEqual(outcomes["a"], ("saved",))
         self.assertEqual(outcomes["b"], (True, True))
         saved = store.load_session(session_id)

@@ -1787,6 +1787,62 @@ class Agent:
         except Exception:
             pass
 
+    # 连续这么多次「同一工具 + 同一参数 + 同一结果」就认定没有进展。
+    # 3 是刻意取小的：真实事故里模型把同一条 `grep -c` 连发了约 40 次、
+    # 每次都返回 45，直到撞上 max_turns 才停（2026-09-22 的功能测试报告 §1）。
+    # 合法的重复（轮询一个在变的文件、等后台任务）结果会变，不会命中。
+    NO_PROGRESS_REPEATS = 3
+
+    def _stalled_tool_call(self, repeats=None):
+        """连续 N 次同一工具、同一参数、同一结果 ⇒ 返回一句人话，否则 None。
+
+        判据要三样都相同。只看工具名会误伤「同一个工具读不同文件」；
+        只看参数会误伤「参数相同但结果在变」（轮询本来就该允许）。
+        结果也相同，才说明这一轮真的什么都没往前推。
+        """
+        limit = int(self.NO_PROGRESS_REPEATS if repeats is None else repeats)
+        if limit < 2:
+            return None
+        seen = []
+        for message in reversed(list(getattr(self, "messages", ()) or ())):
+            if not isinstance(message, dict):
+                continue
+            role = message.get("role")
+            if role == "tool":
+                seen.append(["", "", str(message.get("content") or "")])
+                if len(seen) > limit:
+                    break
+                continue
+            if role != "assistant":
+                continue
+            calls = message.get("tool_calls") or ()
+            if len(calls) != 1:
+                # 一轮里发了多个工具（或没发）：不是我们要认的那种打转形态。
+                break
+            function = (calls[0] or {}).get("function") or {}
+            index = len(seen) - 1
+            if index < 0 or seen[index][0]:
+                break
+            seen[index][0] = str(function.get("name") or "")
+            seen[index][1] = str(function.get("arguments") or "")
+        rows = [tuple(row) for row in seen if row[0]]
+        if len(rows) < limit or len(set(rows[:limit])) != 1:
+            return None
+        name, arguments, _ = rows[0]
+        shown = " ".join(str(arguments).split())[:160]
+        return (f"连续 {limit} 次调用 {name}，参数与返回完全相同"
+                f"（{shown}）")
+
+    @staticmethod
+    def _no_progress_notice(detail):
+        """打转被打断时给用户和模型看的话。与 max_turns 同一套形状。"""
+        return (
+            f"[zylab] 检测到工具循环没有进展：{detail}。"
+            "已中断这一轮以免继续白花请求。"
+            "已有的工具结果都保留着——下一轮请**换一种做法或直接总结**，"
+            "不要再用同样的参数调同一个工具。"
+        )
+
     @staticmethod
     def _max_turn_notice(max_turns):
         """Return a user/model-visible notice for a bounded loop stop.
@@ -2140,6 +2196,27 @@ class Agent:
             allowed_tools)
 
         for turn in _turn_indices(max_turns):
+            stalled = self._stalled_tool_call()
+            if stalled is not None:
+                notice = self._no_progress_notice(stalled)
+                self._append_terminal_notice(
+                    notice, turn_id=turn_id,
+                    record_event=controller.record_event,
+                    notice_kind="no_progress",
+                )
+                action = controller.fail_turn(
+                    "no_progress",
+                    details={"detail": stalled, "message": notice},
+                )
+                yield {
+                    "t": "end",
+                    "reason": "工具循环没有进展",
+                    "kind": "no_progress",
+                    "status": "partial",
+                    "message": notice,
+                    "action": action,
+                }
+                return
             if attachment_errors:
                 error = attachment_errors.pop(0)
                 details = {
@@ -3488,6 +3565,25 @@ class Agent:
         effective_allowed_tools = self._effective_tool_allowlist(
             allowed_tools)
         for turn in _turn_indices(max_turns):
+            # 检测放在**发请求之前**：这样打转被认出来时连这一次 provider 请求
+            # 都省掉。两条循环各插一份——历史上「只改一条」已经出过事
+            # （2026-09-20 换模型兜底）。
+            stalled = self._stalled_tool_call()
+            if stalled is not None:
+                notice = self._no_progress_notice(stalled)
+                self._append_terminal_notice(
+                    notice, turn_id=turn_id,
+                    record_event=journal,
+                    notice_kind="no_progress",
+                )
+                yield {
+                    "t": "end",
+                    "reason": "工具循环没有进展",
+                    "kind": "no_progress",
+                    "status": "partial",
+                    "message": notice,
+                }
+                return
             # Child runtime 可在 provider/tool 安全边界注入 inbox；每条保持独立
             # user message，不把多条纠偏静默拼成一条。
             deliver_inbox()
