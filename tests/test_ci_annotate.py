@@ -477,6 +477,44 @@ class TracebackSelection(unittest.TestCase):
         self.assertEqual(sorted(c[3] for c in picked),
                          ["block0", "block1", "block2"])
 
+class RunawayCauseLines(unittest.TestCase):
+    """PTY 用例的「最后一行」常常是**一整屏终端转储**，会把摘要预算一口吃光。
+
+    2026-09-22 实测：Windows py3.10 那列 48 类根因，摘要里只显示得出 2 类 ——
+    因为第一条根因行是几千字符的转义序列。归并本身没错，错在**显示没有上限**。
+    """
+
+    def test_it_strips_escapes_and_caps_the_length(self):
+        blob = "空闲 · chat\x1b[K\x1b[48;5H\x1b[?25h" + "X" * 4000
+        out = ci_annotate.tidy_cause(blob)
+        self.assertNotIn("\x1b", out)
+        self.assertLessEqual(len(out), ci_annotate.CAUSE_LINE + 1)
+        self.assertTrue(out.endswith("…"))
+
+    def test_a_short_line_is_untouched(self):
+        self.assertEqual(ci_annotate.tidy_cause("AssertionError: 1 != 2"),
+                         "AssertionError: 1 != 2")
+
+    def test_whitespace_is_collapsed_so_one_cause_stays_one_line(self):
+        self.assertEqual(ci_annotate.tidy_cause("a\n\n  b\tc"), "a b c")
+
+    def test_the_summary_fits_its_budget_even_with_huge_causes(self):
+        """十几类根因 + 每类一个巨大的尾行，正文仍要落在 MAX_BODY 内。"""
+        blocks = []
+        for i in range(12):
+            blocks.append(
+                f"{'=' * 70}\nFAIL: test_{i} (m.C.test_{i})\n{'-' * 70}\n"
+                f"Traceback (most recent call last):\n"
+                f"E{i}: " + "Z" * 3000 + "\n")
+        log = ("..F\n" + "\n".join(blocks) + "\n" + "-" * 70
+               + "\nRan 12 tests in 1s\n\nFAILED (failures=12)\n")
+        body = dict(ci_annotate.annotations(log))["根因汇总"]
+        self.assertLessEqual(len(ci_annotate.escape(body)),
+                             ci_annotate.MAX_BODY)
+        # 12 类都要露脸，不能被第一条吃掉
+        for i in range(12):
+            self.assertIn(f"E{i}:", body)
+
 
 if __name__ == "__main__":
     unittest.main()

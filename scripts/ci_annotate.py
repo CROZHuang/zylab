@@ -74,6 +74,26 @@ def _last_line(block):
     return lines[-1].strip() if lines else ""
 
 
+# 「根因行」取的是失败块的最后一行，而 PTY 用例的最后一行常常是**一整屏终端
+# 转储**（几千字符的转义序列）。它会把「根因汇总」那条注解的正文预算一口吃光，
+# 于是后面十几类根因一条都显示不出来 —— 2026-09-22 实测：Windows py3.10 那列
+# 48 类根因，摘要里只看得见 2 类。
+#
+# 所以显示前先压：去掉控制字符、压掉连续空白、截到 CAUSE_LINE 字符。
+# **归并键单独算**（cause_key），不受显示截断影响。
+CAUSE_LINE = 150
+NAME_LINE = 96      # 「首例」只是用例名，不需要 150
+_CONTROL = re.compile(r"[\x00-\x08\x0b-\x1f\x7f]")
+
+
+def tidy_cause(line, limit=None):
+    """把一行根因压成可显示的一行——纯函数，测得到。"""
+    limit = CAUSE_LINE if limit is None else limit
+    text = _CONTROL.sub("", str(line)).replace("\x1b", "")
+    text = re.sub(r"\s+", " ", text).strip()
+    return text[:limit] + ("…" if len(text) > limit else "")
+
+
 def cause_key(line):
     """把一行异常收敛成「根因」——纯函数，测得到。"""
     return _NOISE.sub("…", str(line))[:200]
@@ -152,8 +172,8 @@ def annotations(log):
         head = f"{len(causes)} 类根因 / {sum(c for _, c, _, _ in causes)} 个失败块"
         body = [head, f"按异常类：{class_histogram(causes)}"]
         for line, count, name, _ in causes[:MAX_CAUSES]:
-            body.append(f"{count:4d}×  {line}")
-            body.append(f"       首例 {name}")
+            body.append(f"{count:4d}×  {tidy_cause(line)}")
+            body.append(f"       首例 {tidy_cause(name, NAME_LINE)}")
         out.append(("根因汇总", "\n".join(body)))
     if names:
         out.append(("失败清单", "\n".join(names[:MAX_NAMES])))
