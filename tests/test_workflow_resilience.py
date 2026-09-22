@@ -29,14 +29,31 @@ from core import workflows as W  # noqa: E402
 class TheRouteLevelPredicate(unittest.TestCase):
     """判据要认出「换条路线可能就好了」，又不能把真失败也算进去。"""
 
+    # 下面这些串**照抄真实网关的输出**，不是编的。判据第一版只认了 DeepInfer
+    # 那一家的说法，在用户的默认网关（Boyue）上恒为 False —— 而单元测试全绿，
+    # 因为判据和夹具当时是我从同一个来源抄下来的。
+    BOYUE_503 = (
+        'HTTP 503: {"error":{"code":"model_not_found","message":"No available '
+        'channel for model glm-5.3 under group auto (distributor) '
+        '(request id: 202609220719544346612298268d9d66IM3aw2B)"}}')
+
     def test_provider_side_unavailability_counts(self):
         for error in ("403 model_not_available",
                       "HTTP 403 model is not available",
                       "kind=model_unavailable gateway=deepinfer",
+                      self.BOYUE_503,
                       "provider-attempt limit exhausted (5/5)",
                       "Provider Attempt Limit reached"):
             with self.subTest(error=error):
                 self.assertTrue(W._is_route_level_failure(error))
+
+    def test_the_default_gateway_is_covered(self):
+        """单独钉一条：用户默认网关的原话必须命中。
+
+        2026-09-22 实测发现它**不**命中——那一刻「workflow 已修」这句话是假的。
+        """
+        self.assertTrue(W._is_route_level_failure(self.BOYUE_503),
+                        "Boyue 说 model_not_found / No available channel")
 
     def test_a_real_task_failure_does_not_count(self):
         """模型答不出来、断言失败——换路线没用，不该白花第二次。"""

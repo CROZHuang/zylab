@@ -206,8 +206,47 @@ def _run_conpty_child(body, sends, *, cwd, timeout, prefix, child_env):
     finally:
         child.close()
     decoded = output.decode("utf-8", "replace")
-    payload = decoded.rsplit("RESULT:", 1)[1].strip().splitlines()[0]
-    return decoded, json.loads(payload)
+    return decoded, result_payload(decoded)
+
+
+def result_payload(decoded):
+    """从 PTY 输出里抠出 child 那条 ``RESULT:<json>``。
+
+    **用 raw_decode，不用 json.loads。** `json.loads` 要求整个字符串**恰好**是一个
+    JSON 值；而 ConPTY 是从屏幕缓冲区重绘的，`RESULT:` 那条逻辑行后面常常紧跟着
+    别的屏幕内容（中间没有换行），于是报 `Extra data: line 1 column N`。
+    `raw_decode` 只解析**第一个**完整值、忽略后面的尾巴，正是这里要的语义。
+    2026-09-22 公开仓库 CI：Windows 两列各 3 个 ERROR 全是它
+    （test_decision_gate_bridge / test_repomap / test_tui_pty / test_goals）。
+
+    顺序刻意是「**先按原来的形态试**，不行再扫候选起点」：
+
+    1. 去空白、取第一行 —— POSIX 的干净输出走这一条，**标量负载**
+       （`RESULT:"foo"` / `null` / `3`，有 child 是 `json.dumps(picked)`）也走这一条；
+       换成 raw_decode 之后，JSON 后面紧跟屏幕内容的那种形态在这一步就解开了。
+    2. 仍不行，才逐个 `{` / `[` 当起点试 —— 重绘会在 `RESULT:` 和 JSON 之间塞
+       控制序列。**不能只取第一个 `{` / `[`**：CSI 序列自己就带 `[`
+       （`\x1b[0m` 的那个比 JSON 还靠前），第一版就栽在这里；而转义序列解不成
+       JSON（`[0m` / `[19;10H` 都过不了第一个分隔符），所以「试一遍」比「猜起点」
+       既短又准。
+
+    POSIX 上对干净输出的结果与原来一字不差。
+    """
+    tail = decoded.rsplit("RESULT:", 1)[1]
+    decoder = json.JSONDecoder()
+    stripped = tail.strip()
+    candidates = [stripped.splitlines()[0]] if stripped else []
+    candidates += [tail[i:] for i, char in enumerate(tail) if char in "{["]
+    failure = None
+    for candidate in candidates:
+        try:
+            value, _end = decoder.raw_decode(candidate)
+        except ValueError as exc:
+            failure = failure or exc
+            continue
+        return value
+    raise failure or json.JSONDecodeError(
+        "RESULT: 后面找不到 JSON 负载", tail, 0)
 
 
 # raw_mode 进入时一定会发的括号粘贴开关。拿它当「输入泵已经武装好」的信号。
@@ -308,8 +347,7 @@ def run_pty_child(body, sends, *, cwd, timeout, prefix=""):
         child_home.cleanup()
 
     decoded = output.decode("utf-8", "replace")
-    payload = decoded.rsplit("RESULT:", 1)[1].strip().splitlines()[0]
-    return decoded, json.loads(payload)
+    return decoded, result_payload(decoded)
 
 
 def install_ready_input_pump(marker="ZYLAB_TEST_PUMP_READY"):

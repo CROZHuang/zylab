@@ -13,8 +13,9 @@ MSYS 的 `/tmp`，而紧接着运行的是 **Windows 的 python**，它把 `"/tm
 zylab 自己有 `tools._from_shell_path` 专门处理，我在 workflow 里又踩了一遍。
 收成脚本 + 相对路径之后，两个平台解析的是同一个字符串。
 
-注解每步只显示 10 条，所以**打包**：一条根因汇总、一条失败清单、最多三条完整
-traceback、一条输出尾部。一行一个失败名只够看见名字，看不到为什么。
+注解每步只显示 10 条，所以**打包**：一条根因汇总、一条失败清单、最多 MAX_BLOCKS 条
+完整 traceback（每个根因一条）、一条输出尾部。一行一个失败名只够看见名字，
+看不到为什么。
 
 **根因汇总是这里最贵的一条。** 2026-09-22 的 Windows 那列带回 40 个失败名 + 2 条
 traceback，而那 2 条**是同一个根因**（py3.10 的 `chmod: follow_symlinks`）——
@@ -28,7 +29,11 @@ import sys
 
 MAX_BODY = 3500          # 单条注解的正文上限，留足余量给 %0A 转义
 MAX_NAMES = 40
-MAX_BLOCKS = 3
+# 每个根因取一条 traceback。3 → 5：头两轮根因多达 51/59 类，注解预算用在
+# 「根因汇总」上更值；现在崩溃类清完、根因降到 14/46 类，预算该换成深度了。
+# 上限来自 GitHub 每步只显示 ~10 条注解：
+# 根因汇总 + 失败清单 + 5 条 traceback + 尾部 = 8，留一条给 GitHub 自己。
+MAX_BLOCKS = 5
 MAX_CAUSES = 12
 TAIL_LINES = 8
 # unittest 的一个失败块长这样：
@@ -118,7 +123,7 @@ def group_by_cause(blocks):
 
 
 def annotations(log):
-    """返回 [(标题, 正文)]，最多 4 条。没有可报的就返回空。"""
+    """返回 [(标题, 正文)]；条数受 MAX_BLOCKS 约束，没有可报的就返回空。"""
     out = []
     names = [line for line in log.splitlines()
              if line.startswith(("FAIL:", "ERROR:"))]

@@ -204,8 +204,23 @@ def _owner_alive(record):
 # 探活本来就会在启动前换候选（见 _preflight），但供应商的可用性会**跑到一半才
 # 抖掉**（deepinfer 的成员资格双向抖动是已知事实）。所以同一套换候选的逻辑也要
 # 能在运行中用一次：与其让一个坏席位把共享预算耗光，不如换它的下一候选。
+# **每一条都是真实网关的原话，不是想出来的**（2026-09-22 逐个问过）：
+#
+#   Boyue（用户的默认网关）：
+#     HTTP 503 {"error":{"code":"model_not_found",
+#       "message":"No available channel for model <m> under group auto (distributor)"}}
+#   DeepInfer（用户功能测试报告的现场）：403 model_not_available
+#   zylab 自己：provider-attempt limit exhausted (5/5)
+#
+# **第一版只认了 DeepInfer 那一家的说法**，于是在用户自己的默认网关上判据恒为
+# False，换席位一次都不会发生 —— 而 11 条单元测试全绿，因为判据和夹具是我从
+# **同一个来源**抄下来的，那样的测试无法反驳它。下面的串照抄现场输出。
+#
+# 刻意**不**把裸 503 算进来：503 是通用的瞬态信号，zylab 另有 transient 重试路径；
+# 把每次抖动都当成路线级失败，会白烧掉 max_node_attempts。
 _ROUTE_LEVEL_FAILURE = (
     "model_not_available", "model is not available", "model_unavailable",
+    "model_not_found", "no available channel",
     "provider-attempt limit exhausted", "provider attempt limit",
 )
 
