@@ -66,6 +66,7 @@ _SHADOW_PATH = None
 _SHADOW_OVERRIDE = None
 _SHADOW_BROKEN = None
 _SHADOW_LOCK = threading.RLock()
+_SHADOW_ATEXIT = False
 
 # M5 metrics are independent of the opt-in session shadow.  They are always
 # enabled but deliberately use a separate durable path: creating state.sqlite3
@@ -665,7 +666,7 @@ def reset_shadow_configuration():
 
 
 def _get_shadow():
-    global _SHADOW
+    global _SHADOW, _SHADOW_ATEXIT
     if not shadow_enabled():
         return None
     target = _shadow_target()
@@ -673,6 +674,20 @@ def _get_shadow():
         close_shadow()
     if _SHADOW is None:
         _SHADOW = state_db.StateStore(target)
+        if not _SHADOW_ATEXIT:
+            # **进程退出时要关它。** 这是个模块级单例，`close_shadow()` 一直都在，
+            # 只是从来没人在退出路径上调 —— 于是解释器收尾时 sqlite 连接被 GC
+            # 掉，打出 `ResourceWarning: unclosed database`。
+            #
+            # 在 POSIX 上那只是噪音；**Windows 上是真后果**：未关闭的句柄会把
+            # 库文件占到进程退出，于是父进程（或测试夹具）删不掉那个目录
+            # —— 2026-09-22 公开仓库 CI 的 Windows 那列，`TemporaryDirectory`
+            # 清理抛 `WinError 32` 一度把 40 条用例全染成 ERROR，尾部那句
+            # `<sys>:0: ResourceWarning: unclosed database` 就是它留下的指纹。
+            #
+            # 懒注册（只在真开过 shadow 的进程里挂）：没用过的进程不多一个 handler。
+            atexit.register(close_shadow)
+            _SHADOW_ATEXIT = True
     return _SHADOW
 
 

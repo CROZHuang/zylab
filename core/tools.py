@@ -426,7 +426,14 @@ def _is_wsl_launcher(path):
     if not wincompat.IS_WINDOWS:
         return False
     root = os.environ.get("SystemRoot") or os.environ.get("windir") or "C:\\Windows"
-    system_dirs = [os.path.join(root, d) for d in ("System32", "Sysnative", "SysWOW64")]
+    # **两侧都要解析。** path_under 是纯字符串比较（见它的 docstring），
+    # 形态由调用点负责统一。原来只对候选做了 realpath、而 root 保持词法：
+    # 一旦 `%SystemRoot%` 经过 junction / subst / 8.3 短名，比较就恒不成立，
+    # WSL 垫片被当成正常 bash 放行，**而界面上看不出异常**。
+    # macOS 把它暴露了（那里 /var→/private/var 是系统软链，候选解析后与词法
+    # root 差一个 /private）：2026-09-22 CI 的 test_windows_paths 两条。
+    system_dirs = [os.path.realpath(os.path.join(root, d))
+                   for d in ("System32", "Sysnative", "SysWOW64")]
     here = os.path.dirname(os.path.realpath(os.path.abspath(path)))
     return paths.path_under(here, system_dirs)
 

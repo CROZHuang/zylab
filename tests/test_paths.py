@@ -85,6 +85,46 @@ class PathsTests(unittest.TestCase):
             self.assertEqual(paths.protected_remotes(), [])
             self.assertFalse(paths.is_protected("/anywhere"))
 
+    def test_a_declaration_behind_a_symlink_is_still_guarded(self):
+        """**声明经过软链时，两种形态都要守。**
+
+        比较本身（`paths.path_under`）是纯字符串比较，而调用点各有各的形态：
+        `tools._guard` 比的是 realpath 过的候选，`_guard_bash` 的词法守卫比的是
+        命令原文（它没法解析任意 shell）。原来 `protected_paths()` 只留声明形态，
+        于是前一类在「声明经过软链」时**恒不成立**——2026-09-22 实测：声明一条
+        指向真实目录的软链之后，经软链写和经真实路径写**都被放行**，
+        而界面上看不出任何异常。
+
+        这是 `paths.path_under` 当初被建出来的那类事故的另一道门（那次是
+        Windows 上 `startswith(root + "/")` 恒为 False）。macOS 上尤其容易碰到：
+        `/tmp`→`/private/tmp`、`/var`→`/private/var` 都是系统软链。
+        """
+        with tempfile.TemporaryDirectory() as tmp:
+            real = Path(tmp) / "real"
+            real.mkdir()
+            link = Path(tmp) / "link"
+            try:
+                link.symlink_to(real, target_is_directory=True)
+            except (OSError, NotImplementedError):
+                self.skipTest("本机不能创建符号链接（Windows 需管理员/开发者模式）")
+            with mock.patch.dict(
+                    os.environ, {"ZYLAB_PROTECTED_PATHS": str(link)}):
+                roots = paths.protected_paths()
+                # 两种形态都在
+                self.assertIn(str(link), roots)
+                self.assertIn(os.path.realpath(link), roots)
+                # 两条路都拦得住
+                self.assertTrue(paths.is_protected(str(link / "x")))
+                self.assertTrue(paths.is_protected(str(real / "x")))
+                # 守多了不行：不相干的兄弟目录不该被误拦
+                self.assertFalse(paths.is_protected(str(Path(tmp) / "other")))
+
+    def test_a_plain_declaration_stays_a_single_entry(self):
+        """realpath 恒等时不该冒出重复项——「守多了」也要有边界。"""
+        with mock.patch.dict(
+                os.environ, {"ZYLAB_PROTECTED_PATHS": "/no-such-archive"}):
+            self.assertEqual(paths.protected_paths(), ["/no-such-archive"])
+
     def test_declared_protected_paths_take_effect(self):
         with mock.patch.dict(os.environ, {
                 "ZYLAB_PROTECTED_PATHS": os.pathsep.join(

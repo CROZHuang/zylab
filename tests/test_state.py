@@ -3,6 +3,7 @@ import json
 import os
 import sqlite3
 import stat
+import subprocess
 import sys
 import tempfile
 import threading
@@ -12,7 +13,8 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest import mock
 
-sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+sys.path.insert(0, ROOT)
 
 from unittest import mock as _mock
 from core import agent as agent_mod
@@ -698,6 +700,78 @@ class ShadowFacadeTests(unittest.TestCase):
                 "request_started", "assistant_message", "turn_completed",
             ])
             self.assertEqual(seqs, list(range(1, len(seqs) + 1)))
+
+
+class ShadowClosesOnExitTests(unittest.TestCase):
+    """影子 writer 是模块级单例，进程退出时必须关掉。
+
+    `close_shadow()` 一直都在，只是没人在退出路径上调 —— 于是解释器收尾时
+    sqlite 连接被 GC，打出 `ResourceWarning: unclosed database`。
+
+    **在 POSIX 上那只是噪音，Windows 上是真后果**：未关闭的句柄会把库文件占到
+    进程退出，父进程/测试夹具删不掉那个目录。2026-09-22 公开仓库 CI 的 Windows
+    那列，`TemporaryDirectory` 清理抛 `WinError 32` 一度把 40 条用例全染成
+    ERROR，而尾部那句 `<sys>:0: ResourceWarning: unclosed database` 就是指纹。
+
+    所以这条用例**用子进程 + `-W error::ResourceWarning` 复现原现象**：
+    在真实的解释器收尾路径上跑，而不是在进程内断言一个 mock。
+    """
+
+    @staticmethod
+    def _warns_about_unclosed_connections(tmp):
+        """本解释器会不会为「没关的 sqlite 连接」发 ResourceWarning？**探，不问版本。**
+
+        这条警告是解释器收尾期发出的（CI 日志里带 `<sys>:0:` 前缀），
+        而且并非所有版本都有：实测本机 3.12 与 3.10 **一条都不发**，连裸
+        `sqlite3.connect` 也不发；CI 的 3.13 那几列才有。
+
+        所以直接断言「stderr 里没有 unclosed」在 3.12/3.10 上**不修也是绿的**
+        —— 那是假保证。先探一次：探不到就明确 skip，探到了才当真断言。
+        （AGENTS.md §7：问「我要的那个东西在不在」，不要问版本号。）
+        """
+        probe = subprocess.run(
+            [sys.executable, "-W", "always::ResourceWarning", "-c",
+             "import sqlite3; sqlite3.connect(%r)"
+             % os.path.join(tmp, "probe.db")],
+            capture_output=True, text=True,
+            encoding="utf-8", errors="replace", timeout=120)
+        return "unclosed" in probe.stderr
+
+    def test_a_process_that_opened_the_shadow_exits_without_warnings(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            if not self._warns_about_unclosed_connections(tmp):
+                self.skipTest(
+                    "本解释器不为未关闭的 sqlite 连接发 ResourceWarning，"
+                    "这条断言在这里无法反驳实现（机制本身由 "
+                    "test_it_registers_once_not_per_call 钉住）")
+            code = (
+                "import os, sys;"
+                "sys.path.insert(0, %r);"
+                "from core import store;"
+                "store.configure_shadow(%r, enabled=True);"
+                "store._get_shadow();"
+                "print('opened')"
+            ) % (ROOT, os.path.join(tmp, "shadow.db"))
+            done = subprocess.run(
+                [sys.executable, "-W", "always::ResourceWarning", "-c", code],
+                capture_output=True, text=True,
+                encoding="utf-8", errors="replace", timeout=120)
+            self.assertIn("opened", done.stdout, done.stderr)
+            self.assertEqual(done.returncode, 0, done.stderr[-1200:])
+            self.assertNotIn("unclosed database", done.stderr)
+
+    def test_it_registers_once_not_per_call(self):
+        """懒注册：开过多次也只挂一个 handler，没开过的进程一个都不挂。"""
+        with tempfile.TemporaryDirectory() as tmp, \
+                mock.patch.object(store, "_SHADOW_ATEXIT", False), \
+                mock.patch.object(store.atexit, "register") as register:
+            store.configure_shadow(
+                os.path.join(tmp, "shadow.db"), enabled=True)
+            store._get_shadow()
+            store._get_shadow()
+            store.reset_shadow_configuration()
+            self.assertEqual(register.call_count, 1)
+            self.assertIs(register.call_args.args[0], store.close_shadow)
 
 
 class FileCacheConcurrencyTests(unittest.TestCase):

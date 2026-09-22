@@ -163,8 +163,26 @@ def protected_paths():
     for item in declared:
         item = os.path.expanduser(item.strip())
         item = item.rstrip("/") or "/"
-        if item and item not in out:
-            out.append(item)
+        if not item:
+            continue
+        # **声明的形态和解析后的形态都要守。**
+        #
+        # 比较本身（paths.path_under）是纯字符串比较，而调用点各有各的形态：
+        #   - `tools._guard` / `_under_protected` 比的是 **realpath 过**的候选；
+        #   - `_guard_bash` 的词法守卫比的是**命令原文**，它没法解析任意 shell。
+        # 原来这里只留声明形态，于是前一类在「声明经过软链」时**恒不成立**：
+        # 声明 `/tmp/archive`（macOS 上 /tmp→/private/tmp）之后，写
+        # `/tmp/archive/x` 解析成 `/private/tmp/archive/x`，与词法 root 比不上
+        # —— **受保护路径静默失守，而界面上看不出任何异常**。2026-09-22 实测
+        # 复现：声明一条指向真实目录的软链，经软链写和经真实路径写**都放行**。
+        #
+        # 这正是 `paths.path_under` 当初被建出来的那类事故的另一道门
+        # （那次是 Windows 的 `startswith(root + "/")` 恒为 False）。
+        # 按 path_under 自己的原则：**守多了只是拒绝写入，守漏了才是事故。**
+        for form in (item, os.path.realpath(item)):
+            form = form.rstrip("/") or "/"
+            if form and form not in out:
+                out.append(form)
     return out
 
 
@@ -217,6 +235,17 @@ def path_under(value, roots):
     """value 是否等于某个 root、或落在它之下。**所有前缀式路径守卫的唯一实现。**
 
     纯字符串比较，调用方自己决定要不要先 realpath（与旧的 `is_protected` 同约定）。
+
+    **但两侧必须在同一个形态上**：要么都解析过，要么都没解析。只解析一侧的
+    后果不是「偶尔漏一个」，而是**比较恒不成立**，也就是那道守卫彻底失效、
+    且界面上看不出任何异常。2026-09-22 实测栽过两处：
+    `protected_paths()` 只留声明形态而 `tools._guard` 比的是 realpath 过的候选
+    （声明经过软链 → 受保护路径完全不守）；`tools._is_wsl_launcher` 解析了候选
+    却让 `%SystemRoot%` 保持词法（SystemRoot 经过 junction → WSL 垫片被放行）。
+
+    **不在这里替调用方解析**是刻意的：`_guard_bash` 的词法守卫比的是命令原文，
+    那些路径可能根本不存在，解析会改变语义。所以形态由调用点负责，
+    而这一段就是提醒它。
 
     Windows 上**不能**按 `root + "/"` 比：那里的分隔符是 `\\`，盘符大小写和
     `D:/archive` / `d:\\archive\\` 这些等价写法也都要认。原来的写法在 Windows 上
