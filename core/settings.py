@@ -46,6 +46,9 @@ DEFAULTS = {
     "model": None,               # None = 用 agent.MODEL
     "gateway": None,             # None = 用 client 的默认（deepinfer）
     "max_tokens": 8192,
+    # 对话请求的 temperature（0–2）。会话里 /temperature 可临时改、/temperature save
+    # 存成默认。模型不接受 temperature 时不发（能力表里记着）。摘要/recap 这类内部
+    # 请求固定 0.2，不跟这个值走 —— 它们要的是稳定，不是风格。
     "temperature": 0.3,
     "compact_at": None,          # None = 按模型上限自动算
     "auto_approve": False,       # 相当于常开 /auto
@@ -67,6 +70,11 @@ DEFAULTS = {
     "recap_away_seconds": 300,
     "catalog_refresh": True,
     "catalog_ttl_hours": 24,
+    # /model 在大目录（Boyue 这类几百个模型的聚合网关）上只列这些家族的最新旗舰。
+    # 写模型名开头的那个词（gpt、claude、kimi…）或公司名（OpenAI、Anthropic）都行；
+    # [] = 所有家族都列。None = 出厂的六家（models.DEFAULT_PREFERRED_FAMILIES）。
+    # 小目录（官方 API、DeepInfer）不受影响：实测能用的全列。
+    "preferred_families": None,
     "model_health": {
         # Seconds. These control probe freshness and the automatic route
         # circuit; explicit route choices may still bypass an open circuit.
@@ -853,15 +861,54 @@ def catalog_policy(cfg):
     return {"enabled": bool(enabled), "ttl_seconds": int(hours * 3600)}
 
 
+TEMPERATURE_RANGE = (0.0, 2.0)
+
+
+def temperature_policy(cfg):
+    """对话请求的 temperature：0–2 的数；缺省或非法都退回出厂值 0.3。"""
+    value = (cfg or {}).get("temperature", DEFAULTS["temperature"])
+    parsed = parse_temperature(value)
+    return float(DEFAULTS["temperature"]) if parsed is None else parsed
+
+
+def parse_temperature(value):
+    """把用户写的温度读成 float；不是 0–2 之间的数就返回 None。"""
+    if isinstance(value, bool):
+        return None
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return None
+    low, high = TEMPERATURE_RANGE
+    if math.isnan(number) or not (low <= number <= high):
+        return None
+    return number
+
+
+def preferred_families(cfg):
+    """偏好家族：None 表示用出厂值；非法值（不是字符串列表）也退回出厂值。"""
+    value = (cfg or {}).get("preferred_families", DEFAULTS["preferred_families"])
+    if not isinstance(value, (list, tuple)):
+        return None
+    names = [str(name).strip() for name in value
+             if isinstance(name, str) and str(name).strip()]
+    return names if len(names) == len(value) else None
+
+
 def render(cfg, sources):
     out = ["  配置来源：" + " → ".join(sources), ""]
     for k in ("model", "gateway", "max_tokens", "temperature",
               "compact_at", "auto_approve", "resume_replay", "max_turns",
               "background_task_handoff", "catalog_refresh",
-              "catalog_ttl_hours", "recap_auto", "recap_away_seconds"):
+              "catalog_ttl_hours", "preferred_families", "recap_auto",
+              "recap_away_seconds"):
         shown = cfg.get(k)
         if k == "max_turns":
             shown = max_turns_policy(cfg) or "不设上限"
+        elif k == "preferred_families":
+            names = preferred_families(cfg)
+            shown = ("出厂六家" if names is None
+                     else ", ".join(names) if names else "全部家族")
         out.append(f"    {k:16} {shown}")
     transport = transport_policy(cfg)
     endpoints = transport["allowed_insecure_endpoints"]

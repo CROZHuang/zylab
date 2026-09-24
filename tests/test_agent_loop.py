@@ -121,6 +121,70 @@ def mk(model="m"):
     return ag
 
 
+class ChatTemperature(unittest.TestCase):
+    """用户 2026-09-24：「温度的话，user 也可以自己选择，一般默认为 0.3」。
+
+    以前对话请求里写死 0.3，settings 的 temperature 从没接上 —— 改了也不生效。
+    断言落在**发出去的请求**上，不是 Agent 的属性上。
+    """
+
+    def sent_temperatures(self, ag, accepts=True):
+        seen = []
+        script = scripted(("好", []))
+
+        def fake(model, messages, tools=None, **kw):
+            seen.append(kw.get("temperature", "未传"))
+            yield from script(model, messages, tools=tools, **kw)
+
+        with mock.patch.object(client, "stream_chat", fake), \
+                mock.patch.object(A.models_db, "supports_temperature",
+                                  return_value=accepts):
+            list(ag.run("go"))
+        return seen
+
+    def test_the_users_temperature_is_what_gets_sent(self):
+        ag = mk()
+        ag.temperature = 0.7
+        self.assertEqual(self.sent_temperatures(ag), [0.7])
+
+    def test_the_default_is_0_3(self):
+        self.assertEqual(A.DEFAULT_TEMPERATURE, 0.3)
+        self.assertEqual(self.sent_temperatures(mk()), [0.3])
+
+    def test_a_model_that_rejects_temperature_gets_none(self):
+        ag = mk()
+        ag.temperature = 0.7
+        self.assertEqual(self.sent_temperatures(ag, accepts=False), [None])
+
+
+class ChatEffort(unittest.TestCase):
+    """/model 里选的推理强度，只跟着那一个「网关 + 模型」走。"""
+
+    def sent_efforts(self, ag):
+        seen = []
+        script = scripted(("好", []))
+
+        def fake(model, messages, tools=None, **kw):
+            seen.append(kw.get("effort", "未传"))
+            yield from script(model, messages, tools=tools, **kw)
+
+        with mock.patch.object(client, "stream_chat", fake), \
+                mock.patch.object(A.models_db, "supports_temperature",
+                                  return_value=False):
+            list(ag.run("go"))
+        return seen
+
+    def test_the_chosen_effort_goes_with_its_route(self):
+        ag = mk("gpt-6-sol")
+        ag.set_effort("test", "gpt-6-sol", "high")
+        self.assertEqual(self.sent_efforts(ag), ["high"])
+
+    def test_another_model_does_not_inherit_it(self):
+        ag = mk("glm-5.3")
+        ag.set_effort("test", "gpt-6-sol", "high")
+        self.assertEqual(self.sent_efforts(ag), [None])
+
+
 class ToolDispatch(unittest.TestCase):
     def test_provider_attempt_guard_reaches_each_tool_loop_request(self):
         ag = mk()

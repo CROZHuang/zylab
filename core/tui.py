@@ -2421,6 +2421,17 @@ def _wrap_control_lines(text, columns, *, max_lines=2):
     return tuple(lines)
 
 
+def wrap_step(index, step, count):
+    """列表里走一步：首尾相接（用户 2026-09-24：「它是一个 loop 而不是 queue」）。
+
+    第一个往上跳到最后一个、最后一个往下回到第一个。所有列表共用这一个函数 ——
+    SPEC-CC-parity I1「所有面板共用一套导航语法」，不能 / 菜单是环、选择器是队列。
+    """
+    if count <= 0:
+        return 0
+    return (int(index) + step) % count
+
+
 def _picker_control_line_limit(terminal_lines=None):
     """Keep title, state, one option and metadata visible in very short TTYs."""
     height = _lines() if terminal_lines is None else int(terminal_lines)
@@ -2496,9 +2507,9 @@ def select(rows, title="", render=str, page=12, allow_filter=True):
                 if k == "enter":
                     return cur[idx] if cur else None
                 if k == "up":
-                    idx = max(0, idx - 1)
+                    idx = wrap_step(idx, -1, len(cur))
                 elif k == "down":
-                    idx = min(len(cur) - 1, idx + 1) if cur else 0
+                    idx = wrap_step(idx, 1, len(cur))
                 elif k == "backspace":
                     filt = filt[:-1]
                     idx = 0
@@ -2619,14 +2630,14 @@ def read_line(prompt, commands=None, history=None):
                     cur = len(buf)
                 elif k == "up":
                     if shown:
-                        menu_i = max(0, menu_i - 1)
+                        menu_i = wrap_step(menu_i, -1, len(ms))
                     elif hidx > 0:
                         hidx -= 1
                         buf = hist[hidx]
                         cur = len(buf)
                 elif k == "down":
                     if shown:
-                        menu_i = min(len(ms) - 1, menu_i + 1)
+                        menu_i = wrap_step(menu_i, 1, len(ms))
                     elif hidx < len(hist):
                         hidx += 1
                         buf = hist[hidx] if hidx < len(hist) else ""
@@ -3446,7 +3457,8 @@ class LineEditor:
             return self._redraw()
         if key == "up":
             if matches:
-                self.menu_index = max(0, self.menu_index - 1)
+                self.menu_index = wrap_step(
+                    min(self.menu_index, len(matches) - 1), -1, len(matches))
             elif self.target is None and self.busy:
                 return [PumpEvent("retrieve")]
             elif self.history_index > 0:
@@ -3457,8 +3469,8 @@ class LineEditor:
             return self._redraw()
         if key == "down":
             if matches:
-                self.menu_index = min(
-                    len(matches) - 1, self.menu_index + 1)
+                self.menu_index = wrap_step(
+                    min(self.menu_index, len(matches) - 1), 1, len(matches))
             elif ((self.target is not None or not self.busy)
                   and self.history_index < len(self.history)):
                 self.history_index += 1
@@ -4124,11 +4136,9 @@ class InputPump:
             return self._close_picker(
                 selected, picker["actions"][key])
         if key == "up":
-            picker["index"] = max(0, picker["index"] - 1)
+            picker["index"] = wrap_step(picker["index"], -1, len(view))
         elif key == "down":
-            picker["index"] = (
-                min(len(view) - 1, picker["index"] + 1)
-                if view else 0)
+            picker["index"] = wrap_step(picker["index"], 1, len(view))
         elif (key == "backspace" and picker["allow_filter"]
               and (not picker["explicit_filter"]
                    or picker["filter_mode"])):
@@ -4324,10 +4334,11 @@ class InputPump:
             gate["error"] = ""
             return [PumpEvent("redraw", snapshot=self._decision_gate_snapshot())]
         if key == "up":
-            gate["index"] = max(0, int(gate.get("index") or 0) - 1)
+            gate["index"] = wrap_step(
+                int(gate.get("index") or 0), -1, len(options))
         elif key == "down":
-            gate["index"] = min(
-                max(0, len(options) - 1), int(gate.get("index") or 0) + 1)
+            gate["index"] = wrap_step(
+                int(gate.get("index") or 0), 1, len(options))
         elif key == "pageup":
             gate["index"] = max(0, int(gate.get("index") or 0) - 5)
         elif key == "pagedown":

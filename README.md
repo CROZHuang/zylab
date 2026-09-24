@@ -196,7 +196,7 @@ global memory 写入和所有 `memory_forget` 采用同样的 defense-in-depth�
 
 斜杠命令：`/help` `/new` `/sessions` `/resume` `/rename` `/clear` `/compact`
 `/context` `/memory` `/skills` `/commands` `/auto` `/permissions` `/config` `/cost` `/stats` `/model`
-`/probe` `/graft` `/architecture` `/tools` `/agents` `/consult` `/workflow`
+`/temperature` `/probe` `/graft` `/architecture` `/tools` `/agents` `/consult` `/workflow`
 `/tasks` `/task` `/expand` `/kill` `/exit`
 
 `/map` 是隐藏的兼容命令：它不会出现在命令面板或 `/help` 的顶层列表中，
@@ -941,11 +941,11 @@ generation，再原子切换 `architecture/current.json`；同 repo 只允许一
 
 | 操作 | 效果 |
 |---|---|
-| 输入 `/` | 立刻弹出命令面板；精确命令 Enter 提交，前缀可 Tab/Enter 补全 |
+| 输入 `/` | 立刻弹出命令面板；精确命令 Enter 提交，前缀可 Tab/Enter 补全；↑↓ 首尾相接（第一个往上到最后一个） |
 | 输入 `/cmd ` | 若该命令有二级操作，弹出带说明的子命令列表；有枚举参数时继续输入空格显示三级参数；可用前缀筛选，或忽略列表继续输入自由参数 |
 | 输入 `@路径` | 在同一菜单中有界补全；文本/图片按上述私有 snapshot 规则投影 |
 | 自定义 `/name args` | 作为普通 prompt 排队；queue 与 scrollback 保留短 invocation，不展示展开全文 |
-| `/model` 不带参数 | 同一 InputPump 的上下键选择器，支持增量筛选和滚动 |
+| `/model` 不带参数 | 同一 InputPump 的上下键选择器，支持增量筛选和滚动；↑↓ 同样首尾相接，鼠标滚轮到头就停；选中走 `/v1/responses` 的模型后弹出推理强度（选项来自网关） |
 | 常驻 composer | 圆角边框、内边距和焦点色；中文/emoji 按显示列换行，queue 在框上方，完整 chat 属性在 footer |
 | queued prompt 到达交付点 | 从 composer 移入 scrollback，作为独立 `You` prompt card 显示且只显示一次 |
 | assistant Markdown | 标题、引用、嵌套/任务列表、表格、链接和围栏代码；常用语言零依赖高亮。表格按内容定列宽、放不下时单元格内折行，不截断 |
@@ -1169,7 +1169,8 @@ tests/            守卫与状态/迁移回归测试
 
 `~/.zylab/models.json` 记录每个模型的：上下文、**是否支持 tool calling**、
 **参数兼容性**、真实首响应/完整响应延迟、家族、所在网关。裸 `/model` 是唯一模型列表，
-`/model refresh` 刷新当前 gateway 的目录，`/model health` 查看持久健康度；
+`/model refresh` 刷新**每一个配了 key 的网关**的目录、并自动实测新出现的旗舰（每个一次
+真实请求，已测过的不重复测），`/model health` 查看持久健康度；
 交互式裸 `/probe` 会先打开成本明确的操作菜单，`zylab --probe-all` 才做批量探测。
 
 ```text
@@ -1210,10 +1211,26 @@ chat 请求和 context-compaction 的 transient tail 会驱动持久 circuit；�
 进入用户可见成功率/延迟计数。用户显式 `/model`、`/model gateway` 或启动参数可以带警告
 越过一次 open circuit；自动跨 gateway/model fallback 仍关闭，避免副作用后静默换脑。
 
-模型目录识别 **OpenAI / Anthropic / 智谱 / moonshot / deepseek / 阿里 /
-intern / MiniMax**；OpenAI 与 Anthropic 在这里仍经 Boyue 转发，不是官方直连。
-`/model` 对 Boyue 再做旗舰精选，并过滤 embedding / reranker / voice / image
-等非聊天模型。
+模型目录**不按公司白名单过滤**：接上任何一家的 key，它的对话模型都会进目录
+（只滤掉名字上就是 embedding / reranker / voice / image 的）。`/model` 列什么由目录
+大小决定：
+
+- **小目录**（官方 API、DeepInfer 这种几十个以内的）：实测能用的全列，明确不支持
+  工具的灰显为「仅聊天」。
+- **大目录**（Boyue、OpenRouter 这种几百个的聚合网关）：只列**偏好家族的最新旗舰**，
+  外加各家的视觉版。偏好家族在 settings 里改：
+
+  ```json
+  { "preferred_families": ["gpt", "claude", "deepseek", "kimi", "glm", "qwen"] }
+  ```
+
+  写模型名开头的词或公司名（`OpenAI`、`Anthropic`）都行；`[]` 表示所有家族。
+
+「哪个是最新旗舰」**不靠任何写死的名单**，靠通用的名字解析：词干 + 版本号 + 档位词，
+按版本比新旧；thinking / preview / 带日期的快照 / 27b 这类尺寸 / mini、flash 这类低档
+各有通行的处理（见 `core/models.py` 的 `parse_model_name`）。新出的 gpt-7、一家从没
+见过的公司，只要按行业通行的写法起名，都不用改代码。经聚合网关转发的 OpenAI /
+Anthropic 模型不是官方直连。
 
 同名模型两边都有时**优先 DeepInfer**（免费、直连）；只有一边有就自动切网关。
 
@@ -1235,11 +1252,19 @@ intern / MiniMax**；OpenAI 与 Anthropic 在这里仍经 Boyue 转发，不是�
 
 1. **列得出 ≠ 调得通。** `kimi-k3` 一度 404 却仍留在能力缓存里（后来又恢复）。
    能力表因此必须可刷新，不能写死。
-2. **参数兼容性因模型而异，且会静默 400。** 当前世代 Claude 拒收 `temperature`。
-   客户端撞到就自动去掉重发，并把这个事实记进能力表。
-3. **`reasoning_effort` 在这两个网关上不可用。** 实测它被接受但有害：
-   deepseek-v4-pro 加上后**产不出内容还烧光 token**；且没有任何模型返回
-   `reasoning_content`。表达推理强度的正确方式是选 `-thinking` 变体模型。
+2. **参数兼容性因模型而异，且会静默 400。** 当前世代 Claude、kimi-k3 拒收
+   `temperature`；新一代 OpenAI 模型不收 `max_tokens`（要 `max_completion_tokens`）。
+   客户端撞到就照网关原话调整重发，并把这个事实记进能力表，下次直接用对的。
+   对话的 temperature 默认 0.3，`/temperature` 可改（`save` 存成默认）；模型不收就不发。
+3. **chat/completions 上不发 `reasoning_effort`。** 实测它在这两个网关上被接受但有害：
+   deepseek-v4-pro 加上后**产不出内容还烧光 token**。
+4. **有的模型只有走 `/v1/responses` 才能同时带工具和推理。** gpt-6-sol / gpt-6-astra 在
+   chat/completions 上带工具时网关会说「use /v1/responses or set reasoning_effort to
+   'none'」——zylab 照这句话**切到 `/v1/responses`**（记进能力表，下次直接走），而不是关掉
+   推理；网关根本没有这个接口时才退回「关推理」。对上层透明：同一套代理循环、计费、压缩。
+   这类模型可以选**推理强度**：`/model` 里选中后会弹出第三级菜单，也可以直接
+   `/model gpt-6-sol high`。可选的值**来自网关**（拒绝原话里列出的清单），不是写死的——
+   gpt-6-sol 收 none…max，gpt-6-astra 不收 none。
 
 ## 旧版实测数字（2026-08-21）
 
@@ -1280,10 +1305,15 @@ ZYLAB_GATEWAY=boyue zylab
 **如果你的 endpoint 必须经代理才够得着**，显式声明一条：
 
 ```bash
-export ZYLAB_API_PROXY='http://<user>:<pass>@<host>:<port>/'
+export ZYLAB_API_PROXY_DEEPSEEK='http://<user>:<pass>@<host>:<port>/'   # 只管这一个网关
+export ZYLAB_API_PROXY='http://<user>:<pass>@<host>:<port>/'            # 其余所有网关
 ```
 
-只认这一个变量，**不读** `http_proxy` / `https_proxy`（理由同上），也不复用
+按网关的那条优先。为什么要能分开：同一台机器上，常常是一个网关**只有**经代理才通、
+另一个**只有**直连才通（2026-09-24 实测：官方 DeepSeek 与内部网关正是这样）——只有一个
+全局开关时两者不可兼得。
+
+只认这两类变量，**不读** `http_proxy` / `https_proxy`（理由同上），也不复用
 网页抓取那条 `web.proxy` —— 这条路会把 key、prompt、代码和工具结果都送过去，
 所以要你为它单独表态。值的形态不对（比如误填了一条 shell 命令）就当没声明、
 照常直连，不会把一个非 URL 交给 urllib。凭据在任何输出里都会被脱敏成 `…@host`。

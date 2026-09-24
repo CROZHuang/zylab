@@ -2212,6 +2212,8 @@ class Session:
             store.configure_metrics_policy(bundle["health_policy"])
             if hasattr(self.ag, "metrics"):
                 self.ag.metrics = store.metrics_facade()
+            if getattr(self, "_temperature_override", None) is None:
+                self.ag.temperature = CFG.temperature_policy(self.cfg)
             if hasattr(self.ag, "compact_override"):
                 self.ag.compact_override = self.cfg.get("compact_at")
                 if hasattr(self.ag, "ctx_limit"):
@@ -8715,7 +8717,12 @@ def cmd_new(sess, rest):
         load_skills=getattr(previous_agent, "load_skills", None),
         compact_at=sess.cfg.get("compact_at"),
         gateway=previous_agent.gateway,
+        # 本会话 /temperature 改过的值跟着新会话走；没改过就是 settings 的默认。
+        temperature=getattr(previous_agent, "temperature",
+                            CFG.temperature_policy(sess.cfg)),
     )
+    new_agent.effort_by_route = dict(
+        getattr(previous_agent, "effort_by_route", None) or {})
     new_agent.hook_cfg = sess.cfg
     new_agent.confirm = sess.confirm
     new_agent.permission_decision = sess.permission_decision
@@ -10866,27 +10873,87 @@ def _cmd_model_check(sess, tail):
                 print(f"    {model:28} {RED('探测失败')} {DIM(str(exc)[:50])}")
                 continue
         status = record.get("status")
-        if record.get("probe_blocked") == "insecure_transport":
-            # 本地策略拦下的请求没出过这台机器，别冒充可用性结论
-            print(f"    {model:28} {YELLOW('未实测')} "
-                  f"{DIM('明文 HTTP 未授权，交互模式里确认一次即可')} {DIM(role)}")
+        if not _print_probe_result(model, record, role):
             continue
-        if status == "ok":
-            tools_ok = (GREEN("工具") if record.get("supports_tools")
-                        else YELLOW("无工具"))
-            first = record.get("first_token_s")
-            timing = DIM(f"{first:.1f}s") if first else ""
-            print(f"    {model:28} {GREEN('可用')} {tools_ok} "
-                  f"{timing} {DIM(role)}")
-        else:
-            print(f"    {model:28} {RED('不可用')} {DIM(str(record.get('error'))[:52])}"
-                  f" {DIM(role)}")
         if before != status:
             changed.append(f"{model} {before} → {status}")
     if changed:
         print(YELLOW("  状态有变：" + "；".join(changed)))
     else:
         print(DIM("  实测结果与缓存一致"))
+
+
+def _print_probe_result(model, record, note=""):
+    """一条实测结果打一行；返回 False 表示这次根本没测成（不该算作状态变化）。"""
+    if record.get("probe_blocked") == "insecure_transport":
+        # 本地策略拦下的请求没出过这台机器，别冒充可用性结论
+        print(f"    {model:28} {YELLOW('未实测')} "
+              f"{DIM('明文 HTTP 未授权，交互模式里确认一次即可')} {DIM(note)}")
+        return False
+    if record.get("status") == "ok":
+        tools_ok = (GREEN("工具") if record.get("supports_tools")
+                    else YELLOW("无工具"))
+        first = record.get("first_token_s")
+        timing = DIM(f"{first:.1f}s") if first else ""
+        print(f"    {model:28} {GREEN('可用')} {tools_ok} "
+              f"{timing} {DIM(note)}")
+    else:
+        print(f"    {model:28} {RED('不可用')} {DIM(str(record.get('error'))[:52])}"
+              f" {DIM(note)}")
+    return True
+
+
+def _proxy_hint(gateway):
+    """够不着网关时的出路：只给这一个网关声明代理（别的网关照旧直连）。"""
+    return (f"这个端点必须经代理才够得着？只给它声明一条："
+            f"export {paths.env_name(client.api_proxy_env(gateway))}="
+            "'http://<user>:<pass>@<host>:<port>/'")
+
+
+def _refresh_all_gateways(sess):
+    """/model refresh：刷新**每一个配了 key 的网关**，再把该实测的实测一遍。
+
+    以前只刷当前网关、也不实测。2026-09-24 用户报的两个现象都出在这里：
+    往 keys.env 里加了官方 DeepSeek 的 key，而当前网关是 boyue —— DeepSeek 的
+    目录从来没被取过；Boyue 目录里早就有 gpt-6-sol，但列表只列实测可用的，
+    而没有任何一步会去实测它。用户定：刷新时自动实测一次。
+
+    一个网关失败不影响其它网关；每个实测结果当场落盘，中途 Ctrl-C 不丢已测的。
+    """
+    gateways = M.keyed_gateways()
+    if not gateways:
+        print(YELLOW("  还没有哪个网关配了 key。先跑 zylab init --gateway <名字>"))
+        return
+    for gateway in gateways:
+        error = None
+        with Spinner(f"抓取 {gateway} 模型目录"):
+            try:
+                result = M.refresh_catalog(gateway)
+            except RuntimeError as exc:
+                error = exc
+        if error is not None:
+            print(RED(f"  [{gateway}] {error}"))
+            if getattr(error, "unreachable", False):
+                print(DIM("    " + _proxy_hint(gateway)))
+            continue
+        print(DIM(f"  [{gateway} 已刷新，{result['count']} 个模型]"))
+        notice = _catalog_change_notice(result)
+        if notice:
+            print(notice.rstrip("\r\n"))
+        due = M.due_for_probe(gateway, M.probe_targets(
+            gateway, preferred=CFG.preferred_families(
+                getattr(sess, "cfg", None))), revalidate=False)
+        if due:
+            print(DIM(f"  实测 {gateway} 上 {len(due)} 个新出现或上次失败的模型"
+                      "（每个一次真实请求；已知能用的不重测，/model check 才重测）："))
+        for model in due:
+            with Spinner(f"实测 {gateway}/{model}"):
+                try:
+                    record = M.probe(gateway, model)
+                except Exception as exc:              # noqa: BLE001
+                    print(f"    {model:28} {RED('探测失败')} {DIM(str(exc)[:50])}")
+                    continue
+            _print_probe_result(model, record)
 
 
 def _catalog_change_notice(result):
@@ -11589,9 +11656,10 @@ def _model_usage():
         "  /model                    打开唯一模型选择列表（含各网关 key 状态）\n"
         "  /model <名字>             切换模型；只在一个网关有就自动选网关\n"
         "  /model <名字>@<网关>       指定路由（两边都有的模型）\n"
+        "  /model <名字> <推理强度>   走 /v1/responses 的模型可带强度；选项来自网关\n"
         "  /model gateway [名字]     切换/查看网关（原 /gateway）\n"
         "  /model health [关键词]    查看持久健康度与 circuit\n"
-        "  /model refresh            刷新当前 gateway 目录后重开选择器\n"
+        "  /model refresh            刷新所有配了 key 的网关、实测新旗舰，再开选择器\n"
         "  /model check              目录 + 实调双证据校验（当前模型与各席位）"))
 
 
@@ -11614,13 +11682,7 @@ def cmd_model(sess, rest):
         if tail:
             print(RED("  /model refresh 不接受额外参数"))
             return
-        _, gateway = sess.route_selection()
-        with Spinner("抓取模型目录"):
-            result = M.refresh_catalog(gateway)
-        print(DIM(f"  [{gateway} 已刷新，{result['count']} 个模型]"))
-        notice = _catalog_change_notice(result)
-        if notice:
-            print(notice.rstrip("\r\n"))
+        _refresh_all_gateways(sess)
         if tui.supported():
             cmd_model(sess, "")
         return
@@ -11628,6 +11690,9 @@ def cmd_model(sess, rest):
         _cmd_model_check(sess, tail)
         return
     if value:
+        # 第二个词是推理强度：`/model gpt-6-sol high`（合不合法由网关给的选项判定）
+        value, _, typed_effort = value.partition(" ")
+        typed_effort = typed_effort.strip()
         # <模型>@<网关>：两边都有的模型（glm-5.3 / kimi-k3 / deepseek）用这个指定路由
         explicit_gateway = None
         if "@" in value:
@@ -11661,6 +11726,11 @@ def cmd_model(sess, rest):
         elif rec.get("status") == "error":
             print(YELLOW(f"  [{value} 上次实测失败："
                          f"{str(rec.get('error'))[:60]}]"))
+        effort_note = ""
+        if typed_effort:
+            effort_note = _typed_effort(sess, target_gateway, value, typed_effort)
+            if effort_note is None:
+                return
         try:
             result = sess.request_route_change(value, target_gateway)
         except ValueError as exc:
@@ -11673,18 +11743,20 @@ def cmd_model(sess, rest):
         chat_only = rec.get("supports_tools") is False
         mode = " · 仅聊天（无工具）" if chat_only else ""
         prefix = "下一轮切到" if result["staged"] else "切到"
-        notice = f"  [{prefix} {value}@{target_gateway}{ctx}{mode}]"
+        notice = f"  [{prefix} {value}@{target_gateway}{ctx}{mode}{effort_note}]"
         print(YELLOW(notice) if chat_only else DIM(notice))
     elif tui.supported():
-        # /model 是高频工作集，不是 400+ 条原始目录：DeepInfer 保留全部
-        # 实测可用模型（无工具项灰显为仅聊天），Boyue 只保留当前旗舰；
-        # 失败/未知能力仍不冒充可用项。
-        rows = M.default_picker_rows()
+        # /model 是高频工作集，不是 400+ 条原始目录：小目录（DeepInfer、厂商
+        # 官方口）保留全部实测可用模型（无工具项灰显为仅聊天），大目录（Boyue）
+        # 只保留偏好家族的最新旗舰（含视觉线）；失败/未知能力仍不冒充可用项。
+        rows = M.default_picker_rows(
+            preferred=CFG.preferred_families(getattr(sess, "cfg", None)))
         if not rows:
             print(YELLOW("  还没有实测可用的模型。先跑 "
                          "zylab --probe-all"))
             return
-        # 先列 DeepInfer 的完整工作集，再列 Boyue 旗舰；各组内按家族扫读。
+        # 先列 DeepInfer 的完整工作集，再列 Boyue 旗舰，其余网关按名字；
+        # 各组内按家族扫读。
         fam_order = {
             "OpenAI": 0, "Anthropic": 1, "deepseek": 2, "moonshot": 3,
             "智谱": 4, "阿里": 5, "intern": 6, "MiniMax": 7, "other": 8,
@@ -11692,6 +11764,7 @@ def cmd_model(sess, rest):
         gateway_order = {"deepinfer": 0, "boyue": 1}
         rows.sort(key=lambda r: (
             gateway_order.get(r.get("gateway"), 9),
+            str(r.get("gateway") or ""),
             fam_order.get(r.get("family"), 9),
             r.get("id", "").lower()))
 
@@ -11738,9 +11811,6 @@ def cmd_model(sess, rest):
         # 网关 key 状态原来只在 /gateway 列表里看得到；并入后放在选择器上方
         print(DIM("  网关 · " + " · ".join(
             f"{name} {_gateway_key_label(name)}" for name in client.GATEWAYS)))
-        deepinfer_count = sum(
-            row.get("gateway") == "deepinfer" for row in rows)
-        boyue_count = len(rows) - deepinfer_count
         chat_only_count = sum(
             row.get("supports_tools") is False for row in rows)
         code_count = len(rows) - chat_only_count
@@ -11748,8 +11818,7 @@ def cmd_model(sess, rest):
             rows, page=14, render=render,
             title=(
                 f"选择模型（{len(rows)} 个：Code {code_count} · "
-                f"仅聊天 {chat_only_count}；DeepInfer {deepinfer_count} · "
-                f"Boyue 旗舰 {boyue_count}/{len(M.BOYUE_DEFAULT_MODELS)}）"
+                f"仅聊天 {chat_only_count}；{_picker_gateway_counts(rows)}）"
                 f"    上下文：* 实测 · ~ 规格推断 · 无标记 网关自报"))
         if pick:
             gw = pick["gateway"]
@@ -11758,6 +11827,7 @@ def cmd_model(sess, rest):
             except ValueError as exc:
                 print(RED(f"  [model] {exc}"))
                 return
+            effort_note = _choose_effort(sess, gw, pick["id"])
             lim = result.get("context")
             ctx = (
                 f" · 上下文 {lim/1000:.0f}k"
@@ -11765,12 +11835,136 @@ def cmd_model(sess, rest):
             chat_only = pick.get("supports_tools") is False
             mode = " · 仅聊天（无工具）" if chat_only else ""
             prefix = "下一轮切到" if result["staged"] else "切到"
-            notice = f"  [{prefix} {pick['id']}@{gw}{ctx}{mode}]"
+            notice = f"  [{prefix} {pick['id']}@{gw}{ctx}{mode}{effort_note}]"
             print(YELLOW(notice) if chat_only else DIM(notice))
         else:
             print(DIM("  (取消)"))
     else:
         print(DIM(f"  当前 {sess.ag.model} · 上下文 {sess.ag.ctx_limit/1000:.0f}k"))
+
+
+def cmd_temperature(sess, rest):
+    """/temperature：查看或设置对话请求的 temperature。
+
+    用户 2026-09-24：「温度的话，user 也可以自己选择，一般默认为 0.3」。以前 settings
+    里的 temperature 根本没接上（对话请求写死 0.3），所以这里同时补了「设置真的生效」。
+    """
+    value = str(rest or "").strip()
+    action = value.lower()
+    default = CFG.temperature_policy(getattr(sess, "cfg", None))
+    current = getattr(sess.ag, "temperature", default)
+    if action in {"help", "?"}:
+        print(DIM(
+            "  /temperature              查看当前值，以及当前模型接不接受\n"
+            "  /temperature <0–2>        本会话生效（从下一次请求起）\n"
+            "  /temperature save         把当前值存成默认（settings.json 的 temperature）\n"
+            "  /temperature default      恢复默认值"))
+        return
+    if not action:
+        overridden = getattr(sess, "_temperature_override", None) is not None
+        line = (f"  temperature {current:g}"
+                f"（{'本会话设置' if overridden else '默认'}；默认 {default:g}）")
+        print(DIM(line))
+        if not M.supports_temperature(sess.ag.gateway, sess.ag.model):
+            print(YELLOW(f"  {sess.ag.model} 不接受 temperature，这个值不会发出去"))
+        return
+    if action == "default":
+        sess._temperature_override = None
+        sess.ag.temperature = default
+        print(DIM(f"  [temperature 恢复默认 {default:g}]"))
+        return
+    if action == "save":
+        try:
+            path = CFG.write_user({"temperature": current})
+        except CFG.SettingsError as exc:
+            print(RED(f"  [temperature] {exc}"))
+            return
+        if isinstance(getattr(sess, "cfg", None), dict):
+            sess.cfg["temperature"] = current
+        sess._temperature_override = None
+        print(DIM(f"  [temperature {current:g} 已存为默认 · {path}]"))
+        return
+    number = CFG.parse_temperature(value)
+    if number is None:
+        print(RED(f"  [temperature] 要 0–2 之间的数，收到 {value!r}"))
+        return
+    sess._temperature_override = number
+    sess.ag.temperature = number
+    print(DIM(f"  [temperature {number:g}，本会话生效；/temperature save 存成默认]"))
+    if not M.supports_temperature(sess.ag.gateway, sess.ag.model):
+        print(YELLOW(f"  {sess.ag.model} 不接受 temperature，换到接受的模型才会生效"))
+
+
+def _choose_effort(sess, gateway, model):
+    """/model 选完模型之后的第三级：推理强度（用户 2026-09-24：「effort 并到 /model
+    中……这样我们能够根据模型情况设置选项和 list」）。
+
+    只对走 /v1/responses 的模型弹 —— chat/completions 上 reasoning_effort 实测有害。
+    选项来自网关（discover_effort_options），不是写死的名单。返回附在切换提示后面的一段话。
+    """
+    record = M.get(gateway, model)
+    if record.get("api") != "responses":
+        return ""
+    options = record.get("effort_options")
+    if not options:
+        with Spinner(f"查询 {model} 支持的推理强度"):
+            try:
+                options = M.discover_effort_options(gateway, model)
+            except Exception:                             # noqa: BLE001
+                options = None
+    if not options:
+        return ""
+    default = record.get("effort_default")
+    current = sess.ag.effort_for(gateway, model)
+    rows = [{"effort": None,
+             "label": "模型默认" + (f"（{default}）" if default else "")}]
+    rows += [{"effort": option, "label": option} for option in options]
+    for row in rows:
+        if row["effort"] == current:
+            row["label"] += "   ← 当前"
+    picked = sess.pick(
+        rows, page=len(rows), render=lambda row: row["label"],
+        allow_filter=False,
+        title=f"{model} 的推理强度（选项来自网关）    Esc 保持不变")
+    if picked:
+        sess.ag.set_effort(gateway, model, picked["effort"])
+        current = picked["effort"]
+    return f" · 推理 {current or '默认'}"
+
+
+def _typed_effort(sess, gateway, model, effort):
+    """`/model gpt-6-sol high`：打字也能带推理强度。返回附在切换提示后面的一段话；
+    不合法时打印原因并返回 None（不切换）。"""
+    record = M.get(gateway, model)
+    options = record.get("effort_options") or []
+    if options and effort not in options:
+        print(RED(f"  [model] {model} 的推理强度可选：{' / '.join(options)}"
+                  f"（来自网关），收到 {effort!r}"))
+        return None
+    if record.get("status") == "ok" and record.get("api") != "responses":
+        print(YELLOW(f"  [{model} 走 chat/completions，推理强度不会发出去 —— "
+                     "只有走 /v1/responses 的模型能设]"))
+        return ""
+    sess.ag.set_effort(gateway, model, effort)
+    return f" · 推理 {effort}"
+
+
+def _picker_gateway_counts(rows):
+    """「deepinfer 11 · boyue 旗舰 12 · deepseek 2」—— 按列表里的出现顺序。"""
+    counts = {}
+    for row in rows:
+        name = str(row.get("gateway") or "")
+        counts[name] = counts.get(name, 0) + 1
+    curated = set()
+    try:
+        sizes = {name: M._catalog_size(name) for name in counts}
+        curated = {name for name, size in sizes.items()
+                   if M.is_large_catalog(size)}
+    except Exception:                                   # noqa: BLE001
+        pass
+    return " · ".join(
+        f"{name}{' 旗舰' if name in curated else ''} {count}"
+        for name, count in counts.items())
 
 
 def _gateway_key_label(name):
@@ -13395,6 +13589,7 @@ REGISTRY = {
     "architecture": (cmd_architecture, "LLM 架构 enrichment（显式构建）"),
     "memory": (cmd_memory, '管理分层长期记忆与 Context Capsule'),
     "model": (cmd_model, '选择模型/路由；gateway/health/refresh 管理网关、健康度与目录'),
+    "temperature": (cmd_temperature, '查看/设置对话 temperature（默认 0.3）'),
     "gateway": (cmd_gateway, '切换网关（已并入 /model gateway）'),
     "probe": (cmd_probe, '探测当前/指定模型能力、缓存或上下文'),
     "agents": (cmd_agents, '查看或 attach child agent（Ctrl+T）'),
@@ -13461,13 +13656,21 @@ COMMAND_SUBCOMMANDS = {
         },
     },
     "/model": {
-        "hint": "也可直接输入模型名",
+        "hint": "也可直接输入模型名；走 /v1/responses 的模型可跟推理强度（gpt-6-sol high）",
         "items": (
             ("gateway", "切换/查看网关（原 /gateway）；可追加名字"),
             ("health", "查看持久健康度；可追加模型关键词"),
-            ("refresh", "刷新当前 gateway 模型目录"),
+            ("refresh", "刷新所有配了 key 的网关，实测新旗舰"),
             ("check", "目录 + 实调双证据校验当前模型与各席位"),
             ("help", "显示模型选择用法"),
+        ),
+    },
+    "/temperature": {
+        "hint": "也可直接输入 0–2 之间的数（本会话生效）",
+        "items": (
+            ("save", "把当前值存成默认（settings.json）"),
+            ("default", "恢复默认值"),
+            ("help", "显示 temperature 用法"),
         ),
     },
     "/recap": {
@@ -14920,9 +15123,7 @@ def cmd_init_cli(a, cfg):
                   f"本机代理变量：{proxies or '未设'}（zylab 直连，不走它们）"))
         # 「我不读你的环境变量」如果不给出路，对**必须走代理才够得着端点**的用户
         # 就是一条死路（2026-09-22 实跑陌生人流程撞到）。给出显式入口。
-        print(DIM(f"    这个端点必须经代理才够得着？显式声明一条："
-                  f"export {paths.env_name('API_PROXY')}="
-                  "'http://<user>:<pass>@<host>:<port>/'"))
+        print(DIM("    " + _proxy_hint(route.name)))
         print(DIM(f"    稍后重试，或换网关：zylab init --gateway {other}"))
         return 1
     # 6. 默认模型能不能答话 —— 目录里列得出 ≠ 这把 key 调得通。
@@ -15331,7 +15532,10 @@ def main():
                     print(f"    {r['id']:36} {t} {r.get('first_token_s',0):>5.1f}s{tp}")
                 else:
                     print(f"    {r['id']:36} {RED('不可用')} {DIM(str(r.get('error',''))[:56])}")
-            ok, bad, sk = M.probe_many(gw, on_result=report)
+            ok, bad, sk = M.probe_many(
+                gw, ids=M.probe_targets(
+                    gw, preferred=CFG.preferred_families(cfg)),
+                on_result=report)
             print(DIM(f"  → 可用 {ok} · 不可用 {bad} · 跳过 {sk}"))
         return
 
@@ -15418,7 +15622,8 @@ def main():
         load_project_md=not (a.no_md or a.no_project_md),
         load_skills=not a.no_skills,
         compact_at=cfg.get("compact_at"),
-        gateway=client.GATEWAY)
+        gateway=client.GATEWAY,
+        temperature=CFG.temperature_policy(cfg))
     sess = Session(ag, cfg)
     if a.max_turns is not None:
         sess.max_turns = a.max_turns if a.max_turns > 0 else None

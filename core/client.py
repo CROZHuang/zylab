@@ -69,8 +69,9 @@ KEYS = os.path.expanduser(
 # 预置它才谈得上「下载下来填个 key 就能用」。内部网关（deepinfer / boyue）仍然只给
 # key 变量名，地址由使用者自己填。
 #
-# 唯一的硬条件是 **OpenAI 兼容**：zylab 只发 `{base}/chat/completions`、只读
-# `{base}/models`。下面每一条都按厂商公开文档填；对不对不靠这张表打包票，靠
+# 唯一的硬条件是 **OpenAI 兼容**：zylab 发 `{base}/chat/completions`、读
+# `{base}/models`；网关明说某个模型要走 `{base}/responses` 时才改走那里（见
+# _adaptation_for）。下面每一条都按厂商公开文档填；对不对不靠这张表打包票，靠
 # `zylab init` 那次真实探测（列目录 + 调一次默认模型）当场验。
 BUILTIN_GATEWAYS = {
     # 内部 / 自建：只给 key 名，地址自己填
@@ -435,23 +436,36 @@ _OPENER = urllib.request.build_opener(
 _PROXY_OPENERS = {}
 
 
-def api_proxy():
+def api_proxy(route=None):
     """模型请求要走的代理；没有显式声明就返回 None（直连）。
 
-    只认 `ZYLAB_API_PROXY`。**刻意不读 http(s)_proxy**（理由同 _OPENER），
+    只认 `ZYLAB_API_PROXY_<网关>`（只管这一个网关）与 `ZYLAB_API_PROXY`（其余
+    所有网关），前者优先。**刻意不读 http(s)_proxy**（理由同 _OPENER），
     也刻意不复用 `web.proxy`：那条给网页抓取，信任面不同 —— 这条会把
     API key、prompt、代码与工具结果都送过去，必须由用户为这条路单独表态。
+
+    为什么要按网关分（2026-09-24 实测，同一台机器）：DeepSeek 官方口**只有**经
+    代理才通，DeepInfer **只有**直连才通。只有一个全局开关时两者不可兼得 ——
+    开了 DeepInfer 断，不开 DeepSeek 的目录永远取不到。
 
     值要过 `looks_like_proxy_url`：09-20 有过事故，`_PROXY_CLEAR='unset …'`
     这种 shell 命令被当成代理交给 ProxyHandler，urllib 抛
     `InvalidURL: URL can't contain control characters`，代理这条腿当场失效。
     形态不对就当没声明（返回 None），不是报错 —— 直连仍然可用。
     """
-    value = paths.env_get("API_PROXY", "").strip()
+    name = getattr(route, "name", None)
+    value = paths.env_get(api_proxy_env(name), "").strip() if name else ""
+    if not value:
+        value = paths.env_get("API_PROXY", "").strip()
     if not value:
         return None
     from . import webfetch                  # 惰性 import：避免模块级环依赖
     return value if webfetch.looks_like_proxy_url(value) else None
+
+
+def api_proxy_env(gateway):
+    """某个网关专用的代理变量名后缀（`API_PROXY_DEEPSEEK`）；与 `BASE_<网关>` 同一套命名。"""
+    return "API_PROXY_" + str(gateway).upper()
 
 
 def _opener_for(proxy):
@@ -1422,8 +1436,13 @@ def stream_chat(model, messages, tools=None, max_tokens=8192, temperature=0.3,
                 gateway=None, route=None, temperature_fallback=True,
                 metrics=_DEFAULT_METRICS, trace_context=None,
                 route_explicit=False, route_warning=None,
-                before_attempt=None, thinking=None):
+                before_attempt=None, thinking=None, effort=None,
+                effort_fallback=True):
     """流式请求，带两种自动降级。temperature=None 表示不发这个参数。
+
+    `effort` 是用户在 /model 里给这个模型选的推理强度，只在走 /v1/responses 时发
+    （chat/completions 上的 reasoning_effort 实测有害，见 README）。模型不收这个值就
+    按模型默认重发并提示；`effort_fallback=False` 只给「问网关收哪些值」用。
 
     **1. temperature 降级。** 当前世代 Claude 已废弃 temperature（claude-opus-4-8
     直接 400："`temperature` is deprecated for this model"）。被拒就去掉重发，
@@ -1468,6 +1487,8 @@ def stream_chat(model, messages, tools=None, max_tokens=8192, temperature=0.3,
     max_attempts = max(1, int(retries))
     transient_failures = 0
     attempt_no = 0
+    adapt = _adaptations(route, model)
+    tried = set()                 # 同一次请求里不重复同一个适配：防来回切的死循环
     while transient_failures < max_attempts:
         attempt_no += 1
         # A cancelled child never reached the provider boundary, so it must
@@ -1496,7 +1517,10 @@ def stream_chat(model, messages, tools=None, max_tokens=8192, temperature=0.3,
             for ev in _stream_once(
                     model, messages, tools, max_tokens, temperature,
                     timeout, cancel, attempt_no, phase_sink, route=route,
-                    thinking=thinking):
+                    thinking=thinking,
+                    max_tokens_param=adapt["max_tokens_param"],
+                    reasoning_effort=adapt["reasoning_effort"],
+                    api=adapt["api"], effort=effort):
                 trace_id = trace.id if trace is not None else None
                 if ev.get("t") == "done":
                     response_usage = _trace_usage(ev.get("usage"))
@@ -1537,14 +1561,35 @@ def stream_chat(model, messages, tools=None, max_tokens=8192, temperature=0.3,
                 not emitted and not temperature_retry
                 and thinking is not None
                 and "thinking" in str(e).lower())
+            # 网关指明了换法的参数适配：probe 也照样自动换（它关掉的只是
+            # temperature 降级 —— 那是能力，这些只是请求的写法）。
+            effort_retry = bool(
+                not emitted and not temperature_retry and effort_fallback
+                and effort is not None and adapt["api"] == "responses"
+                and "reasoning.effort" in str(e))
+            adaptation = (
+                None if (emitted or temperature_retry or thinking_retry
+                         or effort_retry)
+                else _adaptation_for(e, adapt, tried))
+            if (not emitted and adapt["api"] == "chat"
+                    and adapt["reasoning_effort"] == "none"
+                    and "does not support 'none'" in str(e)):
+                # 记下的适配被网关当面否掉了（gpt-6-astra：要关推理才能带工具，
+                # 可它不接受关推理）。忘掉它 —— 否则哪天网关支持了，是这条记忆
+                # 本身把模型挡在门外。本次照常报错。
+                adapt["reasoning_effort"] = None
+                _remember_adaptation(route, model, "reasoning_effort", None)
             transient_retry = False
-            if not emitted and not temperature_retry:
+            if (not emitted and not temperature_retry and adaptation is None
+                    and not effort_retry):
                 transient_failures += 1
                 transient_retry = bool(
                     transient_failures < max_attempts
                     and _is_transient(e))
             retry_reason = (
                 "temperature_fallback" if temperature_retry
+                else "effort_fallback" if effort_retry
+                else f"{adaptation[0]}_fallback" if adaptation
                 else "transient_retry" if transient_retry else None)
             error_kind = (
                 "capability_temperature" if temperature_retry else e.kind)
@@ -1563,6 +1608,38 @@ def stream_chat(model, messages, tools=None, max_tokens=8192, temperature=0.3,
                     route_warning(
                         f"{route.name} 不接受 thinking 参数，本次请求带思考重发")
                 thinking = None
+                continue          # 确定性修复：不算瞬时故障
+            if effort_retry:
+                if route_warning is not None:
+                    route_warning(
+                        f"{model} 不接受推理强度 {effort}，本次按模型默认")
+                try:
+                    # 拒绝原话里就是这个模型真正收的值：顺手更正能力表，
+                    # /model 下次弹出的选项就对了。
+                    from . import models as _models
+                    options = _models.parse_supported_values(e)
+                    if options:
+                        _models.update_record(
+                            route.name, model,
+                            lambda rec: rec.update(effort_options=options))
+                except Exception:                          # noqa: BLE001
+                    pass
+                effort = None
+                continue          # 确定性修复：不算瞬时故障
+            if adaptation is not None:
+                field, value = adaptation
+                tried.add(adaptation)
+                adapt[field] = value
+                _remember_adaptation(route, model, field, value)
+                if route_warning is not None and field == "reasoning_effort":
+                    route_warning(
+                        f"{model} 在 chat/completions 上带工具时不支持推理，"
+                        "已按网关提示设 reasoning_effort=none")
+                if route_warning is not None and field == "api":
+                    route_warning(
+                        f"{model} 改走 /v1/responses（网关的要求）"
+                        if value == "responses" else
+                        f"{route.name} 没有 /v1/responses，{model} 退回 chat/completions")
                 continue          # 确定性修复：不算瞬时故障
             if temperature_retry:
                 try:
@@ -1617,6 +1694,82 @@ def stream_chat(model, messages, tools=None, max_tokens=8192, temperature=0.3,
                 trace.close()
 
 
+# 每个模型要怎么发请求 —— **只收网关在拒绝原话里明确指出了做法的**，不猜。
+# 2026-09-24 对真实网关实测新一代 OpenAI 模型，连着撞了两条：
+#   gpt-6-sol / gpt-6-astra  `'max_tokens' is not supported with this model.
+#                            Use 'max_completion_tokens' instead.`
+#   同上（换完参数名之后）    `Function tools with reasoning_effort are not supported
+#                            … set reasoning_effort to 'none'.`
+# 而很多 OpenAI 兼容网关只认 `max_tokens`、不认 reasoning_effort。所以先按最通行的发，
+# 被这样拒了就照做、重发，并记进能力表（下次、换个进程都直接用对的）。
+_ADAPTATIONS = {}
+_ADAPTATION_DEFAULTS = {"max_tokens_param": "max_tokens",
+                        "reasoning_effort": None,
+                        # 走哪个接口。同一条原则：网关在拒绝里说「use /v1/responses」才切。
+                        "api": "chat"}
+
+
+def _adaptations(route, model):
+    key = (route.name, str(model))
+    cached = _ADAPTATIONS.get(key)
+    if cached is None:
+        cached = dict(_ADAPTATION_DEFAULTS)
+        try:
+            from . import models as _models
+            record = _models.get(route.name, model)
+            if record.get("max_tokens_param") == "max_completion_tokens":
+                cached["max_tokens_param"] = "max_completion_tokens"
+            if record.get("reasoning_effort") == "none":
+                cached["reasoning_effort"] = "none"
+            if record.get("api") == "responses":
+                cached["api"] = "responses"
+        except Exception:                                  # noqa: BLE001
+            pass                  # 能力表读不了就按最通行的发
+        _ADAPTATIONS[key] = cached
+    return dict(cached)
+
+
+def _adaptation_for(error, current, tried=()):
+    """拒绝原话里若指明了换法，返回 (字段, 新值)；否则 None。已试过的跳过、看下一条。
+
+    同一句拒绝常常给出两条路（gpt-6-sol：「use /v1/responses or set
+    reasoning_effort to 'none'」）。**先换接口**：关推理能让它跑起来，但那是让模型
+    关着脑子干活；Responses 上工具与推理可以同时开（2026-09-24 实测两个 gpt-6 都是）。
+    换接口试过而网关没有这个接口时，才轮到「关推理」。
+    """
+    text = str(error)
+    candidates = []
+    if current["api"] == "responses":
+        # 网关根本没有这个接口：退回 chat，接着按 chat 的规矩适配。
+        if getattr(error, "status", None) in (404, 405):
+            candidates.append(("api", "chat"))
+        # 下面几条都是 chat/completions 的写法，这里不适用
+    else:
+        if "/v1/responses" in text:
+            candidates.append(("api", "responses"))
+        if (current["max_tokens_param"] == "max_tokens"
+                and "max_completion_tokens" in text):
+            candidates.append(("max_tokens_param", "max_completion_tokens"))
+        if (current["reasoning_effort"] is None and "reasoning_effort" in text
+                and "'none'" in text):
+            candidates.append(("reasoning_effort", "none"))
+    for candidate in candidates:
+        if candidate not in tried:
+            return candidate
+    return None
+
+
+def _remember_adaptation(route, model, field, value):
+    _ADAPTATIONS.setdefault(
+        (route.name, str(model)), dict(_ADAPTATION_DEFAULTS))[field] = value
+    try:
+        from . import models as _models
+        _models.update_record(
+            route.name, model, lambda rec: rec.update({field: value}))
+    except Exception:                                      # noqa: BLE001
+        pass                      # 记不上不影响本次请求
+
+
 _TOP_LEVEL_SCHEMA_COMBINATORS = frozenset(("oneOf", "allOf", "anyOf"))
 
 
@@ -1658,7 +1811,8 @@ def _provider_tool_schemas(tools, route, model):
 
 def _stream_once(model, messages, tools=None, max_tokens=8192, temperature=0.3,
                  timeout=600, cancel=None, attempt=1, phases=None, route=None,
-                 thinking=None):
+                 thinking=None, max_tokens_param="max_tokens",
+                 reasoning_effort=None, api="chat", effort=None):
     """流式请求，yield 事件字典。
 
     事件类型：
@@ -1671,10 +1825,18 @@ def _stream_once(model, messages, tools=None, max_tokens=8192, temperature=0.3,
     arguments 是逐片拼接的 JSON 字符串。必须按 index 累加，不能按到达顺序。
     """
     route = route or route_for()
-    payload = {"model": model, "messages": messages, "max_tokens": max_tokens,
+    if api == "responses":
+        yield from _stream_once_responses(
+            model, messages, tools, max_tokens, temperature, timeout, cancel,
+            attempt, phases, route=route, effort=effort)
+        return
+    payload = {"model": model, "messages": messages,
+               max_tokens_param: max_tokens,
                "stream": True, "stream_options": {"include_usage": True}}
     if temperature is not None:
         payload["temperature"] = temperature
+    if reasoning_effort is not None:
+        payload["reasoning_effort"] = reasoning_effort
     # thinking={"type": "disabled"} 关掉思考。为什么需要它：reasoning 模型把
     # reasoning_content 也算进 max_tokens，额度小的请求（摘要 2000）会被思考吃光，
     # 正文一个字都出不来，看起来像「provider 返回空响应」。实测 kimi-k3 必现。
@@ -1703,7 +1865,7 @@ def _stream_once(model, messages, tools=None, max_tokens=8192, temperature=0.3,
     _mark_phase(phases, "started", attempt)
     _ACTIVE_CANCEL.handle = cancel      # connect() 里把 socket 绑到这个句柄上
     try:
-        resp = _opener_for(api_proxy()).open(req, timeout=timeout)
+        resp = _opener_for(api_proxy(route)).open(req, timeout=timeout)
     except urllib.error.HTTPError as e:
         _mark_phase(phases, "ended", attempt)
         raise _http_error(e, route, model) from None
@@ -1825,6 +1987,312 @@ def _stream_once(model, messages, tools=None, max_tokens=8192, temperature=0.3,
     yield {"t": "done", "reason": reason, "usage": usage}
 
 
+# ------------------------------------------------------------ /v1/responses
+# 一部分模型只有在 /v1/responses 上才能**同时**带工具和推理（2026-09-24 实测 Boyue：
+# gpt-6-astra 在 chat/completions 上带工具必须关推理、而它不接受关推理；gpt-6-sol
+# 能在 chat 上跑，但推理是关着的）。什么时候走这条路**不写名单**：网关在拒绝原话里
+# 说「use /v1/responses」才切，记进能力表（见 _adaptation_for 的 api 字段）。
+#
+# 对上层透明：这里把 zylab 的 chat 形态历史翻成 Responses 的 input items，再把它的
+# 流式事件翻回 zylab 的内部事件（text / reasoning / tool / done）。上层的代理循环、
+# 计费、压缩一行都不用改。
+#
+# store=false：不让网关那边存对话（chat 路径本来也不存）。推理内容不跨轮保留 ——
+# chat 路径同样不回传 reasoning_content，两边行为一致。
+
+def _responses_text(content):
+    """chat 的 content（字符串或 parts 列表）→ 纯文本。"""
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        pieces = []
+        for part in content:
+            if isinstance(part, str):
+                pieces.append(part)
+            elif isinstance(part, dict) and part.get("type") in (
+                    "text", "input_text", "output_text"):
+                pieces.append(str(part.get("text") or ""))
+        return "".join(pieces)
+    return "" if content is None else str(content)
+
+
+def _responses_user_content(content):
+    """用户消息：纯文本原样；带图片的 parts 换成 Responses 的 input_text / input_image。"""
+    if not isinstance(content, list):
+        return _responses_text(content)
+    parts = []
+    for part in content:
+        if isinstance(part, str):
+            parts.append({"type": "input_text", "text": part})
+            continue
+        if not isinstance(part, dict):
+            continue
+        kind = part.get("type")
+        if kind in ("text", "input_text"):
+            parts.append({"type": "input_text", "text": str(part.get("text") or "")})
+        elif kind == "image_url":
+            image = part.get("image_url")
+            url = image.get("url") if isinstance(image, dict) else image
+            if url:
+                parts.append({"type": "input_image", "image_url": str(url)})
+    return parts or ""
+
+
+def _responses_input(messages):
+    """chat 形态的历史 → (instructions, input items)。
+
+    开头的 system 进 instructions；中途插进来的 system 保持原位，作 developer 消息。
+    工具调用拆成独立的 function_call item，工具结果成 function_call_output，两者
+    靠 call_id 对上 —— 别家模型留下的 id（toolu_…、call_…）照用，网关只要求一致。
+    """
+    instructions, items = [], []
+    for message in messages:
+        if not isinstance(message, dict):
+            continue
+        role = message.get("role")
+        content = message.get("content")
+        if role == "system":
+            text = _responses_text(content)
+            if not items:
+                instructions.append(text)
+            elif text:
+                items.append({"role": "developer", "content": text})
+        elif role == "tool":
+            items.append({
+                "type": "function_call_output",
+                "call_id": str(message.get("tool_call_id") or ""),
+                "output": _responses_text(content)})
+        elif role == "assistant":
+            text = _responses_text(content)
+            if text:
+                items.append({"role": "assistant", "content": text})
+            for call in message.get("tool_calls") or ():
+                function = (call or {}).get("function") or {}
+                items.append({
+                    "type": "function_call",
+                    "call_id": str((call or {}).get("id") or ""),
+                    "name": str(function.get("name") or ""),
+                    "arguments": str(function.get("arguments") or "{}")})
+        else:
+            items.append({"role": "user",
+                          "content": _responses_user_content(content)})
+    return "\n\n".join(text for text in instructions if text), items
+
+
+def _responses_tools(tools):
+    """chat 的 {"type":"function","function":{…}} → Responses 的扁平写法。"""
+    converted = []
+    for tool in tools or ():
+        function = tool.get("function") if isinstance(tool, dict) else None
+        if not isinstance(function, dict) or not function.get("name"):
+            continue
+        converted.append({
+            "type": "function",
+            "name": function["name"],
+            "description": function.get("description") or "",
+            "parameters": (function.get("parameters")
+                           or {"type": "object", "properties": {}}),
+            # 显式关掉：strict 模式要求每个参数都必填，zylab 的工具有可选参数。
+            "strict": False})
+    return converted
+
+
+def _responses_usage(usage):
+    """Responses 的用量字段 → zylab 统一用的 chat 形态（normalize_cache 等照读）。"""
+    usage = usage if isinstance(usage, dict) else {}
+    cached = (usage.get("input_tokens_details") or {}).get("cached_tokens")
+    reasoning = (usage.get("output_tokens_details") or {}).get("reasoning_tokens")
+    return {
+        "prompt_tokens": int(usage.get("input_tokens") or 0),
+        "completion_tokens": int(usage.get("output_tokens") or 0),
+        "total_tokens": int(usage.get("total_tokens") or 0),
+        "prompt_tokens_details": {"cached_tokens": int(cached or 0)},
+        "completion_tokens_details": {"reasoning_tokens": int(reasoning or 0)},
+    }
+
+
+def _stream_once_responses(model, messages, tools=None, max_tokens=8192,
+                           temperature=None, timeout=600, cancel=None,
+                           attempt=1, phases=None, route=None, effort=None):
+    """/v1/responses 的一次流式请求；yield 的事件与 _stream_once（chat）完全同形。
+
+    连接、取消、阶段打点与 _stream_once 一一对应；改一边时对照另一边。
+    """
+    route = route or route_for()
+    instructions, items = _responses_input(messages)
+    payload = {"model": model, "input": items, "stream": True,
+               "store": False, "max_output_tokens": max_tokens}
+    if instructions:
+        payload["instructions"] = instructions
+    if temperature is not None:
+        payload["temperature"] = temperature
+    if effort:
+        payload["reasoning"] = {"effort": effort}
+    provider_tools = _responses_tools(_provider_tool_schemas(tools, route, model))
+    if provider_tools:
+        payload["tools"] = provider_tools
+        payload["tool_choice"] = "auto"
+
+    req = urllib.request.Request(
+        f"{route.base}/responses", data=json.dumps(payload).encode(),
+        headers={"Authorization": f"Bearer {api_key(route)}",
+                 "Content-Type": "application/json", "Accept": "text/event-stream"})
+
+    calls = {}        # item id -> {call_id, name, args, index}
+    usage = {}
+    reason = None
+    used_effort = None
+    terminal = False
+    if _cancelled(cancel):
+        _mark_phase(phases, "ended", attempt)
+        raise Interrupted("用户中断")
+
+    _mark_phase(phases, "started", attempt)
+    _ACTIVE_CANCEL.handle = cancel
+    try:
+        resp = _opener_for(api_proxy(route)).open(req, timeout=timeout)
+    except urllib.error.HTTPError as e:
+        _mark_phase(phases, "ended", attempt)
+        raise _http_error(e, route, model) from None
+    except APIError as e:
+        _mark_phase(phases, "ended", attempt)
+        if e.gateway is None:
+            e.gateway = route.name
+        if e.model is None:
+            e.model = model
+        raise
+    except Exception as e:
+        _mark_phase(phases, "ended", attempt)
+        if _cancelled(cancel):
+            raise Interrupted("用户中断") from None
+        raise APIError(
+            f"连接失败: {e}", kind="network", gateway=route.name,
+            model=model, retryable=True) from None
+    finally:
+        _ACTIVE_CANCEL.handle = None
+
+    _mark_phase(phases, "headers", attempt)
+    binder = getattr(cancel, "bind", None) if cancel is not None else None
+    try:
+        if callable(binder):
+            binder(resp)
+        if _cancelled(cancel):
+            raise Interrupted("用户中断")
+        with resp:
+            for raw in resp:
+                if _cancelled(cancel):
+                    raise Interrupted("用户中断")
+                line = raw.decode("utf-8", "replace").strip()
+                if not line.startswith("data:"):
+                    continue          # `event:` 行与 data 里的 type 重复
+                data = line[5:].strip()
+                if data == "[DONE]":
+                    break
+                try:
+                    event = json.loads(data)
+                except json.JSONDecodeError:
+                    continue
+                kind = event.get("type")
+                if kind == "response.output_text.delta":
+                    delta = event.get("delta") or ""
+                    if delta:
+                        _mark_phase(phases, "first_delta", attempt)
+                        _mark_phase(phases, "last_delta", attempt)
+                        yield {"t": "text", "v": delta}
+                elif kind in ("response.reasoning_summary_text.delta",
+                              "response.reasoning_text.delta"):
+                    delta = event.get("delta") or ""
+                    if delta:
+                        _mark_phase(phases, "first_delta", attempt)
+                        _mark_phase(phases, "last_delta", attempt)
+                        yield {"t": "reasoning", "v": delta}
+                elif kind in ("response.output_item.added",
+                              "response.output_item.done"):
+                    item = event.get("item") or {}
+                    if item.get("type") != "function_call":
+                        continue
+                    _mark_phase(phases, "first_delta", attempt)
+                    _mark_phase(phases, "last_delta", attempt)
+                    slot = calls.setdefault(
+                        str(item.get("id") or event.get("output_index")),
+                        {"call_id": None, "name": "", "args": "",
+                         "index": event.get("output_index", len(calls))})
+                    slot["call_id"] = item.get("call_id") or slot["call_id"]
+                    slot["name"] = item.get("name") or slot["name"]
+                    # 完成态里的 arguments 是整份，以它为准；added 时通常是空串。
+                    if item.get("arguments"):
+                        slot["args"] = item["arguments"]
+                elif kind == "response.function_call_arguments.delta":
+                    slot = calls.get(str(event.get("item_id")))
+                    if slot is not None:
+                        slot["args"] += event.get("delta") or ""
+                        _mark_phase(phases, "last_delta", attempt)
+                elif kind in ("response.completed", "response.incomplete"):
+                    body = event.get("response") or {}
+                    usage = _responses_usage(body.get("usage"))
+                    used_effort = (body.get("reasoning") or {}).get("effort")
+                    if kind == "response.incomplete":
+                        why = (body.get("incomplete_details") or {}).get("reason")
+                        reason = ("length" if why == "max_output_tokens"
+                                  else str(why or "incomplete"))
+                    terminal = True
+                elif kind == "response.failed":
+                    error = ((event.get("response") or {}).get("error") or {})
+                    code = str(error.get("code") or "")
+                    raise APIError(
+                        f"response.failed: {error.get('message') or error}",
+                        kind="provider", code=code or None,
+                        gateway=route.name, model=model,
+                        retryable=code in ("server_error", "rate_limit_exceeded"))
+                elif kind == "error":
+                    raise APIError(
+                        f"responses error: {event.get('message') or event}",
+                        kind="provider", code=event.get("code"),
+                        gateway=route.name, model=model, retryable=False)
+    except Interrupted:
+        raise
+    except APIError:
+        raise                     # 上面自己抛的，别被下面包成「读取失败」
+    except Exception as e:
+        if _cancelled(cancel):
+            raise Interrupted("用户中断") from None
+        retryable = isinstance(
+            e, (OSError, TimeoutError, urllib.error.URLError,
+                http.client.IncompleteRead, http.client.RemoteDisconnected))
+        raise APIError(
+            f"流式读取失败: {e}", kind="stream_read",
+            gateway=route.name, model=model, retryable=retryable) from None
+    finally:
+        releaser = getattr(cancel, "release", None) if cancel is not None else None
+        if callable(releaser):
+            releaser(resp)
+        _mark_phase(phases, "ended", attempt)
+
+    if not terminal:
+        if _cancelled(cancel):
+            raise Interrupted("用户中断")
+        raise APIError(
+            "流式响应在 response.completed 前结束",
+            kind="stream_eof", gateway=route.name, model=model,
+            retryable=True)
+
+    if calls:
+        ordered = sorted(
+            calls.values(),
+            key=lambda slot: slot["index"] if isinstance(slot["index"], int) else 0)
+        yield {"t": "tool", "v": [
+            {"id": slot["call_id"] or f"{slot['name']}:{index}",
+             "type": "function",
+             "function": {"name": slot["name"], "arguments": slot["args"] or "{}"}}
+            for index, slot in enumerate(ordered)]}
+    if reason is None:
+        reason = "tool_calls" if calls else "stop"
+    done = {"t": "done", "reason": reason, "usage": usage}
+    if used_effort:
+        done["effort"] = used_effort
+    yield done
+
+
 _LIMITS = {}
 
 
@@ -1848,11 +2316,11 @@ def model_limit(model, default=128_000, gateway=None):
     return _LIMITS.get(cache_key, default)
 
 
-def list_models(gateway=None, route=None):
+def list_models(gateway=None, route=None, timeout=60):
     route = route or route_for(gateway)
     require_secure_transport(route, purpose="model_catalog")
     req = urllib.request.Request(
         f"{route.base}/models",
         headers={"Authorization": f"Bearer {api_key(route)}"})
-    with _opener_for(api_proxy()).open(req, timeout=60) as r:
+    with _opener_for(api_proxy(route)).open(req, timeout=timeout) as r:
         return json.loads(r.read()).get("data", [])

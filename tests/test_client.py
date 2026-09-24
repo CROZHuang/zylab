@@ -688,6 +688,272 @@ class TemperatureFallback(unittest.TestCase):
         self.assertIn("temperature", calls[0])
 
 
+RESPONSES_TEXT_OK = [
+    'data: {"type":"response.output_text.delta","delta":"你好","output_index":0}\n',
+    'data: {"type":"response.completed","response":{"status":"completed",'
+    '"usage":{"input_tokens":5,"output_tokens":2,"total_tokens":7},'
+    '"reasoning":{"effort":"medium"}}}\n',
+]
+
+
+class NewerModelParameters(unittest.TestCase):
+    """2026-09-24 对真实网关实测新旗舰，两类失败都是 **zylab 的请求格式**，不是模型坏了：
+
+      gpt-6-sol / gpt-6-astra  `'max_tokens' is not supported with this model.
+                               Use 'max_completion_tokens' instead.`
+      kimi-k3                  `Parameter 'temperature'=0.3 is not supported`（**重发之后**）
+
+    只 fake 最底层的 HTTP opener，stream_chat / _stream_once / probe 全是真的 ——
+    第二个缺陷恰恰出在两层默认值的交界处，mock 掉任何一层都看不见它。
+    """
+
+    REJECT_MAX_TOKENS = (
+        "HTTP 400: {\"error\":{\"message\":\"Unsupported parameter: 'max_tokens' is "
+        "not supported with this model. Use 'max_completion_tokens' instead.\","
+        "\"type\":\"invalid_request_error\",\"param\":\"max_tokens\"}}")
+
+    REJECT_REASONING = (
+        "HTTP 400: {\"error\":{\"message\":\"Function tools with reasoning_effort "
+        "are not supported for gpt-6-sol in /v1/chat/completions. To use function "
+        "tools, use /v1/responses or set reasoning_effort to 'none'.\","
+        "\"param\":\"reasoning_effort\"}}")
+
+    def setUp(self):
+        client._ADAPTATIONS.clear()
+        self.addCleanup(client._ADAPTATIONS.clear)
+
+    def ok_response(self):
+        return FakeResponse([sse(chunk(content="ok")), "data: [DONE]\n"])
+
+    def test_max_tokens_rejection_switches_parameter_and_remembers_it(self):
+        calls = []
+
+        def fake_open(req, timeout=None):
+            body = json.loads(req.data)
+            calls.append(body)
+            if "max_tokens" in body:
+                raise client.APIError(self.REJECT_MAX_TOKENS)
+            return self.ok_response()
+
+        with mock.patch.object(client._OPENER, "open", side_effect=fake_open):
+            events = list(client.stream_chat(
+                "gpt-6-sol", [{"role": "user", "content": "x"}],
+                max_tokens=120, retries=1))
+            list(client.stream_chat(
+                "gpt-6-sol", [{"role": "user", "content": "x"}],
+                max_tokens=120, retries=1))
+        self.assertEqual(
+            [(("max_tokens" in c), c.get("max_completion_tokens")) for c in calls],
+            [(True, None), (False, 120), (False, 120)],
+            "被拒一次就换参数；同一进程里下一次直接用对的")
+        self.assertEqual("".join(e["v"] for e in events if e["t"] == "text"), "ok")
+        self.assertEqual(
+            models.get("deepinfer", "gpt-6-sol").get("max_tokens_param"),
+            "max_completion_tokens", "记进能力表，换个进程也不用再撞一次")
+
+    def test_a_new_process_reads_the_remembered_parameter(self):
+        models.update_record("deepinfer", "gpt-6-astra", lambda rec: rec.update(
+            gateway="deepinfer", id="gpt-6-astra",
+            max_tokens_param="max_completion_tokens"))
+        calls = []
+
+        def fake_open(req, timeout=None):
+            calls.append(json.loads(req.data))
+            return self.ok_response()
+
+        with mock.patch.object(client._OPENER, "open", side_effect=fake_open):
+            list(client.stream_chat(
+                "gpt-6-astra", [{"role": "user", "content": "x"}], max_tokens=64))
+        self.assertNotIn("max_tokens", calls[0])
+        self.assertEqual(calls[0]["max_completion_tokens"], 64)
+
+    def test_both_adaptations_chain_like_the_real_gateway_did(self):
+        """真实顺序：先撞 max_tokens；换完参数名再撞「use /v1/responses or set
+        reasoning_effort to 'none'」—— 两条路里**先换接口**：关推理能跑，但那是让模型
+        关着脑子干活，Responses 上工具与推理可以同时开。"""
+        calls = []
+
+        def fake_open(req, timeout=None):
+            body = json.loads(req.data)
+            calls.append((req.full_url.rsplit("/", 1)[-1], body))
+            if req.full_url.endswith("/responses"):
+                return FakeResponse(RESPONSES_TEXT_OK)
+            if "max_tokens" in body:
+                raise client.APIError(self.REJECT_MAX_TOKENS)
+            raise client.APIError(self.REJECT_REASONING)
+
+        warnings_seen = []
+        with mock.patch.object(client._OPENER, "open", side_effect=fake_open):
+            events = list(client.stream_chat(
+                "gpt-6-chain", [{"role": "user", "content": "x"}],
+                max_tokens=120, retries=1, route_warning=warnings_seen.append))
+        self.assertEqual([url for url, _ in calls],
+                         ["completions", "completions", "responses"])
+        self.assertNotIn("reasoning_effort", calls[-1][1])
+        self.assertEqual(calls[-1][1]["max_output_tokens"], 120)
+        self.assertEqual("".join(e["v"] for e in events if e["t"] == "text"), "你好")
+        self.assertTrue(any("/v1/responses" in w for w in warnings_seen))
+        record = models.get("deepinfer", "gpt-6-chain")
+        self.assertEqual(record.get("api"), "responses")
+        self.assertIsNone(record.get("reasoning_effort"))
+
+    def test_without_a_responses_endpoint_it_falls_back_to_reasoning_none(self):
+        """网关根本没有 /v1/responses（404）：退回 chat，才轮到「关推理」。
+        不跳过已试过的适配，这一步会在「切接口」上原地打转。"""
+        calls = []
+
+        def fake_open(req, timeout=None):
+            body = json.loads(req.data)
+            calls.append((req.full_url.rsplit("/", 1)[-1], body))
+            if req.full_url.endswith("/responses"):
+                raise client.APIError("HTTP 404: page not found", status=404)
+            if body.get("reasoning_effort") == "none":
+                return self.ok_response()
+            raise client.APIError(self.REJECT_REASONING)
+
+        with mock.patch.object(client._OPENER, "open", side_effect=fake_open):
+            events = list(client.stream_chat(
+                "gpt-6-no-responses", [{"role": "user", "content": "x"}],
+                retries=1))
+        self.assertEqual([url for url, _ in calls],
+                         ["completions", "responses", "completions", "completions"])
+        self.assertEqual(calls[-1][1].get("reasoning_effort"), "none")
+        self.assertEqual("".join(e["v"] for e in events if e["t"] == "text"), "ok")
+        self.assertEqual(
+            models.get("deepinfer", "gpt-6-no-responses").get("api"), "chat")
+
+    def test_an_unrelated_400_is_not_mistaken_for_an_adaptation(self):
+        calls = []
+
+        def fake_open(req, timeout=None):
+            calls.append(json.loads(req.data))
+            raise client.APIError("HTTP 400: messages must alternate roles")
+
+        with mock.patch.object(client._OPENER, "open", side_effect=fake_open):
+            with self.assertRaises(client.APIError):
+                list(client.stream_chat(
+                    "gpt-6-plain", [{"role": "user", "content": "x"}], retries=1))
+        self.assertEqual(len(calls), 1)
+        self.assertNotIn("reasoning_effort", calls[0])
+
+    def test_the_capability_probe_gets_the_same_parameter_fallback(self):
+        """probe 关掉的只是 temperature 的自动降级（它要亲眼看见那条拒绝）；
+        参数名不是能力，照样自动换。"""
+        calls = []
+
+        def fake_open(req, timeout=None):
+            body = json.loads(req.data)
+            calls.append(body)
+            if "max_tokens" in body:
+                raise client.APIError(self.REJECT_MAX_TOKENS)
+            return self.ok_response()
+
+        with mock.patch.object(client._OPENER, "open", side_effect=fake_open):
+            list(client.stream_chat(
+                "gpt-6-luna", [{"role": "user", "content": "x"}],
+                max_tokens=120, retries=1, temperature_fallback=False))
+        self.assertEqual(len(calls), 2)
+        self.assertEqual(calls[1].get("max_completion_tokens"), 120)
+
+    def test_the_probe_really_drops_temperature_on_its_retry(self):
+        """`_one_shot(temperature=None)` 以前干脆不传这个参数，stream_chat 的默认值
+        0.3 就又补了回去 —— 「去掉 temperature 重发」从来没去掉过。"""
+        calls = []
+
+        def fake_open(req, timeout=None):
+            body = json.loads(req.data)
+            calls.append(body)
+            if "temperature" in body:
+                raise client.APIError(
+                    "HTTP 400: Parameter 'temperature'=0.3 is not supported "
+                    "for kimi-k3 model.")
+            return FakeResponse([
+                sse(chunk(tool_calls=[{"index": 0, "id": "c1", "function": {
+                    "name": "get_file", "arguments": "{\"path\": \"/tmp/a.txt\"}"}}])),
+                "data: [DONE]\n"])
+
+        with mock.patch.object(client._OPENER, "open", side_effect=fake_open), \
+                mock.patch.object(models, "_record_probe_health"):
+            record = models.probe("deepinfer", "kimi-k3")
+        self.assertEqual(len(calls), 2)
+        self.assertNotIn("temperature", calls[1])
+        self.assertEqual(record["status"], "ok")
+        self.assertIs(record["supports_temperature"], False)
+        self.assertIs(record["supports_tools"], True)
+
+
+class ProbeEvidence(unittest.TestCase):
+    """实测结论必须有证据。2026-09-24 实跑 claude-opus-5-5：第一次回了一个**空响应**
+    （没有文本也没有工具调用），被记成「不支持工具」→ 列表里消失；第二次它好好地调了工具。
+    一次都没说话，谈不上「不会调工具」。"""
+
+    TOOL_CALL = [sse(chunk(tool_calls=[{"index": 0, "id": "c1", "function": {
+        "name": "get_file", "arguments": "{\"path\": \"/tmp/a.txt\"}"}}])),
+        "data: [DONE]\n"]
+
+    def setUp(self):
+        client._ADAPTATIONS.clear()
+        self.addCleanup(client._ADAPTATIONS.clear)
+
+    def probe(self, model, responses):
+        calls = []
+
+        def fake_open(req, timeout=None):
+            calls.append(json.loads(req.data))
+            return FakeResponse(responses[min(len(calls), len(responses)) - 1])
+
+        with mock.patch.object(client._OPENER, "open", side_effect=fake_open), \
+                mock.patch.object(models, "_record_probe_health"):
+            record = models.probe("deepinfer", model)
+        return record, calls
+
+    def test_an_empty_reply_is_retried_not_read_as_no_tools(self):
+        record, calls = self.probe("opus-empty-once", [["data: [DONE]\n"], self.TOOL_CALL])
+        self.assertEqual(len(calls), 2)
+        self.assertEqual(record["status"], "ok")
+        self.assertIs(record["supports_tools"], True)
+        self.assertGreater(calls[1]["max_tokens"], calls[0]["max_tokens"],
+                           "重试给足 token：推理模型可能把 120 个全花在思考上")
+
+    def test_two_empty_replies_are_an_error_not_a_capability(self):
+        record, calls = self.probe("opus-empty-twice", [["data: [DONE]\n"]])
+        self.assertEqual(len(calls), 2)
+        self.assertEqual(record["status"], "error")
+        self.assertIsNone(record["supports_tools"], "没有证据就不下能力结论")
+        self.assertIn("空响应", record["error"])
+
+    def test_a_content_filter_says_so(self):
+        """真实原因要看得见：Bedrock 的内容过滤返回 finish_reason=content_filter、0 token。"""
+        filtered = [sse({"choices": [{"delta": {}, "finish_reason": "content_filter"}]}),
+                    "data: [DONE]\n"]
+        record, calls = self.probe("opus-filtered", [filtered])
+        self.assertEqual(record["status"], "error")
+        self.assertIn("content_filter", record["error"])
+
+    def test_a_text_reply_without_a_tool_call_is_still_chat_only(self):
+        record, calls = self.probe("chatty", [[sse(chunk(content="我不能读文件。")),
+                                               "data: [DONE]\n"]])
+        self.assertEqual(len(calls), 1)
+        self.assertIs(record["supports_tools"], False)
+
+    def test_an_adaptation_the_gateway_rejects_is_forgotten(self):
+        """gpt-6-astra：网关要它关推理才能带工具，而它不接受关推理 —— 那条 none
+        不能一直记着，否则哪天网关支持了，记忆本身会把它挡在门外。"""
+        models.update_record("deepinfer", "astra-like", lambda rec: rec.update(
+            gateway="deepinfer", id="astra-like", reasoning_effort="none"))
+
+        def fake_open(req, timeout=None):
+            raise client.APIError(
+                "HTTP 400: Unsupported value: 'reasoning_effort' does not support "
+                "'none' with this model. Supported values are: 'low', 'medium'.")
+
+        with mock.patch.object(client._OPENER, "open", side_effect=fake_open):
+            with self.assertRaises(client.APIError):
+                list(client.stream_chat(
+                    "astra-like", [{"role": "user", "content": "x"}], retries=1))
+        self.assertIsNone(models.get("deepinfer", "astra-like").get("reasoning_effort"))
+
+
 class ProviderToolSchemaCompatibility(unittest.TestCase):
     def test_boyue_claude_omits_top_level_schema_combinators(self):
         schema = {
@@ -1156,8 +1422,60 @@ class ApiProxyIsOptInOnly(unittest.TestCase):
         「聊天走代理、列模型不走」这种更难查的半通状态。"""
         source = (Path(__file__).resolve().parents[1]
                   / "core" / "client.py").read_text(encoding="utf-8")
-        self.assertEqual(source.count("_opener_for(api_proxy()).open("), 2)
+        # 三条：chat/completions、/v1/responses（09-24 起）、/models
+        self.assertEqual(source.count("_opener_for(api_proxy(route)).open("), 3)
         self.assertNotIn("_OPENER.open(", source)
+        self.assertNotIn("api_proxy())", source,
+                         "不带 route 就读不到按网关的声明")
+
+    def test_a_per_gateway_declaration_applies_to_that_gateway_only(self):
+        """2026-09-24 实测：DeepSeek 官方口只有经代理才通、DeepInfer 只有直连才通。
+        全局一个开关两者不可兼得，所以要能只给一个网关声明代理。"""
+        deepseek = client.GatewayRoute("deepseek", "https://api.deepseek.com/v1", ())
+        deepinfer = client.GatewayRoute("deepinfer", "https://gw.invalid/v1", ())
+        env = {"ZYLAB_API_PROXY_DEEPSEEK": "http://proxy.invalid:3128/"}
+        with mock.patch.dict(os.environ, env):
+            os.environ.pop("ZYLAB_API_PROXY", None)
+            self.assertEqual(client.api_proxy(deepseek), "http://proxy.invalid:3128/")
+            self.assertIsNone(client.api_proxy(deepinfer))
+            self.assertIsNone(client.api_proxy(), "没有 route 时只认全局那一条")
+
+    def test_the_per_gateway_declaration_wins_over_the_global_one(self):
+        route = client.GatewayRoute("deepseek", "https://api.deepseek.com/v1", ())
+        other = client.GatewayRoute("boyue", "https://gw.invalid/v1", ())
+        env = {"ZYLAB_API_PROXY": "http://global.invalid:1/",
+               "ZYLAB_API_PROXY_DEEPSEEK": "http://proxy.invalid:3128/"}
+        with mock.patch.dict(os.environ, env):
+            self.assertEqual(client.api_proxy(route), "http://proxy.invalid:3128/")
+            self.assertEqual(client.api_proxy(other), "http://global.invalid:1/")
+
+    def test_a_malformed_per_gateway_value_falls_back_like_the_global_one(self):
+        route = client.GatewayRoute("deepseek", "https://api.deepseek.com/v1", ())
+        with mock.patch.dict(os.environ, {"ZYLAB_API_PROXY_DEEPSEEK": "yes"}):
+            os.environ.pop("ZYLAB_API_PROXY", None)
+            self.assertIsNone(client.api_proxy(route))
+
+    def test_list_models_sends_through_the_gateways_own_proxy(self):
+        """不只是 api_proxy 算对了 —— 取目录那一跳真的交给了这个网关的 opener。"""
+        route = client.GatewayRoute("deepseek", "https://api.deepseek.com/v1",
+                                    ("DEEPSEEK_API_KEY",))
+        seen = []
+
+        class Opener:
+            def open(self, req, timeout=None):
+                seen.append((req.full_url, timeout))
+                return io.BytesIO(b'{"data": [{"id": "deepseek-chat"}]}')
+
+        env = {"ZYLAB_API_PROXY_DEEPSEEK": "http://proxy.invalid:3128/",
+               "DEEPSEEK_API_KEY": "sk-test"}
+        with mock.patch.dict(os.environ, env), \
+                mock.patch.object(client, "_opener_for",
+                                  side_effect=lambda proxy: (
+                                      seen.append(proxy) or Opener())):
+            listing = client.list_models(route=route, timeout=7)
+        self.assertEqual([m["id"] for m in listing], ["deepseek-chat"])
+        self.assertEqual(seen[0], "http://proxy.invalid:3128/")
+        self.assertEqual(seen[1], ("https://api.deepseek.com/v1/models", 7))
 
 
 class InitDiagnosticNeverPrintsProxyCredentials(unittest.TestCase):

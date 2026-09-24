@@ -39,6 +39,18 @@ class FakeAgent:
     def mark_route_explicit(self):
         self.explicit_marks += 1
 
+    # 与 core.agent.Agent 同一对方法：推理强度按「网关 + 模型」记
+    def effort_for(self, gateway=None, model=None):
+        return getattr(self, "efforts", {}).get(
+            (gateway or self.gateway, model or self.model))
+
+    def set_effort(self, gateway, model, effort):
+        efforts = self.__dict__.setdefault("efforts", {})
+        if effort:
+            efforts[(gateway, model)] = effort
+        else:
+            efforts.pop((gateway, model), None)
+
 
 class LiveCommandTests(unittest.TestCase):
     def setUp(self):
@@ -200,28 +212,239 @@ class LiveCommandTests(unittest.TestCase):
         self.assertIn("下一轮切到 new-model@boyue", output.getvalue())
         self.assertIn("下一轮切到 deepinfer", output.getvalue())
 
-    def test_model_refresh_uses_selected_gateway_without_route_change(self):
+    @staticmethod
+    def catalog(gateway, count, added=()):
+        return {"count": count, "gateway": gateway, "added": list(added),
+                "delisted": [], "restored": [], "changed": bool(added)}
+
+    def test_model_refresh_covers_every_keyed_gateway_without_route_change(self):
+        """以前只刷当前网关：用户加了官方 DeepSeek 的 key、当前网关是 boyue，
+        DeepSeek 的目录就从来没被取过（2026-09-24）。"""
+        catalogs = {"deepinfer": self.catalog("deepinfer", 17),
+                    "deepseek": self.catalog("deepseek", 2)}
         with (
-                mock.patch.object(
-                    CLI.M, "refresh_catalog",
-                    return_value={"count": 17, "gateway": "deepinfer",
-                                  "added": [], "delisted": [], "restored": [],
-                                  "changed": False}) as fetch,
+                mock.patch.object(CLI.M, "keyed_gateways",
+                                  return_value=["deepinfer", "deepseek"]),
+                mock.patch.object(CLI.M, "refresh_catalog",
+                                  side_effect=catalogs.__getitem__) as fetch,
+                mock.patch.object(CLI.M, "probe_targets", return_value=[]),
+                mock.patch.object(CLI.M, "due_for_probe", return_value=[]),
                 mock.patch.object(CLI.tui, "supported", return_value=False),
                 contextlib.redirect_stdout(io.StringIO()) as output,
         ):
             CLI.cmd_model(self.session, "refresh")
 
-        fetch.assert_called_once_with("deepinfer")
+        self.assertEqual([c.args for c in fetch.call_args_list],
+                         [("deepinfer",), ("deepseek",)])
         self.assertEqual(self.session.route_selection(), (
             "old-model", "deepinfer"))
         self.assertIn("deepinfer 已刷新，17 个模型", output.getvalue())
+        self.assertIn("deepseek 已刷新，2 个模型", output.getvalue())
         self.assertNotIn("models", CLI.REGISTRY)
         self.assertNotIn("/models", CLI.COMMANDS)
         canonical, entry, exit_alias = CLI.resolve_command("models")
         self.assertEqual(canonical, "models")
         self.assertIsNone(entry)
         self.assertFalse(exit_alias)
+
+    def test_model_refresh_probes_exactly_what_is_due(self):
+        """用户定：刷新时自动实测一次。实测的是「该测的旗舰」里还没测过/到期的，
+        不是整个目录 —— 已测过的不重复花钱。"""
+        probed = []
+
+        def probe(gateway, model):
+            probed.append((gateway, model))
+            return {"gateway": gateway, "id": model, "status": "ok",
+                    "supports_tools": True, "first_token_s": 1.2}
+
+        with (
+                mock.patch.object(CLI.M, "keyed_gateways", return_value=["boyue"]),
+                mock.patch.object(CLI.M, "refresh_catalog",
+                                  return_value=self.catalog(
+                                      "boyue", 240, added=["gpt-6-sol"])),
+                mock.patch.object(CLI.M, "probe_targets",
+                                  return_value=["gpt-6-sol", "gpt-5.6-sol"]) as targets,
+                mock.patch.object(CLI.M, "due_for_probe",
+                                  return_value=["gpt-6-sol"]) as due,
+                mock.patch.object(CLI.M, "probe", side_effect=probe),
+                mock.patch.object(CLI.tui, "supported", return_value=False),
+                contextlib.redirect_stdout(io.StringIO()) as output,
+        ):
+            CLI.cmd_model(self.session, "refresh")
+
+        # 偏好家族来自会话的 settings（这里没配 → None = 出厂六家）
+        targets.assert_called_once_with("boyue", preferred=None)
+        due.assert_called_once_with(
+            "boyue", ["gpt-6-sol", "gpt-5.6-sol"], revalidate=False)
+        self.assertEqual(probed, [("boyue", "gpt-6-sol")])
+        self.assertIn("gpt-6-sol", output.getvalue())
+        self.assertIn("可用", output.getvalue())
+
+    def test_an_unreachable_gateway_does_not_stop_the_others(self):
+        """够不着的网关报一行、给出**只针对它**的代理出路，其余网关照常刷新与实测。"""
+        def refresh(gateway):
+            if gateway == "deepseek":
+                raise CLI.M.CatalogError(
+                    "deepseek 取模型列表失败: <urlopen error timed out>",
+                    unreachable=True)
+            return self.catalog(gateway, 240)
+
+        with (
+                mock.patch.object(CLI.M, "keyed_gateways",
+                                  return_value=["deepseek", "boyue"]),
+                mock.patch.object(CLI.M, "refresh_catalog", side_effect=refresh),
+                mock.patch.object(CLI.M, "probe_targets", return_value=["glm-5.3"]),
+                mock.patch.object(CLI.M, "due_for_probe", return_value=["glm-5.3"]),
+                mock.patch.object(CLI.M, "probe", return_value={
+                    "status": "ok", "supports_tools": True}) as probe,
+                mock.patch.object(CLI.tui, "supported", return_value=False),
+                contextlib.redirect_stdout(io.StringIO()) as output,
+        ):
+            CLI.cmd_model(self.session, "refresh")
+
+        text = output.getvalue()
+        self.assertIn("deepseek 取模型列表失败", text)
+        self.assertIn("ZYLAB_API_PROXY_DEEPSEEK", text)
+        self.assertIn("boyue 已刷新，240 个模型", text)
+        probe.assert_called_once_with("boyue", "glm-5.3")
+
+    def test_a_rejected_key_gets_no_proxy_advice(self):
+        """401 说明请求**到了**网关：该查的是 key，不是路由。"""
+        with (
+                mock.patch.object(CLI.M, "keyed_gateways", return_value=["deepseek"]),
+                mock.patch.object(CLI.M, "refresh_catalog", side_effect=CLI.M.CatalogError(
+                    "deepseek 取模型列表失败: HTTP Error 401: Unauthorized")),
+                mock.patch.object(CLI.tui, "supported", return_value=False),
+                contextlib.redirect_stdout(io.StringIO()) as output,
+        ):
+            CLI.cmd_model(self.session, "refresh")
+
+        self.assertIn("401", output.getvalue())
+        self.assertNotIn("API_PROXY", output.getvalue())
+
+    def run_temperature(self, rest, accepts=True):
+        with (
+                mock.patch.object(CLI.M, "supports_temperature",
+                                  return_value=accepts),
+                contextlib.redirect_stdout(io.StringIO()) as output,
+        ):
+            CLI.cmd_temperature(self.session, rest)
+        return output.getvalue()
+
+    def test_temperature_is_settable_for_the_session(self):
+        self.agent.temperature = 0.3
+        text = self.run_temperature("0.7")
+        self.assertEqual(self.agent.temperature, 0.7)
+        self.assertIn("本会话生效", text)
+        self.assertIn("0.7", self.run_temperature(""))
+
+    def test_temperature_rejects_values_outside_0_to_2(self):
+        self.agent.temperature = 0.3
+        for bad in ("3", "-0.1", "warm", "nan"):
+            with self.subTest(value=bad):
+                text = self.run_temperature(bad)
+                self.assertEqual(self.agent.temperature, 0.3)
+                self.assertIn("0–2", text)
+
+    def test_temperature_save_writes_the_user_default(self):
+        self.agent.temperature = 0.3
+        self.run_temperature("0.9")
+        with mock.patch.object(CLI.CFG, "write_user",
+                               return_value="settings.json") as write:
+            text = self.run_temperature("save")
+        write.assert_called_once_with({"temperature": 0.9})
+        self.assertIn("已存为默认", text)
+        self.assertEqual(self.session.cfg["temperature"], 0.9)
+
+    def test_temperature_default_restores_the_setting(self):
+        self.session.cfg["temperature"] = 0.5
+        self.run_temperature("1.2")
+        self.run_temperature("default")
+        self.assertEqual(self.agent.temperature, 0.5)
+
+    def test_temperature_says_when_the_model_will_not_receive_it(self):
+        self.agent.temperature = 0.3
+        text = self.run_temperature("", accepts=False)
+        self.assertIn("不接受 temperature", text)
+
+    def test_temperature_setting_parsing(self):
+        self.assertEqual(CLI.CFG.temperature_policy({}), 0.3)
+        self.assertEqual(CLI.CFG.temperature_policy({"temperature": 1}), 1.0)
+        for bad in ("hot", 5, -1, True, None):
+            with self.subTest(value=bad):
+                self.assertEqual(
+                    CLI.CFG.temperature_policy({"temperature": bad}), 0.3)
+
+    # ---- /model 的第三级：推理强度（用户 2026-09-24：「effort 并到 /model 中」）----
+    RESPONSES_RECORD = {"status": "ok", "supports_tools": True, "api": "responses",
+                        "effort_options": ["low", "medium", "high"],
+                        "effort_default": "medium"}
+    CHAT_RECORD = {"status": "ok", "supports_tools": True}
+
+    def open_picker(self, record, picks):
+        rows = [{"gateway": "deepinfer", "id": "gpt-6-sol", "family": "OpenAI",
+                 "status": "ok", "supports_tools": True}]
+        with (
+                mock.patch.object(CLI.tui, "supported", return_value=True),
+                mock.patch.object(CLI.M, "default_picker_rows", return_value=rows),
+                mock.patch.object(CLI.M, "get", return_value=dict(record)),
+                mock.patch.object(CLI, "_gateway_key_label", return_value=""),
+                mock.patch.object(CLI, "_picker_gateway_counts", return_value=""),
+                mock.patch.object(self.session, "pick", create=True,
+                                  side_effect=lambda rows_, **kw: picks.pop(0)(rows_))
+                as pick,
+                contextlib.redirect_stdout(io.StringIO()) as output,
+        ):
+            CLI.cmd_model(self.session, "")
+        return pick, output.getvalue()
+
+    def test_picking_a_responses_model_opens_the_effort_menu(self):
+        pick, text = self.open_picker(self.RESPONSES_RECORD, [
+            lambda rows: rows[0],
+            lambda rows: next(r for r in rows if r["effort"] == "high")])
+        self.assertEqual(pick.call_count, 2)
+        labels = [row["label"] for row in pick.call_args_list[1].args[0]]
+        self.assertEqual(labels, ["模型默认（medium）   ← 当前", "low", "medium", "high"],
+                         "选项就是网关给的那几个，外加「模型默认」；还没选过时当前就是默认")
+        self.assertEqual(self.agent.effort_for("deepinfer", "gpt-6-sol"), "high")
+        self.assertIn("推理 high", text)
+
+    def test_a_chat_model_gets_no_effort_menu(self):
+        pick, text = self.open_picker(self.CHAT_RECORD, [lambda rows: rows[0]])
+        self.assertEqual(pick.call_count, 1)
+        self.assertNotIn("推理", text)
+
+    def test_escape_in_the_effort_menu_keeps_what_was_there(self):
+        self.agent.set_effort("deepinfer", "gpt-6-sol", "low")
+        pick, text = self.open_picker(self.RESPONSES_RECORD, [
+            lambda rows: rows[0], lambda rows: None])
+        self.assertEqual(self.agent.effort_for("deepinfer", "gpt-6-sol"), "low")
+        self.assertIn("推理 low", text)
+        labels = [row["label"] for row in pick.call_args_list[1].args[0]]
+        self.assertIn("low   ← 当前", labels)
+
+    def type_model(self, rest, record):
+        with (
+                mock.patch.object(CLI.M, "get", return_value=dict(record)),
+                mock.patch.object(CLI.M, "where", return_value=["deepinfer"]),
+                contextlib.redirect_stdout(io.StringIO()) as output,
+        ):
+            CLI.cmd_model(self.session, rest)
+        return output.getvalue()
+
+    def test_a_typed_effort_is_checked_against_the_gateways_options(self):
+        text = self.type_model("gpt-6-sol@deepinfer ultra", self.RESPONSES_RECORD)
+        self.assertIn("low / medium / high", text)
+        self.assertEqual(self.session.route_selection(), ("old-model", "deepinfer"),
+                         "不合法就不切换")
+        text = self.type_model("gpt-6-sol@deepinfer high", self.RESPONSES_RECORD)
+        self.assertEqual(self.agent.effort_for("deepinfer", "gpt-6-sol"), "high")
+        self.assertIn("推理 high", text)
+
+    def test_a_typed_effort_on_a_chat_model_says_it_will_not_be_sent(self):
+        text = self.type_model("glm-5.3@deepinfer high", self.CHAT_RECORD)
+        self.assertIn("不会发出去", text)
+        self.assertIsNone(self.agent.effort_for("deepinfer", "glm-5.3"))
 
     def test_auto_toggle_changes_only_future_permission_decisions(self):
         with mock.patch.object(sys.stdin, "isatty", return_value=False):
@@ -356,7 +579,8 @@ class SubcommandMenuCoverageTests(unittest.TestCase):
 
     def test_menu_items_are_all_really_accepted(self):
         pairs = (("/recap", CLI.cmd_recap), ("/goal", CLI.cmd_goal),
-                 ("/model", CLI.cmd_model))
+                 ("/model", CLI.cmd_model),
+                 ("/temperature", CLI.cmd_temperature))
         for name, function in pairs:
             accepted = self.actions_in_source(function)
             entry = CLI.COMMAND_SUBCOMMANDS.get(name) or {}
@@ -390,7 +614,8 @@ class SubcommandMenuCoverageTests(unittest.TestCase):
         for name, function in (("/recap", CLI.cmd_recap),
                                ("/goal", CLI.cmd_goal),
                                ("/model", CLI.cmd_model),
-                               ("/agents", CLI.cmd_agents)):
+                               ("/agents", CLI.cmd_agents),
+                               ("/temperature", CLI.cmd_temperature)):
             accepted = self.actions_in_source(function)
             accepted -= {"help", "?"} | self.NOT_SUBCOMMANDS.get(name, set())
             listed = {

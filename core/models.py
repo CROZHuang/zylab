@@ -27,7 +27,9 @@ import os
 from . import wincompat
 import tempfile
 import time
+import urllib.error
 import uuid
+from collections import namedtuple
 from contextlib import contextmanager
 from datetime import datetime, timezone
 from pathlib import Path
@@ -54,9 +56,9 @@ GATEWAY_CATALOG_REVISION = {
 
 # 能力目录只缓存会拿来编码的模型家族，避免 Boyue 的 400+ 条原始目录淹没 UI。
 #
-# DeepInfer 目录很小，后面的 picker 会保留其中所有实测可用模型；Boyue 则在
-# BOYUE_DEFAULT_MODELS 再做一层旗舰精选。模型来源和调用路由是两回事：
-# 这里的 OpenAI / Anthropic 仍然是经 Boyue 转发，不冒充官方直连。
+# 小目录（DeepInfer、厂商官方口）的 picker 保留其中所有实测可用模型；大目录
+# （Boyue 这类聚合网关）再用通用的名字解析只取偏好家族的最新旗舰。模型来源和
+# 调用路由是两回事：经 Boyue 转发的 OpenAI / Anthropic 不冒充官方直连。
 FAMILIES = {
     "OpenAI":    ("gpt-", "openai/"),
     "Anthropic": ("claude-", "anthropic/"),
@@ -74,25 +76,264 @@ _NON_CHAT = (
     "embedding", "reranker", "rerank", "-voice", "image-gen", "image-",
     "audio", "realtime", "deep-research", "moderation", "-tts", "whisper")
 
-# DeepInfer 当前工作集在 Boyue 上的直接或同家族候选。这里只保存 Boyue 的
-# 真实 endpoint id；多个 DeepInfer 变体可以复用一个 Boyue endpoint（例如
-# glm-5.2-1m -> glm-5.2、kimi-k3-256k -> kimi-k3），不制造服务端不存在的别名。
-# 精确权重/版本是否一致仍需 A/B；这个列表只表达“允许出现在 /model picker”。
-BOYUE_DEEPINFER_CANDIDATE_MODELS = (
-    "qwen3.6-35b-a3b",
-    "deepseek-v4-flash", "deepseek-v4-flash-0731",
-    "deepseek-v4-pro", "deepseek-v4-pro-0813",
-    "glm-5.2", "glm-5.3",
-    "kimi-k2.6", "kimi-k3",
-    "qwen3.8-max",
-)
+# /model 列表在**大目录**上只取偏好家族的最新旗舰（用户 2026-09-24 定：
+# gpt / claude / deepseek / kimi / glm / qwen；settings 的 preferred_families 可改）。
+#
+# **不按公司手写规则。** 用户原话：「万一哪一天我给了你别的公司的 api 呢？难道要我
+# 返回 cc 再修一遍？」—— 所以这里只有一个**通用的名字解析**：把 id 拆成
+#   词干（gpt）+ 版本号前的词（opus）+ 版本号（5-5）+ 版本号后的词（sol / pro / 0813）
+# 再用一小组**跨厂商通用**的词决定它是不是「一个独立的旗舰」：
+#   - 硬排除：同一个模型的另一种调法 —— thinking / high / responses / vl / coder /
+#     128k / fp8 / `:free` …；
+#   - 软偏好：同一版本里，正式版胜过 preview/beta，不带日期的别名胜过带日期的快照
+#     （0731、20250929）。没有版本号、只有日期的（qwen-plus-1220）是别名的快照，不列；
+#   - 视觉版（4.6v、-vision、-vl）是家族里**单独的一条线**，与文本线各自取最新
+#     （用户 2026-09-24：「glm 有个视觉模型的，那个要加上，deepseek 的也是」）；
+#   - 逐级回退：最新一代里有 API 命名的旗舰就只看它们；只有开源尺寸（27b、a3b）的
+#     取最大的；只剩低档（mini / flash / turbo …）的才列低档。
+# 然后按「家族 → 产品线 → 版本」比新旧：家族 = 词干 + 版本号前的词（claude-opus 与
+# claude-sonnet 各自发版、互不压制），家族里只看**最新一代**（主版本号），这一代的每条
+# 产品线各取最新可用的一个。
+#
+# 2026-09-24 对真实的 408 条 Boyue 目录跑，偏好六家选出 gpt-6-{sol,luna,astra}、
+# claude-opus-5-5、claude-sonnet-5、deepseek-v4-pro、kimi-k3、glm-5.3、qwen3.8-max、
+# qwen3.7-plus，外加视觉线 glm-5v-turbo、deepseek-v4-flash-vision-exp、qwen3-vl-plus
+# —— 与人工挑的一致（tests/test_models.py 用这份真实目录钉住）。
+DEFAULT_PREFERRED_FAMILIES = ("gpt", "claude", "deepseek", "kimi", "glm", "qwen")
 
-# /model 的 Boyue 工作集：当前世代旗舰 + DeepInfer 候选路由。
-# 是否真正出现仍由 capability probe 决定；目录存在但失败/无工具的型号不会展示。
-BOYUE_DEFAULT_MODELS = (
-    "gpt-5.6-sol", "gpt-5.6-terra",
-    "claude-opus-5", "claude-sonnet-5", "claude-sonnet-4-6",
-) + BOYUE_DEEPINFER_CANDIDATE_MODELS
+# 同一个模型的另一种调法：思考/推理开关、接口形态、模态、专项、安全分类。
+_MODE_WORDS = frozenset((
+    "thinking", "think", "reasoning", "responses", "realtime", "audio", "tts",
+    "asr", "transcribe", "search", "embedding", "embeddings", "embed", "rerank",
+    "reranker", "moderation", "guard", "image", "ocr", "omni",
+    "video", "speech", "voice", "t2i", "t2v", "i2v", "code", "coder", "codex",
+    "math", "distill", "highspeed", "base"))
+# 看图的版本：不是「另一种调法」，是一条独立的线（`4.6v` 的 v 也算）。
+_VISION_WORDS = frozenset(("vision", "vl", "multimodal", "v"))
+# 推理力度档。只在版本号**之后**才算调法（gpt-5.5-high）；在前面是家族名
+# （mistral-medium-3 是一个型号，不是 gpt-5.5 的中档）。
+_EFFORT_WORDS = frozenset(("high", "low", "medium", "xhigh", "none", "minimal"))
+_STAGE_WORDS = frozenset((
+    "preview", "beta", "alpha", "exp", "experimental", "rc", "test", "latest"))
+# 同一代里的低档。
+_LOWER_TIER_WORDS = frozenset((
+    "mini", "nano", "lite", "flash", "flashx", "air", "airx", "small", "tiny",
+    "micro", "turbo", "fast"))
+# 不改变「是哪个模型」的词：开源权重的对话版都叫 -instruct。
+_NEUTRAL_WORDS = frozenset(("instruct", "chat", "it"))
+_SIZE_TOKEN = re.compile(r"(a?)(\d+(?:\.\d+)?)([bt])")    # 27b、a3b（激活）、1t
+_CONTEXT_TOKEN = re.compile(r"\d+[km]")                    # 128k、1m
+_QUANT_TOKEN = re.compile(r"fp\d+|bf16|int\d+|awq|gptq|gguf|w\d+a\d+")
+_VERSION = r"\d{1,2}(?:\.\d{1,2})*"
+_BARE_VERSION = re.compile(_VERSION)                       # 6、5.6
+_SERIES_VERSION = re.compile(rf"([a-z])({_VERSION})([a-z]*)")   # v4、k2.6、m3
+_SUFFIXED_VERSION = re.compile(rf"({_VERSION})([a-z]+)")        # 4o、5v
+_STEM_VERSION = re.compile(rf"([a-z]+?)({_VERSION})([a-z]*)")   # qwen3.8、o3
+
+
+ModelName = namedtuple("ModelName", (
+    "stem", "family", "line", "version", "date", "size",
+    "stage", "variant", "lower", "vision"))
+
+
+def parse_model_name(model_id):
+    """把一个模型 id 拆成可以比新旧的几部分；空 id 返回 None。
+
+    只认名字的**形状**，不认任何一家公司：新厂商只要按行业通行的写法起名
+    （词干 + 版本号 + 档位词），不用改这里就能被正确归类。
+    """
+    name = str(model_id or "").strip().lower().rsplit("/", 1)[-1]
+    name, tagged, _tag = name.partition(":")      # OpenRouter 式 `:free`
+    tokens = [token for token in re.split(r"[-_\s]+", name) if token]
+    if not tokens:
+        return None
+    head, tail = tokens[0], tokens[1:]
+    stem = re.match(r"[a-z]*", head).group(0) or head
+    family_words, words, dates = [], [], []
+    version = None
+    size = 0.0
+    variant = bool(tagged)
+    attached = _STEM_VERSION.fullmatch(head)
+    if attached:                                  # qwen3.8-max：版本号贴在词干上
+        stem, version = attached.group(1), attached.group(2)
+        if attached.group(3):
+            words.append(attached.group(3))
+        post = tail
+    else:
+        post = []
+        index = 0
+        while index < len(tail):
+            token = tail[index]
+            if token.isdigit() and len(token) >= 3:
+                # 日期（2411、20250929、2025-01-25）：连同紧跟的 1–2 位数字段一起吞掉，
+                # 不然 `2025-01-25` 的 `01-25` 会被读成版本号 1.25。
+                dates.append(int(token))
+                index += 1
+                while index < len(tail) and re.fullmatch(r"\d{1,2}", tail[index]):
+                    dates.append(int(tail[index]))
+                    index += 1
+                continue
+            sized = _SIZE_TOKEN.fullmatch(token)
+            if sized:
+                if not sized.group(1):
+                    size = max(size, _size_value(sized))
+                index += 1
+                continue
+            if _CONTEXT_TOKEN.fullmatch(token) or _QUANT_TOKEN.fullmatch(token):
+                variant = True
+                index += 1
+                continue
+            if _BARE_VERSION.fullmatch(token):
+                parts, after = [token], index + 1
+                while (after < len(tail) and len(parts) < 3
+                       and re.fullmatch(r"\d{1,2}", tail[after])):
+                    parts.append(tail[after])
+                    after += 1
+                version, post = ".".join(parts), tail[after:]
+                break
+            series = _SERIES_VERSION.fullmatch(token)
+            if series:
+                version = series.group(2)
+                words.append(series.group(1) + ":")
+                if series.group(3):
+                    words.append(series.group(3))
+                post = tail[index + 1:]
+                break
+            suffixed = _SUFFIXED_VERSION.fullmatch(token)
+            if suffixed:
+                version = suffixed.group(1)
+                words.append(suffixed.group(2))
+                post = tail[index + 1:]
+                break
+            family_words.append(token)
+            index += 1
+    stage = lower = vision = False
+    kept_family = []
+    for word in family_words:
+        if word in _VISION_WORDS:
+            vision = True
+        elif word in _MODE_WORDS or word in _STAGE_WORDS:
+            variant = True
+        else:
+            if word in _LOWER_TIER_WORDS:
+                lower = True
+            kept_family.append(word)
+    for token in post:
+        sized = _SIZE_TOKEN.fullmatch(token)
+        if token.isdigit():
+            dates.append(int(token))
+        elif sized:
+            if not sized.group(1):
+                size = max(size, _size_value(sized))
+        elif (_CONTEXT_TOKEN.fullmatch(token) or _QUANT_TOKEN.fullmatch(token)
+              or token in _MODE_WORDS or token in _EFFORT_WORDS
+              or (token.startswith("no") and token[2:] in _MODE_WORDS)):
+            variant = True
+        elif token in _STAGE_WORDS:
+            stage = True
+        elif token in _NEUTRAL_WORDS:
+            continue
+        else:
+            words.append(token)
+    line = []
+    for word in words:
+        if word in _VISION_WORDS:
+            vision = True
+            continue
+        if word in _MODE_WORDS:
+            variant = True
+        if word in _LOWER_TIER_WORDS:
+            lower = True
+        line.append(word)
+    parsed_version = (tuple(int(part) for part in version.split("."))
+                      if version is not None else ())
+    family = "-".join([stem] + kept_family)
+    return ModelName(stem, family, tuple(line), parsed_version, tuple(dates),
+                     size, stage, variant, lower, vision)
+
+
+def _size_value(match):
+    value = float(match.group(2))
+    return value * 1000 if match.group(3) == "t" else value
+
+
+def _representative_key(model_id, parsed):
+    """同一个家族、产品线、版本里挑谁：正式版 > 预览版，别名 > 快照，大尺寸 > 小尺寸。"""
+    return (parsed.stage, bool(parsed.date), -parsed.size,
+            tuple(-part for part in parsed.date), "/" in model_id,
+            len(model_id), model_id)
+
+
+def _preferred_stems(parsed_by_id, preferred):
+    """目录里出现了偏好家族就只看它们；一个都没有（比如只接了别家的网关）就看全部。"""
+    present = {parsed.stem for parsed in parsed_by_id.values()}
+    wanted = {str(name).strip().lower() for name in (
+        DEFAULT_PREFERRED_FAMILIES if preferred is None else preferred)}
+    matched = {stem for stem in present if stem in wanted}
+    for model_id, parsed in parsed_by_id.items():
+        if (family_of(model_id) or "").lower() in wanted:
+            matched.add(parsed.stem)              # 也认公司名：OpenAI、Anthropic
+    return matched or present
+
+
+def _newest_flagships(ids, *, depth, stems=None, preferred=None):
+    """{(家族, 是否视觉线): [id…]}：最新一代里每条产品线最新的 depth 个版本。"""
+    parsed_by_id = {}
+    for model_id in dict.fromkeys(str(i) for i in ids):
+        parsed = parse_model_name(model_id)
+        if parsed and not parsed.variant and parsed.version:
+            parsed_by_id[model_id] = parsed
+    if stems is None:
+        stems = _preferred_stems(parsed_by_id, preferred)
+    tracks = {}
+    for model_id, parsed in parsed_by_id.items():
+        if parsed.stem in stems:
+            tracks.setdefault((parsed.family, parsed.vision), []).append(
+                (model_id, parsed))
+    picked = {}
+    for track, members in tracks.items():
+        generation = max(parsed.version[0] for _, parsed in members)
+        newest = [m for m in members if m[1].version[0] == generation]
+
+        def tier_of(parsed):                      # 0 旗舰 · 1 开源尺寸 · 2 低档
+            return 2 if parsed.lower else (1 if parsed.size else 0)
+
+        tier = min(tier_of(parsed) for _, parsed in newest)
+        wanted_lines = {parsed.line for _, parsed in newest
+                        if tier_of(parsed) == tier}
+        lines = {}
+        for model_id, parsed in members:
+            if parsed.line not in wanted_lines or tier_of(parsed) != tier:
+                continue
+            versions = lines.setdefault(parsed.line, {})
+            held = versions.get(parsed.version)
+            if held is None or (_representative_key(model_id, parsed)
+                                < _representative_key(*held)):
+                versions[parsed.version] = (model_id, parsed)
+        chosen = []
+        for versions in lines.values():
+            for version in sorted(versions, reverse=True)[:depth]:
+                chosen.append(versions[version][0])
+        picked[track] = chosen
+    return picked
+
+
+# 目录多大就不再「全列」。DeepInfer 16 条、官方 DeepSeek 2 条，全列正合适；
+# Boyue 408 条、OpenRouter 数百条，全列就是用户说的「不现实」。阈值取在两者之间。
+LARGE_CATALOG = 40
+# 每条产品线实测最新的几个版本：最新的那个坏了，列表才有上一个可退。
+FLAGSHIP_PROBE_DEPTH = 2
+
+
+def flagship_candidates(ids, preferred=None, depth=FLAGSHIP_PROBE_DEPTH):
+    """该自动实测的旗舰：偏好家族最新一代每条产品线最新的 depth 个版本。"""
+    return [model_id for chosen in _newest_flagships(
+                ids, depth=depth, preferred=preferred).values()
+            for model_id in chosen]
+
+
+def is_large_catalog(size):
+    return int(size or 0) > LARGE_CATALOG
 
 
 # /workflow 的默认席位是质量白名单，不做模糊“同家族随便挑一个”降级。
@@ -302,6 +543,26 @@ def workflow_seat_routes(seat, rows=None, *, route_allowed=None):
     return selected
 
 
+def is_chat_model(model_id):
+    """名字上看不出「不是对话模型」就算是 —— 真能不能用交给实测。
+
+    以前这里是 FAMILIES 白名单：不在名单里的公司，模型在**刷新目录时**就被丢掉。
+    用户问的正是这个：「万一哪一天我给了你别的公司的 api 呢？」—— 接上 Mistral 的
+    key，目录里一条都不会进来。
+    """
+    name = str(model_id or "").lower()
+    return bool(name) and not any(token in name for token in _NON_CHAT)
+
+
+def display_family(model_id):
+    """列表「家族」那一栏：认识的用中文/公司名，不认识的就用名字的词干。"""
+    known = family_of(model_id)
+    if known:
+        return known
+    parsed = parse_model_name(model_id)
+    return parsed.stem if parsed and parsed.stem else "other"
+
+
 def family_of(model_id):
     """返回模型所属家族名；不属于白名单则返回 None。"""
     i = (model_id or "").lower()
@@ -311,11 +572,6 @@ def family_of(model_id):
         if any(t in i for t in toks):
             return fam
     return None
-
-
-def is_excluded(model_id):
-    """不在支持的模型家族内，或属于非对话用途，一律排除。"""
-    return family_of(model_id) is None
 
 
 def _now():
@@ -654,12 +910,26 @@ def clear_unavailable_if_marked(gateway, model):
     return None
 
 
+class CatalogError(RuntimeError):
+    """取目录失败。`unreachable` 为真表示请求根本没到达网关（超时、连不上），
+    这时该提示的是路由（代理），不是 key。"""
+
+    def __init__(self, message, *, unreachable=False):
+        super().__init__(message)
+        self.unreachable = unreachable
+
+
 def refresh_catalog(gateway):
     """抓目录、并进缓存、返回这次的变化。fetch_catalog 是它的计数版封装。"""
     try:
         listing = client.list_models(gateway=gateway)
     except Exception as e:
-        raise RuntimeError(f"{gateway} 取模型列表失败: {e}") from None
+        unreachable = (
+            isinstance(e, (TimeoutError, OSError))
+            and not isinstance(e, urllib.error.HTTPError))
+        raise CatalogError(
+            f"{gateway} 取模型列表失败: {e}",
+            unreachable=unreachable) from None
 
     changes = {"added": [], "delisted": [], "restored": []}
 
@@ -667,7 +937,7 @@ def refresh_catalog(gateway):
         seen = set()
         for m in listing:
             mid = m.get("id")
-            if not mid or (gateway != "deepinfer" and is_excluded(mid)):
+            if not mid or (gateway != "deepinfer" and not is_chat_model(mid)):
                 continue
             k = key(gateway, mid)
             seen.add(k)
@@ -734,6 +1004,81 @@ def fetch_catalog(gateway):
 
 # ------------------------------------------------------------------ 实测
 
+# 推理强度的可选值**来自网关**，不是写死的名单。要问两步（2026-09-24 实测 Boyue）：
+#  1. 发一个不存在的值 → 拒绝原话列出**接口层**的通用枚举（none … max 七个），
+#     但这不是这个模型收的：gpt-6-astra 就不收 none；
+#  2. 从两头挨个试枚举里的值（最常被个别模型拒的是 none / max）：一旦被拒，拒绝原话
+#     里就是**这个模型**的完整清单（「'none' is not supported with the 'gpt-6-astra-…'
+#     model. Supported values are: 'low', …」）；全都收下，就是整份枚举。
+# 第 2 步被收下的那几次是真推理，所以输出上限压到 16 token；每个模型只问一次。
+_EFFORT_PROBE_VALUE = "zylab-effort-probe"
+
+
+def parse_supported_values(message):
+    """从「… Supported values are: 'a', 'b', and 'c'.」里取出 ['a', 'b', 'c']。"""
+    text = str(message or "")
+    marker = text.find("Supported values are")
+    if marker < 0:
+        return []
+    return re.findall(r"'([^']+)'", text[marker:].split("\n", 1)[0])
+
+
+def _try_effort(gateway, model, value, timeout):
+    """发一次最小请求：('ok', None) 收下了；('rejected', [可选值]) 拒了并列出清单；
+    ('error', None) 别的失败（网络、限流…）。"""
+    try:
+        for _ in client.stream_chat(
+                model, [{"role": "user", "content": "ok"}], gateway=gateway,
+                max_tokens=16, temperature=None, effort=value,
+                effort_fallback=False, retries=1, timeout=timeout,
+                route_explicit=True):
+            pass
+    except client.APIError as exc:
+        options = [option for option in parse_supported_values(exc)
+                   if option != _EFFORT_PROBE_VALUE]
+        return ("rejected", options) if options else ("error", None)
+    return "ok", None
+
+
+def _edges_first(values):
+    """[a, b, c, d, e] → [a, e, b, d, c]：两头的值最可能被个别模型拒。"""
+    remaining, ordered = list(values), []
+    while remaining:
+        ordered.append(remaining.pop(0))
+        if remaining:
+            ordered.append(remaining.pop())
+    return ordered
+
+
+def discover_effort_options(gateway, model, timeout=30):
+    """问网关这个模型收哪些推理强度；问出来就记进能力表并返回，问不出返回 None。"""
+    outcome, enum = _try_effort(gateway, model, _EFFORT_PROBE_VALUE, timeout)
+    if outcome != "rejected":
+        return None               # 不校验这个值、或者别的失败：给不出选项
+    options = list(enum)
+    for value in _edges_first(enum):
+        outcome, listed = _try_effort(gateway, model, value, timeout)
+        if outcome == "rejected":
+            options = listed
+            break
+        if outcome == "error":
+            return None           # 半路失败就别记一个半截的清单
+    update_record(gateway, model, lambda rec: rec.update(effort_options=options))
+    return options
+
+
+class EmptyProbeResponse(RuntimeError):
+    """实测请求成功了，但模型什么都没回（没有文本、没有工具调用）。
+
+    这不是能力证据：2026-09-24 实跑 claude-opus-5-5，第一次空响应被记成「不支持
+    工具」、从列表里消失，第二次它好好地调了工具。
+    """
+
+
+# 空响应重试时给的输出额度：推理模型可能把 120 个 token 全花在思考上。
+_PROBE_RETRY_MAX_TOKENS = 1024
+
+
 def probe(gateway, model, timeout=90):
     """对单个模型做一次真实请求，测出：能不能调通、支不支持工具、收不收
     temperature、首 token 多久。结果写缓存。
@@ -770,6 +1115,24 @@ def probe(gateway, model, timeout=90):
                 attempt_count += timing["attempts"]
             else:
                 raise
+        if not calls and not str(_txt or "").strip():
+            # 一次都没说话，谈不上「不会调工具」：给足额度再问一次。
+            calls, _txt, timing = _one_shot(
+                model, temperature=(0.3 if temp_ok else None),
+                timeout=timeout, gateway=gateway,
+                route_warning=route_warnings.append,
+                max_tokens=_PROBE_RETRY_MAX_TOKENS)
+            attempt_count += timing["attempts"]
+            if not calls and not str(_txt or "").strip():
+                reason = timing.get("finish_reason") or "?"
+                # 2026-09-24 实测 claude-opus-5-5 经 Boyue/Bedrock：不带 temperature
+                # 的同一条实测提示词，三次里两次 content_filter、0 token，一次正常调工具。
+                hint = ("——网关的内容过滤拦下了实测提示词，下次刷新会再测；"
+                        "也可以直接 /model 切过去用"
+                        if reason == "content_filter" else "")
+                raise EmptyProbeResponse(
+                    f"空响应（finish_reason={reason}）：两次都既没有文本也没有"
+                    f"工具调用，不作能力结论{hint}")
         rec.update({
             "status": "ok",
             "supports_tools": bool(calls),
@@ -783,6 +1146,12 @@ def probe(gateway, model, timeout=90):
             "probe_attempts": max(1, attempt_count),
             "probe_timing_version": 2,
             "temperature_retried": temperature_retried,
+            # 没指定强度时网关回报的就是模型默认（2026-09-24 实测两个 gpt-6 都是 medium）
+            **({"effort_default": timing["effort"]} if timing.get("effort") else {}),
+            # 这次真的发出去了：之前「明文 HTTP 未授权」留下的拦截标记作废，
+            # 否则界面会对一次成功的实测说「未实测」（2026-09-24 qwen3.8-max）。
+            "probe_blocked": None,
+            "probe_blocked_at": None,
             "error": None,
             "error_kind": None,
             "http_status": None,
@@ -812,6 +1181,7 @@ def probe(gateway, model, timeout=90):
         capability_rejection = _is_tool_capability_rejection(e)
         rec.update({
             "status": "error", "error": str(e)[:200],
+            "probe_blocked": None, "probe_blocked_at": None,
             "supports_tools": (
                 False if capability_rejection
                 else existing.get("supports_tools")),
@@ -848,16 +1218,25 @@ def probe(gateway, model, timeout=90):
 
     saved = update_record(gateway, model, lambda old: old.update(rec))
     _record_probe_health(saved)
+    if saved.get("status") == "ok" and saved.get("api") == "responses":
+        # 走 Responses 的模型能选推理强度：顺手问出它收哪些值（校验失败不耗 token）。
+        try:
+            discover_effort_options(gateway, model)
+            saved = get(gateway, model)
+        except Exception:                             # noqa: BLE001
+            pass                  # 问不出来不影响实测结论
     return saved
 
 
 def _one_shot(model, temperature, timeout, gateway=None,
-              route_warning=None):
+              route_warning=None, max_tokens=120):
     calls, txt = [], ""
+    finish_reason = None
+    used_effort = None
     phases = client.RequestPhases()
     kw = {
         "tools": _PROBE_TOOL,
-        "max_tokens": 120,
+        "max_tokens": max_tokens,
         "timeout": timeout,
         "phases": phases,
         # Probe 必须亲自观察 temperature rejection；若让 client 静默降级，
@@ -875,8 +1254,10 @@ def _one_shot(model, temperature, timeout, gateway=None,
         "route_explicit": True,
         "route_warning": route_warning,
     }
-    if temperature is not None:
-        kw["temperature"] = temperature
+    # **必须显式传**，包括 None：stream_chat 的 temperature 默认值是 0.3，只在「没
+    # 传」时生效 —— 以前 None 时干脆不传，于是「去掉 temperature 重发」又把 0.3 带了
+    # 回去（2026-09-24 实跑 kimi-k3，第二次仍报 `'temperature'=0.3 is not supported`）。
+    kw["temperature"] = temperature
     try:
         for ev in client.stream_chat(
                 model, _PROBE_MSG, gateway=gateway, **kw):
@@ -884,6 +1265,9 @@ def _one_shot(model, temperature, timeout, gateway=None,
                 calls = ev["v"]
             elif ev["t"] == "text":
                 txt += ev["v"]
+            elif ev["t"] == "done":
+                finish_reason = ev.get("reason")
+                used_effort = ev.get("effort")
     except Exception as exc:
         # 把内部 transient/parameter attempts 带回 probe 记录；不改变异常类型。
         try:
@@ -907,6 +1291,8 @@ def _one_shot(model, temperature, timeout, gateway=None,
             latest.get("first_delta_at"), latest.get("started_at")),
         "response_s": elapsed(
             latest.get("ended_at"), latest.get("started_at")),
+        "finish_reason": finish_reason,
+        "effort": used_effort,
     }
     return calls, txt, timing
 
@@ -936,11 +1322,63 @@ def where(model):
     return [g for g in GATEWAY_PRIORITY if key(g, model) in db]
 
 
-# 批量探测与 /model 使用同一个工作集，避免刷新后重新探测大量历史别名。
-FLAGSHIPS = {
-    "deepinfer": None,          # 目录很小：全部探测
-    "boyue": list(BOYUE_DEFAULT_MODELS),
-}
+def _catalog_size(gateway, db=None, rows=None):
+    """网关目录有多大：上次刷新时在册的条数与缓存里的记录数取大者。"""
+    db = load() if db is None else db
+    meta = (db.get("catalogs") or {}).get(gateway) or {}
+    listed = int(meta.get("listed") or meta.get("count") or 0)
+    if rows is None:
+        rows = probed_rows(gateway)
+    return max(listed, len(rows))
+
+
+def probe_targets(gateway, preferred=None):
+    """/model refresh 与 --probe-all 该实测谁 —— 与 /model 列表同一套规则。
+
+    小目录全部实测（列表也全列）；大目录只测偏好公司每条产品线最新的几个版本，
+    列表也只从这些里挑。两边用同一条规则，才不会出现「列表想显示、却从没被测过」。
+    """
+    rows = probed_rows(gateway)
+    if is_large_catalog(_catalog_size(gateway, rows=rows)):
+        # 大目录只从**还在目录里**的挑：已下架的旗舰不会是「最新」，测它只是每次
+        # 刷新都白花一次请求（2026-09-24 实跑：claude-fable-5 / 5-1 下架后仍被测）。
+        listed = [row["id"] for row in rows if row.get("listed") is not False]
+        return flagship_candidates(listed, preferred=preferred)
+    # 小目录照旧全测，含已下架的：成员资格会来回抖动，列不出 ≠ 调不通。
+    return [row["id"] for row in rows]
+
+
+def due_for_probe(gateway, ids, *, revalidate=True):
+    """ids 里哪些该实测：没有记录的、健康度判定到期的（含目录指纹变了）。
+
+    `revalidate=False` 给 /model refresh 用：**本机实测过能用的不重测**。用户定的是
+    「新旗舰刷新时实测一次」，重新验证老模型是 /model check 的事 —— 2026-09-24 实跑，
+    成功有效期（24 h）一过，一次刷新把 DeepInfer 上 20 个早就能用的模型全重测了一遍，
+    整条命令 204 s。seed 里的记录是别人机器上的观测，不算「本机测过」。
+    """
+    db = load()["models"]
+    facade = _health_facade()
+    health_by_model = {
+        row["model"]: row
+        for row in facade.list_health(gateway=gateway, limit=10_000)
+    }
+    decision_now = time.time()
+    due = []
+    for mid in ids:
+        rec = db.get(key(gateway, mid))
+        if (not revalidate and rec and rec.get("status") == "ok"
+                and rec.get("supports_tools") is not None
+                and not rec.get("seeded")):
+            continue
+        if rec:
+            decision = model_health.probe_decision(
+                health_by_model.get(mid),
+                catalog_fingerprint=rec.get("catalog_fingerprint"),
+                now=decision_now)
+            if not decision.due:
+                continue
+        due.append(mid)
+    return due
 
 
 def probe_many(gateway, ids=None, on_result=None, skip_probed=True):
@@ -949,29 +1387,12 @@ def probe_many(gateway, ids=None, on_result=None, skip_probed=True):
     每个模型一次真实请求，逐个写缓存 —— 中途中断也不丢已测结果。
     """
     if ids is None:
-        ids = FLAGSHIPS.get(gateway)
-    if ids is None:
-        ids = [r["id"] for r in probed_rows(gateway)]
-    db = load()["models"]
-    health_by_model = {}
-    if skip_probed:
-        facade = _health_facade()
-        health_by_model = {
-            row["model"]: row
-            for row in facade.list_health(gateway=gateway, limit=10_000)
-        }
-        decision_now = time.time()
-    ok = bad = skipped = 0
-    for mid in ids:
-        rec = db.get(key(gateway, mid))
-        if skip_probed and rec:
-            decision = model_health.probe_decision(
-                health_by_model.get(mid),
-                catalog_fingerprint=rec.get("catalog_fingerprint"),
-                now=decision_now)
-            if not decision.due:
-                skipped += 1
-                continue
+        ids = probe_targets(gateway)
+    ids = list(ids)
+    todo = due_for_probe(gateway, ids) if skip_probed else ids
+    skipped = len(ids) - len(todo)
+    ok = bad = 0
+    for mid in todo:
         r = probe(gateway, mid)
         if r.get("status") == "ok":
             ok += 1
@@ -992,7 +1413,7 @@ def probed_rows(gateway=None, only_ok=False):
             continue
         if only_ok and record.get("status") != "ok":
             continue
-        if route != "deepinfer" and is_excluded(record.get("id", "")):
+        if route != "deepinfer" and not is_chat_model(record.get("id", "")):
             continue
         row = dict(record)
         row["family"] = (
@@ -1003,30 +1424,93 @@ def probed_rows(gateway=None, only_ok=False):
     return rows
 
 
-def default_picker_rows(rows=None):
-    """返回 /model 工作集：DeepInfer 可用项（含仅聊天）+ Boyue 旗舰。"""
-    candidates = probed_rows() if rows is None else [dict(row) for row in rows]
+def _flagship_rows(rows, preferred=None):
+    """大目录：偏好家族最新一代里每条产品线**最新的、实测可用的**那一个。
+
+    「最新的」坏了就退到上一个能用的 —— 不能让一家整个消失。2026-09-24 的现场：
+    名单里的 claude-opus-5 / claude-sonnet-5 在 Boyue 上实测 error，于是列表里
+    一个 Claude 都没有。只看实测可用（status ok 且确认能调工具）：刚刷进来、还没
+    实测的新旗舰不冒充可用，由 /model refresh 的自动实测把它们测出来。
+
+    偏好家族按**整个目录**判定而不是按「可用的」判定：一家暂时全挂不该让列表
+    突然换成「所有家族」。
+    """
+    ids = [str(row.get("id") or "") for row in rows]
+    parsed = {model_id: parse_model_name(model_id) for model_id in ids}
+    stems = _preferred_stems(
+        {k: v for k, v in parsed.items() if v and not v.variant and v.version},
+        preferred)
+    usable = {}
+    for row in rows:
+        if row.get("status") == "ok" and row.get("supports_tools") is True:
+            usable[str(row.get("id") or "")] = row
+    picked = _newest_flagships(usable, depth=1, stems=stems)
+    return [usable[model_id] for chosen in picked.values()
+            for model_id in chosen]
+
+
+def default_picker_rows(rows=None, *, catalog_sizes=None, preferred=None):
+    """返回 /model 工作集。
+
+    小目录（DeepInfer、厂商官方口）：所有实测可用的，含明确「仅聊天」的（picker
+    灰显）；大目录（Boyue 这类聚合网关）：偏好公司的最新旗舰。未知能力、实测失败
+    的都不冒充可用项；不认识的网关名不列。
+
+    `catalog_sizes` 给显式传入的 rows 用（{网关: 目录条数}）；缺省时按 rows 里
+    该网关的条数算。rows 缺省时读缓存，目录大小也从缓存的刷新记录里取。
+    """
+    if rows is None:
+        rows = probed_rows()
+        db = load()
+        sizes = {gateway: _catalog_size(gateway, db=db, rows=[])
+                 for gateway in (db.get("catalogs") or {})}
+    else:
+        rows = [dict(row) for row in rows]
+        sizes = {}
+    sizes.update(catalog_sizes or {})
+    groups = {}
+    for row in rows:
+        groups.setdefault(str(row.get("gateway") or ""), []).append(row)
     selected = []
-    for row in candidates:
-        if row.get("status") != "ok":
+    for route, group in groups.items():
+        if route not in client.GATEWAYS:
             continue
-        route = str(row.get("gateway") or "")
-        model = str(row.get("id") or "")
-        tool_capability = row.get("supports_tools")
-        if route == "deepinfer":
-            # DeepInfer 目录很小：明确可聊天但无 tool_call 的模型也保留，
-            # 由 picker 灰显；未知能力仍不冒充可用。
-            if tool_capability not in (True, False):
-                continue
-        elif route == "boyue":
-            if (model not in BOYUE_DEFAULT_MODELS
-                    or tool_capability is not True):
-                continue
+        size = max(int(sizes.get(route) or 0), len(group))
+        if is_large_catalog(size):
+            chosen = _flagship_rows(group, preferred)
         else:
-            continue
-        row["family"] = family_of(model) or row.get("family") or "other"
-        selected.append(row)
+            # 小目录：明确可聊天但无 tool_call 的模型也保留，由 picker 灰显；
+            # 未知能力仍不冒充可用。
+            chosen = [row for row in group
+                      if row.get("status") == "ok"
+                      and row.get("supports_tools") in (True, False)]
+        for row in chosen:
+            row["family"] = display_family(row.get("id", ""))
+            selected.append(row)
     return selected
+
+
+def keyed_gateways():
+    """配了 key、也有 endpoint 的网关 —— /model refresh 要刷的就是它们。
+
+    以前只刷「当前网关」：用户往 keys.env 里加了官方 DeepSeek 的 key，而当前网关
+    是 boyue，于是 DeepSeek 的目录从来没被取过，列表里自然一条都没有。
+    """
+    names = []
+    for name in client.GATEWAYS:
+        try:
+            route = client.route_for(name)
+        except ValueError:
+            continue
+        if not route.base:
+            continue
+        try:
+            found = client.key_status(route).get("found")
+        except OSError:
+            found = False
+        if found:
+            names.append(name)
+    return names
 
 
 # 上下文探测的基础阶梯。必须从小到大逐档走，并在最后一档仍成功时继续扩张；

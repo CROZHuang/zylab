@@ -65,6 +65,9 @@ def default_model(gateway=None):
             continue
         return name
     return MODEL
+# 对话请求的 temperature 出厂值；用户用 settings 的 temperature 或 /temperature 改。
+# 以前这里是两处写死的 0.3，settings 里那个 "temperature" 从来没接上。
+DEFAULT_TEMPERATURE = 0.3
 # 网关标称 1,049k；实测 200,130 tokens 的输入照单全收（2026-08-21 二分探测）。
 # 注意：早先记录的「80,131 可用上下文」是错的 —— 那是某次请求的实际用量，不是上限。
 # 兜底值；真实上限按模型从网关查（见 Agent.set_model）。
@@ -600,8 +603,10 @@ class Agent:
                  repo_map_context="",
                  architecture_context="", context_capsule=None,
                  load_user_md=None, load_project_md=None, load_skills=None,
-                 goal_context=""):
+                 goal_context="", temperature=None):
         self.confirm = confirm or (lambda n, a: True)
+        self.temperature = (
+            DEFAULT_TEMPERATURE if temperature is None else float(temperature))
         self.gateway = client.route_for(gateway).name
         # 必须在 set_model 之前 —— set_model 会用它算阈值。
         self.compact_override = compact_at
@@ -1343,6 +1348,26 @@ class Agent:
             return None
         return self._execute_compaction_plan(
             plan, before_provider_attempt=before_provider_attempt)
+
+    def effort_for(self, gateway=None, model=None):
+        """用户在 /model 里给这个路由选的推理强度；None = 模型默认。"""
+        mapping = getattr(self, "effort_by_route", None) or {}
+        return mapping.get((str(gateway or self.gateway), str(model or self.model)))
+
+    def set_effort(self, gateway, model, effort):
+        """按「网关 + 模型」记：换回这个模型时还是它，换到别的模型不串过去。"""
+        mapping = self.__dict__.setdefault("effort_by_route", {})
+        route_key = (str(gateway), str(model))
+        if effort:
+            mapping[route_key] = str(effort)
+        else:
+            mapping.pop(route_key, None)
+
+    def chat_temperature(self):
+        """这一轮对话请求发什么 temperature：用户选的值；模型不接受就不发（None）。"""
+        if not models_db.supports_temperature(self.gateway, self.model):
+            return None
+        return getattr(self, "temperature", DEFAULT_TEMPERATURE)
 
     def compaction_fallback_route(self):
         """摘要用的备选模型：席位池里第一个不是当前模型、且电路没断的。
@@ -2341,11 +2366,11 @@ class Agent:
                         projection.report["omitted_ranges"],
                 })
             try:
-                temp = 0.3 if models_db.supports_temperature(
-                    self.gateway, self.model) else None
+                temp = self.chat_temperature()
                 for event in provider(
                         self.model, projection.messages, tools=offered,
                         temperature=temp, cancel=request_action.cancel,
+                        effort=self.effort_for(),
                         gateway=self.gateway,
                         trace_context=self._trace_context(
                             request_id, turn_id, projection=projection,
@@ -3668,11 +3693,11 @@ class Agent:
                 },
             })
             try:
-                temp = 0.3 if models_db.supports_temperature(
-                    self.gateway, self.model) else None
+                temp = self.chat_temperature()
                 for ev in client.stream_chat(
                         self.model, projection.messages, tools=offered,
                         temperature=temp, cancel=cancel,
+                        effort=self.effort_for(),
                         gateway=self.gateway,
                         trace_context=self._trace_context(
                             request_id, turn_id, projection=projection,

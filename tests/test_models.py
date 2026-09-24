@@ -281,6 +281,41 @@ class ProbeTests(unittest.TestCase):
         self.assertEqual(record["context_probe_requests"], 3)
         self.assertNotIn("context", record)
 
+    def test_refresh_probes_only_what_is_new_or_failing(self):
+        """刷新时的自动实测：本机测过能用的不重测；新出现的、seed 里别人测的要测。"""
+        models.update_record("boyue", "known-ok", lambda rec: rec.update(
+            gateway="boyue", id="known-ok", status="ok", supports_tools=True))
+        models.update_record("boyue", "brand-new", lambda rec: rec.update(
+            gateway="boyue", id="brand-new", status="listed"))
+        seed = {"boyue/seeded-ok": {"gateway": "boyue", "id": "seeded-ok",
+                                    "status": "ok", "supports_tools": True}}
+        ids = ["known-ok", "brand-new", "seeded-ok"]
+        with mock.patch.object(models, "_seed_models", return_value=seed):
+            self.assertEqual(models.due_for_probe("boyue", ids, revalidate=False),
+                             ["brand-new", "seeded-ok"])
+            self.assertEqual(models.due_for_probe("boyue", ids), ids,
+                             "--probe-all / probe_many 照旧按健康度重验")
+
+    def test_a_successful_probe_clears_a_stale_transport_block(self):
+        """2026-09-24 实跑：qwen3.8-max 实测成功，屏幕却说「未实测：明文 HTTP 未授权」——
+        09-08 一次非交互探测留下的 probe_blocked 从来没被清掉。"""
+        models.update_record("boyue", "qwen3.8-max", lambda rec: rec.update(
+            gateway="boyue", id="qwen3.8-max", status="ok",
+            probe_blocked="insecure_transport",
+            probe_blocked_at="2026-09-08T00:00:00+00:00"))
+
+        def fake_stream(*_args, **_kwargs):
+            yield {"t": "tool", "v": [{"id": "c1", "name": "get_file",
+                                       "args": "{}"}]}
+            yield {"t": "done", "reason": "tool_calls", "usage": {}}
+
+        with mock.patch.object(models.client, "stream_chat",
+                               side_effect=fake_stream):
+            record = models.probe("boyue", "qwen3.8-max")
+        self.assertEqual(record["status"], "ok")
+        self.assertIsNone(record.get("probe_blocked"))
+        self.assertIsNone(record.get("probe_blocked_at"))
+
     def test_context_probe_freshness_never_skips_capability_probe(self):
         models.update_record(
             "boyue", "needs-capability",
@@ -355,49 +390,20 @@ class PickerTests(unittest.TestCase):
 
         selected = {
             (item["gateway"], item["id"])
-            for item in models.default_picker_rows(candidates)
+            for item in models.default_picker_rows(
+                candidates, catalog_sizes={"boyue": 225})
         }
+        # Boyue 每条产品线只留最新可用的一个：sonnet-5 在，sonnet-4-6 让位；
+        # qwen 这一代有 max 与 plus 两条线，各留一个。
         self.assertEqual(selected, {
             ("deepinfer", "minimax-m2.7"),
             ("deepinfer", "future-model"),
             ("deepinfer", "intern-s1"),
             ("boyue", "gpt-5.6-sol"),
             ("boyue", "claude-sonnet-5"),
-            ("boyue", "claude-sonnet-4-6"),
             ("boyue", "qwen3.8-max"),
+            ("boyue", "qwen3.7-plus"),
         })
-
-    def test_deepinfer_boyue_candidates_are_model_picker_defaults(self):
-        expected = {
-            "qwen3.6-35b-a3b",
-            "deepseek-v4-flash", "deepseek-v4-flash-0731",
-            "deepseek-v4-pro", "deepseek-v4-pro-0813",
-            "glm-5.2", "glm-5.3",
-            "kimi-k2.6", "kimi-k3",
-            "qwen3.8-max",
-        }
-        self.assertEqual(
-            set(models.BOYUE_DEEPINFER_CANDIDATE_MODELS), expected)
-        self.assertEqual(
-            len(models.BOYUE_DEEPINFER_CANDIDATE_MODELS), len(expected))
-
-        rows = [{
-            "gateway": "boyue",
-            "id": model,
-            "status": "ok",
-            "supports_tools": True,
-        } for model in expected]
-        rows.append({
-            "gateway": "boyue",
-            "id": "qwen3.7-plus",
-            "status": "ok",
-            "supports_tools": True,
-        })
-
-        selected = {
-            row["id"] for row in models.default_picker_rows(rows)
-        }
-        self.assertEqual(selected, expected)
 
     def test_workflow_lineup_uses_only_curated_flagships_and_leaves_gaps(self):
         def row(gateway, model, *, status="ok", tools=True):
@@ -496,6 +502,274 @@ class PickerTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+CATALOGS = Path(__file__).resolve().parent / "fixtures" / "model_catalogs_20260924.json"
+
+
+class FlagshipsFromNameShape(unittest.TestCase):
+    """/model 在大目录上列**偏好家族的最新旗舰** —— 由通用的名字解析决定，不按公司写死。
+
+    历史：这里原来是一份手写的 id 名单（`BOYUE_DEFAULT_MODELS`），每个月都在过期 ——
+    gpt-6-sol、claude-opus-5-5 进了 Boyue 目录，列表还停在 gpt-5.6、一个 Claude 都没有；
+    同一份名单还决定实测谁，新旗舰连实测都轮不到。第二版改成按公司写的六条正则，
+    用户一句话否掉：「万一哪一天我给了你别的公司的 api 呢？难道要我返回 cc 再修一遍？」
+
+    所以这里的夹具有两类：**真实目录**（2026-09-24 三个网关的 /models 原样，
+    不是从规则反推的例子），以及**一家谁也没写过规则的虚构公司**。
+    """
+
+    BOYUE_LISTED = 408
+
+    @classmethod
+    def setUpClass(cls):
+        import json
+        cls.catalogs = json.loads(CATALOGS.read_text(encoding="utf-8"))
+
+    @staticmethod
+    def row(gateway, model, *, status="ok", tools=True):
+        return {"gateway": gateway, "id": model,
+                "status": status, "supports_tools": tools}
+
+    def shown(self, rows, gateway="boyue", size=BOYUE_LISTED, preferred=None):
+        return {r["id"] for r in models.default_picker_rows(
+                    rows, catalog_sizes={gateway: size}, preferred=preferred)
+                if r["gateway"] == gateway}
+
+    # ---- 真实目录 -----------------------------------------------------------
+    def test_the_real_catalog_yields_what_a_person_would_pick(self):
+        """408 条真实 Boyue 目录（假设全部实测可用）→ 偏好六家各自的最新旗舰 + 视觉线。"""
+        rows = [self.row("boyue", m) for m in self.catalogs["boyue"]]
+        self.assertEqual(self.shown(rows), {
+            "gpt-6-sol", "gpt-6-luna", "gpt-6-astra",
+            "claude-opus-5-5", "claude-sonnet-5",
+            "deepseek-v4-pro", "deepseek-v4-flash-vision-exp",
+            "kimi-k3",
+            "glm-5.3", "glm-5v-turbo",
+            "qwen3.8-max", "qwen3.7-plus", "qwen3-vl-plus"})
+
+    def test_every_real_id_parses(self):
+        for gateway, ids in self.catalogs.items():
+            if gateway.startswith("_"):
+                continue
+            for model_id in ids:
+                with self.subTest(gateway=gateway, model=model_id):
+                    self.assertIsNotNone(models.parse_model_name(model_id))
+
+    # ---- 别的公司：没人给它写过规则 ------------------------------------------
+    def test_a_company_nobody_wrote_a_rule_for_is_handled_the_same_way(self):
+        """用户：「万一哪一天我给了你别的公司的 api 呢？」—— 一家虚构的公司，
+        只要按行业通行的写法起名，就和六家走同一套规则。"""
+        rows = [self.row("boyue", m) for m in (
+            "zeta-2-ultra", "zeta-3-pro", "zeta-3.5-pro", "zeta-3.5-mini",
+            "zeta-3.5-pro-thinking", "zeta-3.5-pro-20260801", "zeta-3.5-vl")]
+        self.assertEqual(self.shown(rows, preferred=["zeta"]),
+                         {"zeta-3.5-pro", "zeta-3.5-vl"})
+
+    def test_a_gateway_without_any_preferred_family_lists_every_family(self):
+        """只接了别家的聚合网关：偏好一个都不在，就列所有家族，而不是给一张空表。"""
+        rows = [self.row("openrouter", m) for m in (
+            "mistralai/mistral-large-3", "mistralai/mistral-large-2",
+            "x-ai/grok-4.7", "x-ai/grok-4.6", "meta-llama/llama-4-maverick")]
+        self.assertEqual(self.shown(rows, "openrouter", size=300), {
+            "mistralai/mistral-large-3", "x-ai/grok-4.7",
+            "meta-llama/llama-4-maverick"})
+
+    def test_preferences_are_data_not_code(self):
+        """偏好来自 settings：写词干或公司名都行。"""
+        rows = [self.row("boyue", m) for m in self.catalogs["boyue"]]
+        self.assertEqual(self.shown(rows, preferred=["Anthropic"]),
+                         {"claude-opus-5-5", "claude-sonnet-5"})
+        self.assertEqual(self.shown(rows, preferred=["grok"]),
+                         {"grok-4.7", "x-ai/grok-2-vision-1212"})
+
+    def test_refresh_keeps_models_of_a_company_nobody_listed(self):
+        """目录层以前按手写的家族白名单丢模型：接上 Mistral 的 key，一条都进不来。"""
+        listing = [{"id": "mistral-large-3"}, {"id": "codestral-2508"},
+                   {"id": "text-embedding-3-large"}]
+        with tempfile.TemporaryDirectory() as tmp, \
+                mock.patch.object(models, "CACHE", Path(tmp) / "models.json"), \
+                mock.patch.object(models.client, "list_models",
+                                  return_value=listing):
+            result = models.refresh_catalog("mistral")
+        self.assertEqual(sorted(result["added"]),
+                         ["codestral-2508", "mistral-large-3"],
+                         "非对话模型（embedding）照旧不进目录")
+
+    # ---- 新旧与产品线 --------------------------------------------------------
+    def test_each_line_moves_to_its_newest_generation(self):
+        """gpt-6 出来之后，这一家只看第 6 代：还没有 6 代的 terra 让位。"""
+        rows = [self.row("boyue", m) for m in (
+            "gpt-5.6-sol", "gpt-5.6-terra", "gpt-6-sol", "gpt-6-luna")]
+        self.assertEqual(self.shown(rows), {"gpt-6-sol", "gpt-6-luna"})
+
+    def test_families_release_independently(self):
+        """claude-opus 与 claude-sonnet 各自发版：sonnet 先到 6，opus-5-5 仍在。"""
+        rows = [self.row("boyue", m) for m in (
+            "claude-opus-5", "claude-opus-5-5",
+            "claude-sonnet-4-6", "claude-sonnet-6")]
+        self.assertEqual(self.shown(rows), {"claude-opus-5-5", "claude-sonnet-6"})
+
+    def test_a_lower_tier_never_hides_the_flagship_of_its_generation(self):
+        rows = [self.row("boyue", m) for m in (
+            "deepseek-v4-pro", "deepseek-v4-flash", "deepseek-v4.1-flash",
+            "glm-5.3", "glm-5.3-flash", "glm-5-turbo")]
+        self.assertEqual(self.shown(rows), {"deepseek-v4-pro", "glm-5.3"})
+
+    def test_the_newest_generation_wins_even_when_it_is_only_a_lower_tier(self):
+        """钉住一个取舍：「最新一代」优先于「档位」。glm-5v-turbo 是 GLM 第 5 代唯一的
+        视觉模型；先看档位就会列出更旧的 glm-4.6v，那正是用户抱怨的「不是最新」。"""
+        rows = [self.row("boyue", m) for m in (
+            "glm-4.5v", "glm-4.6v", "glm-5v-turbo", "glm-5.3")]
+        self.assertEqual(self.shown(rows), {"glm-5.3", "glm-5v-turbo"})
+
+    def test_vision_models_are_a_line_of_their_own(self):
+        """用户：「glm 有个视觉模型的，那个要加上，deepseek 的也是」。视觉线与文本线
+        各自取最新，互不压制：文本已到第 5 代，第 4 代的 glm-4.6v 仍是 GLM 最新的视觉版。"""
+        rows = [self.row("boyue", m) for m in (
+            "deepseek-v4-pro", "deepseek-v4-flash",
+            "deepseek-v4-flash-vision-exp", "deepseek-v4-flash-vision-exp-responses",
+            "glm-5.3", "glm-4.6v", "glm-4.5v")]
+        self.assertEqual(self.shown(rows), {
+            "deepseek-v4-pro", "deepseek-v4-flash-vision-exp",
+            "glm-5.3", "glm-4.6v"})
+
+    def test_every_preferred_company_gets_its_newest_flagship(self):
+        rows = [self.row("boyue", m) for m in (
+            "deepseek-v4-pro", "deepseek-v4-pro-0813",
+            "deepseek-v4-flash", "deepseek-v4.1-flash",
+            "glm-5.2", "glm-5.3", "kimi-k2.6", "kimi-k3", "kimi/kimi-k3",
+            "qwen3.7-max", "qwen3.8-max", "qwen3.8-flash")]
+        self.assertEqual(self.shown(rows), {
+            "deepseek-v4-pro", "glm-5.3", "kimi-k3", "qwen3.8-max"})
+
+    def test_a_non_preferred_company_is_not_listed(self):
+        rows = [self.row("boyue", "MiniMax-M3"), self.row("boyue", "glm-5.3")]
+        self.assertEqual(self.shown(rows), {"glm-5.3"})
+
+    # ---- 可用性 --------------------------------------------------------------
+    def test_a_broken_newest_falls_back_to_the_newest_that_works(self):
+        """最新的那个实测失败时，列表给出上一个能用的 —— 不能让这家整个消失。
+
+        现场就是这样：名单里的 claude-opus-5 / claude-sonnet-5 在 boyue 上实测 error，
+        于是列表里**一个 Claude 都没有**。
+        """
+        rows = [self.row("boyue", "gpt-6-sol", status="error"),
+                self.row("boyue", "gpt-5.6-sol")]
+        self.assertEqual(self.shown(rows), {"gpt-5.6-sol"})
+
+    def test_an_unprobed_newest_is_not_shown(self):
+        """只列**实测过能用**的：刷新刚加入、还没实测的新旗舰要先测（见 auto-probe）。"""
+        rows = [self.row("boyue", "gpt-6-sol", status="listed", tools=None),
+                self.row("boyue", "gpt-5.6-sol")]
+        self.assertEqual(self.shown(rows), {"gpt-5.6-sol"})
+
+    # ---- 变体、快照、日期 ----------------------------------------------------
+    def test_another_way_of_calling_a_model_is_never_a_flagship(self):
+        rows = [self.row("boyue", m) for m in (
+            "claude-opus-5-5-thinking", "kimi-k2.7-code", "gpt-oss-120b",
+            "deepseek-v4-flash-responses", "glm-5.2-1m", "qwen3.8-27b-fp8",
+            "nex-agi/nex-n2.5-pro:free", "gpt-5.5-high")]
+        self.assertEqual(self.shown(rows, preferred=[]), set())
+
+    def test_a_plain_name_beats_its_snapshot_and_its_preview(self):
+        rows = [self.row("boyue", m) for m in (
+            "gpt-6-sol", "gpt-6-sol-2026-09-01",
+            "deepseek-v4-pro", "deepseek-v4-pro-beta",
+            "qwen3.8-max", "qwen3.8-max-0902")]
+        self.assertEqual(self.shown(rows),
+                         {"gpt-6-sol", "deepseek-v4-pro", "qwen3.8-max"})
+
+    def test_a_snapshot_stands_in_when_it_is_all_there_is(self):
+        """豆包的型号全带日期（doubao-seed-2-1-pro-260628）：没有不带日期的别名时，
+        快照就代表这个版本 —— 否则整家都会被筛空。"""
+        rows = [self.row("volc", m) for m in (
+            "doubao-seed-2-0-pro-260215", "doubao-seed-2-1-pro-260628",
+            "doubao-seed-2-1-turbo-260628")]
+        with mock.patch.dict(models.client.GATEWAYS, {"volc": {}}):
+            self.assertEqual(self.shown(rows, "volc", size=80),
+                             {"doubao-seed-2-1-pro-260628"})
+
+    def test_a_date_is_never_read_as_a_version(self):
+        """`claude-opus-20250929` 不能被当成「第 20250929 版」压过所有真版本；
+        `qwen-plus-2025-01-25` 的 `01-25` 也不能被读成 1.25 版。"""
+        rows = [self.row("boyue", m) for m in (
+            "claude-opus-20250929", "claude-opus-5-5",
+            "qwen-plus-2025-01-25", "qwen-plus-1220")]
+        self.assertEqual(self.shown(rows), {"claude-opus-5-5"})
+
+    # ---- 其它网关 ----------------------------------------------------------
+    def test_an_official_vendor_gateway_is_listed(self):
+        """用户往 keys.env 里加了官方 DeepSeek key，列表里却一条 DeepSeek 都没有：
+        原来的 `default_picker_rows` 对 deepinfer / boyue 之外的网关一律 `continue`。
+
+        夹具取自 2026-09-24 官方 /models 的**真实返回**（就这两条）。
+        """
+        rows = [self.row("deepseek", m) for m in self.catalogs["deepseek"]]
+        self.assertEqual(self.shown(rows, "deepseek", size=2),
+                         {"deepseek-flash", "deepseek-v4-pro"})
+
+    def test_an_unknown_gateway_is_still_dropped(self):
+        self.assertEqual(
+            models.default_picker_rows([self.row("no-such-gw", "gpt-6-sol")]), [])
+
+    def test_a_small_catalog_lists_everything_that_works(self):
+        """小目录（DeepInfer 16 条）照旧全列：非偏好公司的、明确仅聊天的都在；
+        没测过的、测挂的不冒充可用。偏好家族的筛选只用在「全列不现实」的大目录上。"""
+        rows = [self.row("deepinfer", "minimax-m2.7"),
+                self.row("deepinfer", "future-model"),
+                self.row("deepinfer", "intern-s1", tools=False),
+                self.row("deepinfer", "glm-5.3-flash", status="listed", tools=None),
+                self.row("deepinfer", "kimi-k3", status="error")]
+        self.assertEqual(self.shown(rows, "deepinfer", size=16),
+                         {"minimax-m2.7", "future-model", "intern-s1"})
+
+    def test_the_same_rows_are_curated_once_the_catalog_is_large(self):
+        rows = [self.row("deepinfer", "minimax-m2.7"),
+                self.row("deepinfer", "glm-5.3")]
+        self.assertEqual(self.shown(rows, "deepinfer", size=16),
+                         {"minimax-m2.7", "glm-5.3"})
+        self.assertEqual(self.shown(rows, "deepinfer", size=300), {"glm-5.3"})
+
+    # ---- 实测候选：刷新后自动实测谁 ----------------------------------------
+    def test_probe_candidates_are_the_newest_two_per_line(self):
+        """每条产品线实测最新两个：最新的坏了，列表才有退路可退。"""
+        ids = ["gpt-5.5-sol", "gpt-5.6-sol", "gpt-6-sol",
+               "claude-opus-5", "claude-opus-5-5", "claude-opus-4-8",
+               "glm-5.1", "glm-5.2", "glm-5.3",
+               "MiniMax-M3", "qwen3.7-plus"]
+        self.assertEqual(set(models.flagship_candidates(ids)), {
+            "gpt-6-sol", "gpt-5.6-sol",
+            "claude-opus-5-5", "claude-opus-5",
+            "glm-5.3", "glm-5.2", "qwen3.7-plus"})
+
+    def test_probe_targets_skip_delisted_flagships_only_on_large_catalogs(self):
+        """大目录：已下架的旗舰不再实测（它不会是「最新」）；小目录照旧全测 ——
+        DeepInfer 上 kimi-k3-256k 不在目录里却一直能调。"""
+        # seed（随仓库分发的别人机器上的观测）会在 load() 时并进来，这里只看本机记录。
+        with tempfile.TemporaryDirectory() as tmp, \
+                mock.patch.object(models, "CACHE", Path(tmp) / "models.json"), \
+                mock.patch.object(models, "SEED", Path(tmp) / "no-seed.json"), \
+                mock.patch.object(models, "_SEED_CACHE", None):
+            def put(gateway, model, listed):
+                models.update_record(gateway, model, lambda rec: rec.update(
+                    gateway=gateway, id=model, status="listed", listed=listed))
+            put("boyue", "claude-fable-5-1", False)
+            put("boyue", "claude-opus-5-5", True)
+            for index in range(45):
+                put("boyue", f"filler-{index}", True)
+            put("deepinfer", "kimi-k3-256k", False)
+            put("deepinfer", "glm-5.3", True)
+            self.assertEqual(models.probe_targets("boyue"), ["claude-opus-5-5"])
+            self.assertEqual(set(models.probe_targets("deepinfer")),
+                             {"kimi-k3-256k", "glm-5.3"})
+
+    def test_probe_candidates_on_the_real_catalog_stay_small(self):
+        """首刷一次要实测的量：真实 408 条目录上是几十个，不是几百个。"""
+        candidates = models.flagship_candidates(self.catalogs["boyue"])
+        self.assertLessEqual(len(candidates), 30)
+        self.assertIn("gpt-6-sol", candidates)
+        self.assertIn("claude-opus-5-5", candidates)
 
 
 class ModelSeed(unittest.TestCase):
