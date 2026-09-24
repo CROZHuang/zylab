@@ -392,6 +392,9 @@ def _merge_gateways(current, patch, *, trusted_user):
         note = str(value.get("note") or "").strip()
         if note:
             entry["note"] = note
+        proxy = str(value.get("proxy") or "").strip()
+        if proxy:
+            entry["proxy"] = proxy
         if entry:
             current[name] = entry
 
@@ -1064,6 +1067,38 @@ def write_user(patch):
         with _user_lock():
             cur = _read_user_for_update()
             cur.update(patch)
+            _write_user_unlocked(cur)
+    except SettingsError:
+        raise
+    except OSError as exc:
+        raise SettingsError(f"用户配置写入失败：{USER_FILE} —— {exc}") from exc
+    return USER_FILE
+
+
+def update_user_gateway(name, fields):
+    """锁内合并**一个**网关的配置，其它网关原样保留；fields 里值为 None 的键被删掉。
+
+    不能用 write_user({"gateways": {name: …}})：那是浅合并，会把 gateways 整段换掉 ——
+    2026-09-24 实测，给一个网关写地址，settings 里其它网关的地址全没了。
+    """
+    name = str(name or "").strip().lower()
+    if not name:
+        raise SettingsError("网关名不能为空")
+    if not isinstance(fields, dict):
+        raise SettingsError("网关配置更新必须是 object")
+    try:
+        with _user_lock():
+            cur = _read_user_for_update()
+            gateways = cur.get("gateways")
+            gateways = dict(gateways) if isinstance(gateways, dict) else {}
+            entry = dict(gateways.get(name) or {})
+            for key_name, value in fields.items():
+                if value is None:
+                    entry.pop(key_name, None)
+                else:
+                    entry[key_name] = value
+            gateways[name] = entry
+            cur["gateways"] = gateways
             _write_user_unlocked(cur)
     except SettingsError:
         raise

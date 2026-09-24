@@ -9733,6 +9733,7 @@ def cmd_doctor(sess, rest):
             or sandbox_state.get("configuration_error")
             or sandbox_error or "-")),
         ("gateway", f"{route.name} · {route.base}"),
+        ("route", client.route_description(route.name)),
         ("API key", _key_row(route)),
         ("transport", "HTTPS" if secure_transport else "HTTP (credential exposure risk)"),
         ("SQLite shadow", (
@@ -10904,10 +10905,80 @@ def _print_probe_result(model, record, note=""):
 
 
 def _proxy_hint(gateway):
-    """够不着网关时的出路：只给这一个网关声明代理（别的网关照旧直连）。"""
-    return (f"这个端点必须经代理才够得着？只给它声明一条："
-            f"export {paths.env_name(client.api_proxy_env(gateway))}="
-            "'http://<user>:<pass>@<host>:<port>/'")
+    """够不着网关时的出路：给**这一个**网关配代理（别的网关照旧），存进 zylab 自己的配置。"""
+    return (f"这个网关要经代理才够得着？配一次就好（存进 zylab 的 settings，任何终端都生效）："
+            f"zylab init --gateway {gateway} --proxy 'http://<user>:<pass>@<host>:<port>/'")
+
+
+PROXY_PROBE_TIMEOUT = 30
+
+
+def _init_find_route(route, a, interactive, ok, warn, *, probe=None,
+                     environ=None, ask=input):
+    """init 的「怎么够得着这个网关」—— 对每个网关都一样（用户 2026-09-24：「万一以后我又
+    给了你 openai/anthropic/glm 的 api 呢？」「如果我给同事用呢？」）。
+
+    - 显式 `--proxy URL`：照写进 settings 的这个网关下；`--proxy none` 改回直连；
+    - 否则已经配了（环境变量或 settings）就不动；
+    - 否则先试直连（不带 key）；不通就拿用户环境里的代理挨个试连（同样不带 key），
+      找到能通的问一句，**同意才写** —— 代理会经手 key、prompt 和代码。
+      `--yes` 算同意（代理来自用户自己的环境）；非交互又没 `--yes` 只给出命令。
+    返回接下来要用的代理（None = 直连）。
+    """
+    probe = probe or client.probe_reachable
+    explicit = str(getattr(a, "proxy", None) or "").strip()
+    entry = client.GATEWAYS.setdefault(route.name, {})
+    if explicit:
+        if explicit.lower() in ("none", "direct", "off"):
+            CFG.update_user_gateway(route.name, {"proxy": None})
+            entry.pop("proxy", None)
+            ok(f"网关 {route.name} 改为直连（settings 里的代理已删除）")
+            return None
+        if not webfetch.looks_like_proxy_url(explicit):
+            warn("--proxy 要 http://<host>:<port>/ 这样的地址，这个值不像，忽略")
+            return client.api_proxy(route)
+        CFG.update_user_gateway(route.name, {"proxy": explicit})
+        entry["proxy"] = explicit
+        ok(f"网关 {route.name} 经代理 {webfetch.redact(explicit)}（已写入 {CFG.USER_FILE}）")
+        return explicit
+    current = client.api_proxy(route)
+    if current:
+        ok(f"网关 {route.name} {client.route_description(route.name)}")
+        return current
+    reachable, detail = probe(route.base, None)
+    if reachable:
+        return None
+    candidates = client.environment_proxy_candidates(environ)
+    if not candidates:
+        return None               # 交给后面的真实探测报「不可达」并给出 --proxy 的出路
+    warn(f"网关 {route.name} 直连不通（{detail}），试你环境里的代理（试连不带 key）")
+    for variable, candidate in candidates:
+        # 经代理的试连给足时间：2026-09-24 实测同一条代理连 DeepSeek 快时 0.1 s、
+        # 慢时 23 s（双峰），8 s 的直连超时会把一条好代理判成不通。
+        reachable, _detail = probe(route.base, candidate,
+                                   timeout=PROXY_PROBE_TIMEOUT)
+        if not reachable:
+            continue
+        shown = webfetch.redact(candidate)
+        if getattr(a, "yes", False):
+            accepted = True
+        elif interactive:
+            reply = str(ask(
+                f"  经 {variable}（{shown}）可以连上 {route.name}。"
+                f"以后 {route.name} 都走这个代理吗？[Y/n] ") or "").strip().lower()
+            accepted = reply in ("", "y", "yes", "是", "好")
+        else:
+            accepted = False
+        if accepted:
+            CFG.update_user_gateway(route.name, {"proxy": candidate})
+            entry["proxy"] = candidate
+            ok(f"网关 {route.name} 经代理 {shown}（来自 {variable}，已写入 {CFG.USER_FILE}）")
+            return candidate
+        print(DIM(f"    经 {variable} 能连上。要用它：zylab init --gateway {route.name} "
+                  f'--proxy "${variable}"'))
+        return None
+    warn(f"你环境里的代理也连不上 {route.name}")
+    return None
 
 
 def _refresh_all_gateways(sess):
@@ -11731,6 +11802,7 @@ def cmd_model(sess, rest):
             effort_note = _typed_effort(sess, target_gateway, value, typed_effort)
             if effort_note is None:
                 return
+        previous = (sess.ag.model, getattr(sess.ag, "gateway", None))
         try:
             result = sess.request_route_change(value, target_gateway)
         except ValueError as exc:
@@ -11745,6 +11817,7 @@ def cmd_model(sess, rest):
         prefix = "下一轮切到" if result["staged"] else "切到"
         notice = f"  [{prefix} {value}@{target_gateway}{ctx}{mode}{effort_note}]"
         print(YELLOW(notice) if chat_only else DIM(notice))
+        _warn_if_context_exceeds(sess, value, target_gateway, result["staged"], previous)
     elif tui.supported():
         # /model 是高频工作集，不是 400+ 条原始目录：小目录（DeepInfer、厂商
         # 官方口）保留全部实测可用模型（无工具项灰显为仅聊天），大目录（Boyue）
@@ -11822,6 +11895,7 @@ def cmd_model(sess, rest):
                 f"    上下文：* 实测 · ~ 规格推断 · 无标记 网关自报"))
         if pick:
             gw = pick["gateway"]
+            previous = (sess.ag.model, getattr(sess.ag, "gateway", None))
             try:
                 result = sess.request_route_change(pick["id"], gw)
             except ValueError as exc:
@@ -11837,6 +11911,7 @@ def cmd_model(sess, rest):
             prefix = "下一轮切到" if result["staged"] else "切到"
             notice = f"  [{prefix} {pick['id']}@{gw}{ctx}{mode}{effort_note}]"
             print(YELLOW(notice) if chat_only else DIM(notice))
+            _warn_if_context_exceeds(sess, pick["id"], gw, result["staged"], previous)
         else:
             print(DIM("  (取消)"))
     else:
@@ -11893,6 +11968,37 @@ def cmd_temperature(sess, rest):
     print(DIM(f"  [temperature {number:g}，本会话生效；/temperature save 存成默认]"))
     if not M.supports_temperature(sess.ag.gateway, sess.ag.model):
         print(YELLOW(f"  {sess.ag.model} 不接受 temperature，换到接受的模型才会生效"))
+
+
+def _warn_if_context_exceeds(sess, model, gateway, staged, previous):
+    """切到窗口更小的模型、而当前上下文已经超过它的压缩线：当场说清楚接下来会发生什么。
+
+    2026-09-24 用户现场：会话 398K，从 1M 窗口的模型切到 claude-opus-5-5（压缩线 218K），
+    发一句「hello？」就进了 10 分钟的压缩 —— 4 段、每段两次摘要请求、每次 60–95 秒，
+    而切换那一刻什么都没说。不发网络请求：窗口取能力表里记的，没有就按未知处理。
+    """
+    # 只是提示：读数不是数字（还没算过、或被替换成了别的对象）就不说，绝不挡住切换。
+    context = getattr(sess, "last_ctx", None)
+    if isinstance(context, bool) or not isinstance(context, (int, float)) or context <= 0:
+        return
+    if staged:
+        limit = M.get(gateway, model).get("context") or A.CTX_UNKNOWN
+        threshold = (A.compact_threshold(limit)
+                     if isinstance(limit, (int, float)) else 0)
+    else:
+        threshold = getattr(sess.ag, "compact_at", 0)
+    if (isinstance(threshold, bool) or not isinstance(threshold, (int, float))
+            or threshold <= 0 or context <= threshold):
+        return
+    target = int(threshold * A.COMPACT_DEEP_FRACTION)
+    per_pass = max(1, A.COMPACT_SOURCE_TOKENS - 8_000)
+    passes = min(A.COMPACT_MAX_PASSES, max(1, -(-(context - target) // per_pass)))
+    back = f"/model {previous[0]}@{previous[1]}" if previous else "切回原来的模型"
+    print(YELLOW(
+        f"  [当前上下文约 {context/1000:.0f}K，超过 {model} 的压缩线 "
+        f"{threshold/1000:.0f}K：下一轮开始前要先压缩，约 {passes} 段，"
+        f"每段一到两次摘要请求，慢模型上可能要几分钟]"))
+    print(DIM(f"    嫌慢：{back} 切回去 /compact 压完再切过来；或 /new 开新会话"))
 
 
 def _choose_effort(sess, gateway, model):
@@ -15035,7 +15141,7 @@ def cmd_init_cli(a, cfg):
             return 2
         keys = [a.key_env] if a.key_env else [
             re.sub(r"[^A-Z0-9]+", "_", name.upper()) + "_API_KEY"]
-        CFG.write_user({"gateways": {name: {"base": base, "keys": keys}}})
+        CFG.update_user_gateway(name, {"base": base, "keys": keys})
         client.GATEWAYS[name] = {"base": base, "keys": tuple(keys),
                                  "note": "用户自建"}
         ok(f"已新建网关 profile {name} → {base}（key 变量 {keys[0]}）")
@@ -15055,7 +15161,7 @@ def cmd_init_cli(a, cfg):
             print(DIM(f"  {line}"))
         return 2
     if base != client.resolve_base(route.name):
-        CFG.write_user({"gateways": {route.name: {"base": base}}})
+        CFG.update_user_gateway(route.name, {"base": base})
         ok(f"endpoint 已写入 {CFG.USER_FILE}（{route.name} → {base}）")
     else:
         ok(f"网关 {route.name} endpoint {base}")
@@ -15087,6 +15193,8 @@ def cmd_init_cli(a, cfg):
         print(DIM(f"    找过环境变量 {', '.join(route.key_names)}；"
                   f"找过文件 {', '.join(client._key_files())}"))
         return 2
+    # 4c. 怎么够得着它：直连，还是经哪个代理（对每个网关都一样）
+    _init_find_route(route, a, interactive, ok, warn)
     # 5. 一次真实探测：三种失败读起来不一样
     # **值必须脱敏。** 代理 URL 常内嵌 `user:pass@`，而这行诊断会原样进终端、
     # 进日志、进用户粘给同事的那段输出。`webfetch.redact()` 的注释原话就是
@@ -15120,7 +15228,8 @@ def cmd_init_cli(a, cfg):
     except (urllib.error.URLError, OSError, TimeoutError) as exc:
         bad(f"网关 {route.name} 不可达：{exc} —— 与 key 无关")
         print(DIM(f"    直连 {client._display_url(route.base)}；"
-                  f"本机代理变量：{proxies or '未设'}（zylab 直连，不走它们）"))
+                  f"本机代理变量：{proxies or '未设'}"
+                  f"{'（上面已逐个试连过）' if proxies else ''}"))
         # 「我不读你的环境变量」如果不给出路，对**必须走代理才够得着端点**的用户
         # 就是一条死路（2026-09-22 实跑陌生人流程撞到）。给出显式入口。
         print(DIM("    " + _proxy_hint(route.name)))
@@ -15440,6 +15549,8 @@ def main():
                     help="init 用：网关名（内置 deepinfer / boyue，也可自定义）")
     ap.add_argument("--base", default=None, metavar="URL",
                     help="init 用：网关 endpoint，形如 https://<host>/v1；写入 settings.json")
+    ap.add_argument("--proxy", default=None, metavar="URL",
+                    help="init：这个网关经哪个代理（存进 settings；none = 直连）")
     ap.add_argument("--key-env", default=None, metavar="NAME",
                     help="init 用：从环境变量 NAME 取 key 写入 keys.env（不回显）")
     ap.add_argument("--yes", action="store_true",

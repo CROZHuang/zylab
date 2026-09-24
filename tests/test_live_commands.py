@@ -304,7 +304,8 @@ class LiveCommandTests(unittest.TestCase):
 
         text = output.getvalue()
         self.assertIn("deepseek 取模型列表失败", text)
-        self.assertIn("ZYLAB_API_PROXY_DEEPSEEK", text)
+        # 出路是存进 zylab 自己配置的那条命令，不是只对当前 shell 有效的环境变量
+        self.assertIn("zylab init --gateway deepseek --proxy", text)
         self.assertIn("boyue 已刷新，240 个模型", text)
         probe.assert_called_once_with("boyue", "glm-5.3")
 
@@ -446,6 +447,30 @@ class LiveCommandTests(unittest.TestCase):
         self.assertIn("不会发出去", text)
         self.assertIsNone(self.agent.effort_for("deepinfer", "glm-5.3"))
 
+    # ---- 切到窗口更小的模型：当场说清楚（用户 2026-09-24 发一句 hello 等了十分钟压缩）----
+    def switch_with_context(self, context_tokens, compact_at):
+        self.session.last_ctx = context_tokens
+        self.agent.compact_at = compact_at
+        with (
+                mock.patch.object(CLI.M, "get", return_value={"status": "ok",
+                                                              "supports_tools": True}),
+                mock.patch.object(CLI.M, "where", return_value=["deepinfer"]),
+                contextlib.redirect_stdout(io.StringIO()) as output,
+        ):
+            CLI.cmd_model(self.session, "claude-opus-5-5@deepinfer")
+        return output.getvalue()
+
+    def test_switching_below_the_context_warns_and_says_what_to_do(self):
+        text = self.switch_with_context(398_000, 217_600)
+        self.assertIn("398K", text)
+        self.assertIn("218K", text)
+        self.assertIn("先压缩", text)
+        self.assertIn("/model old-model@deepinfer", text, "说得出怎么切回去")
+
+    def test_switching_with_room_to_spare_says_nothing_extra(self):
+        text = self.switch_with_context(40_000, 217_600)
+        self.assertNotIn("先压缩", text)
+
     def test_auto_toggle_changes_only_future_permission_decisions(self):
         with mock.patch.object(sys.stdin, "isatty", return_value=False):
             prior = self.session.permission_decision(
@@ -460,6 +485,94 @@ class LiveCommandTests(unittest.TestCase):
         self.assertTrue(future["allowed"])
         self.assertEqual(future["decision"], "auto_approve")
         self.assertIn("仅影响尚未开始的后续审批", output.getvalue())
+
+
+class InitFindsTheRoute(unittest.TestCase):
+    """init 的「怎么够得着这个网关」对**每个网关**都一样（用户：「万一以后我又给了你
+    openai/anthropic/glm 的 api 呢？」）：先直连；不通就拿用户环境里的代理试连
+    （不带 key），找到能通的问一句，同意才存。"""
+
+    ROUTE = CLI.client.GatewayRoute("glm", "https://open.invalid/v4", ("GLM_API_KEY",))
+    ENV = {"https_proxy": "http://someone:secret@proxy.invalid:3128/"}
+
+    def run_step(self, probe_answers, *, yes=False, interactive=False, answer="y",
+                 proxy=None):
+        tries = []
+
+        def probe(base, proxy_url=None, timeout=None):
+            tries.append(proxy_url)
+            timeouts.append(timeout)
+            return probe_answers[len(tries) - 1], "detail"
+
+        timeouts = []
+        self.timeouts = timeouts
+
+        args = mock.Mock(yes=yes, proxy=proxy)
+        saved = []
+        with (
+                mock.patch.object(CLI.CFG, "update_user_gateway",
+                                  side_effect=lambda name, fields: saved.append(
+                                      (name, fields))),
+                mock.patch.dict(CLI.client.GATEWAYS, {"glm": {"keys": ("GLM_API_KEY",)}}),
+                mock.patch.dict(os.environ, {}),
+                contextlib.redirect_stdout(io.StringIO()) as output,
+        ):
+            for name in ("ZYLAB_API_PROXY", "ZYLAB_API_PROXY_GLM"):
+                os.environ.pop(name, None)
+            chosen = CLI._init_find_route(
+                self.ROUTE, args, interactive, print, print, probe=probe,
+                environ=self.ENV, ask=lambda prompt: answer)
+            live = dict(CLI.client.GATEWAYS["glm"])
+        return chosen, tries, saved, output.getvalue(), live
+
+    def test_a_reachable_gateway_needs_nothing(self):
+        chosen, tries, saved, _, _ = self.run_step([True])
+        self.assertIsNone(chosen)
+        self.assertEqual(tries, [None], "直连通就不去碰任何代理")
+        self.assertEqual(saved, [])
+
+    def test_an_environment_proxy_that_works_is_saved_on_consent(self):
+        chosen, tries, saved, text, live = self.run_step(
+            [False, True], interactive=True, answer="")
+        self.assertEqual(tries, [None, self.ENV["https_proxy"]])
+        self.assertEqual(chosen, self.ENV["https_proxy"])
+        self.assertEqual(saved, [("glm", {"proxy": self.ENV["https_proxy"]})])
+        self.assertEqual(live.get("proxy"), self.ENV["https_proxy"], "本进程接下来就用它")
+        self.assertNotIn("secret", text)
+
+    def test_proxies_get_a_longer_probe_than_the_direct_route(self):
+        """同一条代理连 DeepSeek 实测快时 0.1 s、慢时 23 s：拿直连的 8 s 去试它，
+        一条好代理会被判成不通（09-24 同事流程当场这样失败）。"""
+        self.run_step([False, True], yes=True)
+        self.assertIsNone(self.timeouts[0], "直连用默认的短超时")
+        self.assertGreaterEqual(self.timeouts[1], 25)
+
+    def test_declining_saves_nothing_and_says_how(self):
+        chosen, _, saved, text, _ = self.run_step([False, True], interactive=True,
+                                                  answer="n")
+        self.assertIsNone(chosen)
+        self.assertEqual(saved, [])
+        self.assertIn("--proxy", text)
+
+    def test_non_interactive_without_yes_only_suggests(self):
+        chosen, _, saved, text, _ = self.run_step([False, True])
+        self.assertIsNone(chosen)
+        self.assertEqual(saved, [])
+        self.assertIn('--proxy "$https_proxy"', text)
+
+    def test_an_explicit_proxy_is_saved_as_given(self):
+        chosen, tries, saved, text, _ = self.run_step(
+            [], proxy="http://u:pw@corp.invalid:8080/")
+        self.assertEqual(chosen, "http://u:pw@corp.invalid:8080/")
+        self.assertEqual(tries, [], "用户点名了就不再探")
+        self.assertEqual(saved, [("glm", {"proxy": "http://u:pw@corp.invalid:8080/"})])
+        self.assertNotIn("pw@", text)
+
+    def test_proxy_none_goes_back_to_direct(self):
+        chosen, _, saved, _, live = self.run_step([], proxy="none")
+        self.assertIsNone(chosen)
+        self.assertEqual(saved, [("glm", {"proxy": None})])
+        self.assertNotIn("proxy", live)
 
 
 class BusyCommandPTYTests(unittest.TestCase):

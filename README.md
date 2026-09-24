@@ -1302,16 +1302,27 @@ ZYLAB_GATEWAY=boyue zylab
 默认导出的代理常常只放行一部分域名，打到自家网关上返回 403 —— 看起来像 key 失效，
 实际是路由错了。这个坑排查起来极贵，所以客户端不碰环境里的代理设置。
 
-**如果你的 endpoint 必须经代理才够得着**，显式声明一条：
+**如果某个网关必须经代理才够得着**，给**这一个网关**配一次就好（存进 zylab 自己的
+settings，从哪个终端、IDE、cron 启动都生效；别的网关照旧直连）：
+
+```bash
+zylab init --gateway deepseek --proxy 'http://<user>:<pass>@<host>:<port>/'
+zylab init --gateway deepseek --proxy none     # 改回直连
+```
+
+不给 `--proxy` 时 `zylab init` 会自己探路：先试直连；不通就拿你环境里已有的代理变量
+（`https_proxy` 等）挨个试连——**试连不带 key**，只看连不连得上——找到能通的就问你一句，
+同意才存。对每个网关都一样：今天是 DeepSeek，以后接 OpenAI、Anthropic、GLM 也是同一条命令。
+
+临时改道也可以用环境变量，优先级高于 settings：
 
 ```bash
 export ZYLAB_API_PROXY_DEEPSEEK='http://<user>:<pass>@<host>:<port>/'   # 只管这一个网关
 export ZYLAB_API_PROXY='http://<user>:<pass>@<host>:<port>/'            # 其余所有网关
 ```
 
-按网关的那条优先。为什么要能分开：同一台机器上，常常是一个网关**只有**经代理才通、
-另一个**只有**直连才通（2026-09-24 实测：官方 DeepSeek 与内部网关正是这样）——只有一个
-全局开关时两者不可兼得。
+为什么要按网关分：同一台机器上，常常是一个网关**只有**经代理才通、另一个**只有**直连才通
+（2026-09-24 实测：官方 DeepSeek 与内部网关正是这样）——只有一个全局开关时两者不可兼得。
 
 只认这两类变量，**不读** `http_proxy` / `https_proxy`（理由同上），也不复用
 网页抓取那条 `web.proxy` —— 这条路会把 key、prompt、代码和工具结果都送过去，

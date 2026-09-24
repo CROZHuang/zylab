@@ -119,6 +119,42 @@ class ColdStartTests(unittest.TestCase):
                          "https://127.0.0.1:9/v1")
         self.assertEqual(saved["gateways"]["mycorp"]["keys"], ["FAKE_KEY"])
 
+    def seed_settings(self, gateways):
+        os.makedirs(os.path.join(self.home, ".zylab"), exist_ok=True)
+        path = os.path.join(self.home, ".zylab", "settings.json")
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump({"gateways": gateways}, f)
+        return path
+
+    def test_init_for_one_gateway_keeps_the_other_gateways(self):
+        """2026-09-24 实测：`write_user({"gateways": {名字: …}})` 是浅合并 —— 给一个网关
+        写配置，settings 里其它网关的地址整段被冲掉。维护者自己就存着两个。"""
+        path = self.seed_settings({"deepinfer": {"base": "https://a.invalid/v1"},
+                                   "boyue": {"base": "https://b.invalid/v1"}})
+        p = run(["init", "--gateway", "mycorp", "--base", "https://127.0.0.1:9/v1",
+                 "--key-env", "FAKE_KEY", "--yes"], self.home,
+                extra={"FAKE_KEY": "sk-not-a-real-key"})
+        self.assertNotIn("Traceback", p.stderr)
+        with open(path, encoding="utf-8") as f:
+            saved = json.load(f)["gateways"]
+        self.assertEqual(saved.get("deepinfer"), {"base": "https://a.invalid/v1"})
+        self.assertEqual(saved.get("boyue"), {"base": "https://b.invalid/v1"})
+        self.assertEqual(saved["mycorp"]["base"], "https://127.0.0.1:9/v1")
+
+    def test_init_saves_a_declared_proxy_for_that_gateway_only(self):
+        """代理存进 zylab 自己的配置、只挂在这一个网关下；任何输出都不带凭据。"""
+        path = self.seed_settings({"deepinfer": {"base": "https://a.invalid/v1"}})
+        p = run(["init", "--gateway", "mycorp", "--base", "https://127.0.0.1:9/v1",
+                 "--proxy", "http://someone:secret-pass@127.0.0.1:9/",
+                 "--key-env", "FAKE_KEY", "--yes"], self.home,
+                extra={"FAKE_KEY": "sk-not-a-real-key"})
+        self.assertNotIn("Traceback", p.stderr)
+        self.assertNotIn("secret-pass", p.stdout + p.stderr)
+        with open(path, encoding="utf-8") as f:
+            saved = json.load(f)["gateways"]
+        self.assertEqual(saved["mycorp"]["proxy"], "http://someone:secret-pass@127.0.0.1:9/")
+        self.assertNotIn("proxy", saved["deepinfer"])
+
     def test_an_unconfigured_private_gateway_names_the_ready_made_ones(self):
         """自建网关没地址是正常的；但得告诉人「其实可以直接挑一个内置的」。"""
         p = run(["init", "--gateway", "boyue", "--yes"], self.home)

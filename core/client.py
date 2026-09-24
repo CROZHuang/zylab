@@ -143,6 +143,9 @@ def _merged_gateways():
             entry["keys"] = tuple(keys)
         if str(cfg.get("note") or "").strip():
             entry["note"] = str(cfg["note"]).strip()
+        # 怎么够得着这个网关（`zylab init --proxy`，或 init 试连后经用户同意写入）。
+        if str(cfg.get("proxy") or "").strip():
+            entry["proxy"] = str(cfg["proxy"]).strip()
     return out
 
 
@@ -439,8 +442,8 @@ _PROXY_OPENERS = {}
 def api_proxy(route=None):
     """模型请求要走的代理；没有显式声明就返回 None（直连）。
 
-    只认 `ZYLAB_API_PROXY_<网关>`（只管这一个网关）与 `ZYLAB_API_PROXY`（其余
-    所有网关），前者优先。**刻意不读 http(s)_proxy**（理由同 _OPENER），
+    依次认：环境变量 `ZYLAB_API_PROXY_<网关>`（临时改道）→ settings 里这个网关的
+    `proxy`（`zylab init` 存的，跟着 zylab 走）→ 环境变量 `ZYLAB_API_PROXY`（其余所有网关）。**刻意不读 http(s)_proxy**（理由同 _OPENER），
     也刻意不复用 `web.proxy`：那条给网页抓取，信任面不同 —— 这条会把
     API key、prompt、代码与工具结果都送过去，必须由用户为这条路单独表态。
 
@@ -453,19 +456,81 @@ def api_proxy(route=None):
     `InvalidURL: URL can't contain control characters`，代理这条腿当场失效。
     形态不对就当没声明（返回 None），不是报错 —— 直连仍然可用。
     """
-    name = getattr(route, "name", None)
-    value = paths.env_get(api_proxy_env(name), "").strip() if name else ""
-    if not value:
-        value = paths.env_get("API_PROXY", "").strip()
-    if not value:
-        return None
     from . import webfetch                  # 惰性 import：避免模块级环依赖
-    return value if webfetch.looks_like_proxy_url(value) else None
+    name = getattr(route, "name", None)
+    candidates = []
+    if name:
+        candidates.append(paths.env_get(api_proxy_env(name), ""))
+        # 存在 zylab 自己配置里的那条：同事的机器上没有这台机器的 shell 文件，
+        # 从 IDE、cron 启动也读不到 shell —— 所以要能跟着 zylab 走。
+        candidates.append((GATEWAYS.get(str(name).lower()) or {}).get("proxy") or "")
+    candidates.append(paths.env_get("API_PROXY", ""))
+    for value in candidates:
+        value = str(value or "").strip()
+        if value and webfetch.looks_like_proxy_url(value):
+            return value
+    return None
 
 
 def api_proxy_env(gateway):
     """某个网关专用的代理变量名后缀（`API_PROXY_DEEPSEEK`）；与 `BASE_<网关>` 同一套命名。"""
     return "API_PROXY_" + str(gateway).upper()
+
+
+_ENV_PROXY_NAMES = ("https_proxy", "HTTPS_PROXY", "all_proxy", "ALL_PROXY",
+                    "http_proxy", "HTTP_PROXY")
+
+
+def environment_proxy_candidates(environ=None):
+    """用户环境里声明过的代理：[(变量名, 值)]，去重、保序。
+
+    只拿来**试连**并征求同意，绝不自动启用 —— 理由见 api_proxy：企业网络里默认导出的
+    代理常常只放行一部分域名，而这条路会经手 key、prompt 和代码。
+    """
+    from . import webfetch
+    environ = os.environ if environ is None else environ
+    found = []
+    for variable in _ENV_PROXY_NAMES:
+        value = str(environ.get(variable) or "").strip()
+        if (value and webfetch.looks_like_proxy_url(value)
+                and value not in [known for _, known in found]):
+            found.append((variable, value))
+    return found
+
+
+def probe_reachable(base, proxy=None, timeout=8):
+    """能不能连上这个网关：(是否连上, 说明)。**不带 key** —— 只 GET {base}/models。
+
+    任何 HTTP 回答都算连上（401/403/404 说明请求到了网关）；超时、拒连、代理握手失败
+    算没连上。试一条陌生代理时，key 不能先交出去。
+    """
+    req = urllib.request.Request(
+        f"{str(base).rstrip('/')}/models", headers={"Accept": "application/json"})
+    try:
+        with _opener_for(proxy).open(req, timeout=timeout) as response:
+            return True, f"HTTP {getattr(response, 'status', 200)}"
+    except urllib.error.HTTPError as exc:
+        return True, f"HTTP {exc.code}"
+    except APIError as exc:                 # 跨域重定向被拒：也是网关答了话
+        return True, str(exc)[:80]
+    except Exception as exc:                # noqa: BLE001
+        return False, type(exc).__name__
+
+
+def route_description(name):
+    """给 /doctor 与 init 看的「这个网关怎么走」：直连 / 经代理（打码）+ 出处。"""
+    from . import webfetch
+    route = route_for(name)
+    proxy = api_proxy(route)
+    if not proxy:
+        return "直连"
+    if paths.env_get(api_proxy_env(route.name), "").strip() == proxy:
+        source = f"环境变量 {paths.env_name(api_proxy_env(route.name))}"
+    elif (GATEWAYS.get(route.name) or {}).get("proxy") == proxy:
+        source = "settings"
+    else:
+        source = f"环境变量 {paths.env_name('API_PROXY')}"
+    return f"经代理 {webfetch.redact(proxy)}（{source}）"
 
 
 def _opener_for(proxy):

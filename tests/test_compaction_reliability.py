@@ -414,8 +414,9 @@ class SummaryAcceptanceTests(unittest.TestCase):
             f"- 文件 core/mod{i}.py：改了函数 f{i}，测试通过" for i in range(60))
         self.assertEqual(C.summary_defects(listy), [])
 
-    def compact(self, *scripts):
+    def compact(self, *scripts, learned=None):
         from unittest import mock                     # noqa: PLC0415
+        learned = {} if learned is None else learned
         agent = A.Agent.__new__(A.Agent)
         agent.messages = history(30)
         agent.model, agent.gateway = "kimi-k3-256k", "deepinfer"
@@ -436,7 +437,11 @@ class SummaryAcceptanceTests(unittest.TestCase):
 
         with mock.patch.object(A.client, "stream_chat", provider), \
              mock.patch.object(A.models_db, "thinking_off_rejected", return_value=False), \
-             mock.patch.object(A.models_db, "note_thinking_off_rejected"):
+             mock.patch.object(A.models_db, "note_thinking_off_rejected"), \
+             mock.patch.object(A.models_db, "compact_needs_wide_budget",
+                               side_effect=lambda g, m: learned.get((g, m), False)), \
+             mock.patch.object(A.models_db, "note_compact_needs_wide_budget",
+                               side_effect=lambda g, m: learned.__setitem__((g, m), True)):
             result = agent.force_compact(instructions="重点保留数据库迁移的决定")
         return agent, calls, str(result or "")
 
@@ -450,6 +455,38 @@ class SummaryAcceptanceTests(unittest.TestCase):
         self.assertEqual([c["route"] for c in calls], [("deepinfer", "kimi-k3-256k")] * 2)
         self.assertGreater(calls[1]["max_tokens"], calls[0]["max_tokens"])
         self.assertEqual(agent.context_summary["content"], GOOD_SUMMARY)
+
+    def test_a_route_that_needed_the_wide_budget_starts_there_next_time(self):
+        """2026-09-24 实测 claude-opus-5-5@boyue：连续 4 段，每段 6000 额度那次必截断、
+        16000 那次必通过（8.6K–9.9K），每段白跑 60 s。学到一次，下一段直接从大额度开始。"""
+        learned = {}
+        _, calls, _ = self.compact(
+            self.answer(GOOD_SUMMARY[:60], "length"), self.answer(GOOD_SUMMARY),
+            learned=learned)
+        self.assertEqual([c["max_tokens"] for c in calls],
+                         [A.COMPACT_MAX_TOKENS, A.COMPACT_RETRY_MAX_TOKENS])
+        self.assertTrue(learned.get(("deepinfer", "kimi-k3-256k")))
+        _, again, _ = self.compact(self.answer(GOOD_SUMMARY), learned=learned)
+        self.assertEqual([c["max_tokens"] for c in again], [A.COMPACT_RETRY_MAX_TOKENS],
+                         "一次就成，不再先撞 6000")
+
+    def test_a_rescue_by_another_model_teaches_nothing_about_this_one(self):
+        """小额度截断后是**别家**写成的：这不说明本 route 需要大额度，不记。"""
+        learned = {}
+        self.compact(self.answer(LOOPING_SUMMARY), self.answer(GOOD_SUMMARY),
+                     learned=learned)
+        self.assertEqual(learned, {})
+
+    def test_the_learned_first_step_still_turns_thinking_off(self):
+        agent = A.Agent.__new__(A.Agent)
+        agent.model, agent.gateway = "claude-opus-5-5", "boyue"
+        from unittest import mock                     # noqa: PLC0415
+        with mock.patch.object(A.models_db, "thinking_off_rejected", return_value=False), \
+                mock.patch.object(A.models_db, "compact_needs_wide_budget",
+                                  return_value=True):
+            first = agent.compaction_attempts()[0]
+        self.assertEqual(first["max_tokens"], A.COMPACT_RETRY_MAX_TOKENS)
+        self.assertEqual(first["thinking"], {"type": "disabled"})
 
     def test_a_looping_summary_is_never_installed(self):
         agent, calls, result = self.compact(

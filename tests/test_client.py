@@ -10,6 +10,7 @@ import os
 import sys
 import tempfile
 import unittest
+import urllib.error
 import urllib.request
 from pathlib import Path
 from unittest import mock
@@ -1454,6 +1455,63 @@ class ApiProxyIsOptInOnly(unittest.TestCase):
         with mock.patch.dict(os.environ, {"ZYLAB_API_PROXY_DEEPSEEK": "yes"}):
             os.environ.pop("ZYLAB_API_PROXY", None)
             self.assertIsNone(client.api_proxy(route))
+
+    def test_a_proxy_saved_in_settings_applies_to_that_gateway(self):
+        """同事的机器上没有这台机器的 shell 文件：代理要能存进 zylab 自己的配置
+        （settings 的 gateways.<名字>.proxy），从哪个终端、IDE、cron 启动都生效。"""
+        deepseek = client.GatewayRoute("deepseek", "https://api.deepseek.com/v1", ())
+        deepinfer = client.GatewayRoute("deepinfer", "https://gw.invalid/v1", ())
+        with mock.patch.dict(client.GATEWAYS["deepseek"],
+                             {"proxy": "http://proxy.invalid:3128/"}), \
+                mock.patch.dict(os.environ, {}):
+            for name in ("ZYLAB_API_PROXY", "ZYLAB_API_PROXY_DEEPSEEK"):
+                os.environ.pop(name, None)
+            self.assertEqual(client.api_proxy(deepseek), "http://proxy.invalid:3128/")
+            self.assertIsNone(client.api_proxy(deepinfer))
+
+    def test_the_environment_overrides_the_saved_proxy(self):
+        route = client.GatewayRoute("deepseek", "https://api.deepseek.com/v1", ())
+        with mock.patch.dict(client.GATEWAYS["deepseek"],
+                             {"proxy": "http://saved.invalid:1/"}), \
+                mock.patch.dict(os.environ,
+                                {"ZYLAB_API_PROXY_DEEPSEEK": "http://env.invalid:2/"}):
+            self.assertEqual(client.api_proxy(route), "http://env.invalid:2/")
+
+    def test_a_malformed_saved_proxy_is_ignored(self):
+        route = client.GatewayRoute("deepseek", "https://api.deepseek.com/v1", ())
+        with mock.patch.dict(client.GATEWAYS["deepseek"], {"proxy": "proxy_on"}), \
+                mock.patch.dict(os.environ, {}):
+            for name in ("ZYLAB_API_PROXY", "ZYLAB_API_PROXY_DEEPSEEK"):
+                os.environ.pop(name, None)
+            self.assertIsNone(client.api_proxy(route))
+
+    def test_reachability_is_probed_without_the_key(self):
+        """试连只看连不连得上：任何 HTTP 回答（401 也算）= 连上；不带 Authorization ——
+        试一条陌生代理时，key 不能先交出去。"""
+        seen = []
+
+        class Opener:
+            def __init__(self, outcome):
+                self.outcome = outcome
+
+            def open(self, req, timeout=None):
+                seen.append(dict(req.header_items()))
+                raise self.outcome
+
+        answered = urllib.error.HTTPError("u", 401, "Unauthorized", {}, None)
+        with mock.patch.object(client, "_opener_for", return_value=Opener(answered)):
+            self.assertTrue(client.probe_reachable("https://gw.invalid/v1")[0])
+        with mock.patch.object(client, "_opener_for",
+                               return_value=Opener(urllib.error.URLError("timed out"))):
+            self.assertFalse(client.probe_reachable("https://gw.invalid/v1")[0])
+        self.assertTrue(seen)
+        self.assertFalse(any("Authorization" in headers for headers in seen))
+
+    def test_environment_proxy_candidates(self):
+        env = {"https_proxy": "http://a.invalid:1/", "HTTPS_PROXY": "http://a.invalid:1/",
+               "http_proxy": "http://b.invalid:2/", "all_proxy": "unset x"}
+        self.assertEqual(client.environment_proxy_candidates(env), [
+            ("https_proxy", "http://a.invalid:1/"), ("http_proxy", "http://b.invalid:2/")])
 
     def test_list_models_sends_through_the_gateways_own_proxy(self):
         """不只是 api_proxy 算对了 —— 取目录那一跳真的交给了这个网关的 opener。"""

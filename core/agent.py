@@ -134,18 +134,32 @@ def _request_params_rejected(error):
 
 
 class _ThinkingOffLearner:
-    """一次阶梯运行内的观察者：关思考被 400、同一 route 不关就成功 → 记进模型目录。"""
+    """一次阶梯运行内的观察者，把两类「零成本测量」记进模型目录：
+
+    - 关思考被 400、同一 route 不关就成功 → 这条 route 不许关思考；
+    - 小额度的摘要被截断、同一 route 加大额度就成功 → 这条 route 要大额度
+      （2026-09-24 claude-opus-5-5：每段都先在 6000 处截断、白跑一分钟）。
+    """
 
     def __init__(self):
         self._rejected = set()
+        self._truncated = set()
 
-    def observe(self, gateway, model, thinking, error, succeeded):
+    def observe(self, gateway, model, thinking, error, succeeded,
+                max_tokens=None, defects=()):
         key = (str(gateway), str(model))
         if thinking == COMPACT_THINKING_OFF and _request_params_rejected(error):
             self._rejected.add(key)
         elif thinking is None and succeeded and key in self._rejected:
             self._rejected.discard(key)
             models_db.note_thinking_off_rejected(*key)
+        if max_tokens is None:
+            return
+        if max_tokens <= COMPACT_MAX_TOKENS and "truncated" in (defects or ()):
+            self._truncated.add(key)
+        elif succeeded and max_tokens > COMPACT_MAX_TOKENS and key in self._truncated:
+            self._truncated.discard(key)
+            models_db.note_compact_needs_wide_budget(*key)
 
 
 def compact_threshold(ctx_limit, override=None):
@@ -1413,7 +1427,11 @@ class Agent:
             if models_db.thinking_off_rejected(gateway, model):
                 return {"label": label, "max_tokens": COMPACT_RETRY_MAX_TOKENS,
                         "thinking": None, "route": route, "when": "first"}
-            return {"label": label, "max_tokens": COMPACT_MAX_TOKENS,
+            # 已经学到这条 route 在小额度里写不完：关着思考、直接给大额度。
+            budget = (COMPACT_RETRY_MAX_TOKENS
+                      if models_db.compact_needs_wide_budget(gateway, model)
+                      else COMPACT_MAX_TOKENS)
+            return {"label": label, "max_tokens": budget,
                     "thinking": dict(COMPACT_THINKING_OFF), "route": route,
                     "when": "first"}
 
@@ -1754,7 +1772,8 @@ class Agent:
                     summary = ""
             used = {"model": model, "gateway": gateway}
             learner.observe(gateway, model, params["thinking"], error,
-                            error is None and bool(summary.strip()))
+                            error is None and bool(summary.strip()),
+                            max_tokens=params["max_tokens"], defects=defects)
             if error is None and summary.strip():
                 break
         return self._finish_compaction(
@@ -2133,7 +2152,8 @@ class Agent:
                             summary = ""
                     succeeded = error is None and bool(summary.strip())
                     learner.observe(gateway, model, params["thinking"], error,
-                                    succeeded)
+                                    succeeded, max_tokens=params["max_tokens"],
+                                    defects=defects)
                     details = None
                     if not succeeded:
                         rejected = "、".join(

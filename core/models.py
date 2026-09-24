@@ -1617,6 +1617,30 @@ def note_thinking_off_rejected(gateway, model):
         pass
 
 
+def compact_needs_wide_budget(gateway, model):
+    """这条 route 写摘要是否已知「小额度写不完」。见 note_compact_needs_wide_budget。"""
+    try:
+        return bool(get(gateway, model).get("compact_wide_budget"))
+    except Exception:                                  # noqa: BLE001 - 目录坏了不该挡住请求
+        return False
+
+
+def note_compact_needs_wide_budget(gateway, model):
+    """记下「这条 route 的摘要在小额度里写不完」—— 证据是一对真实请求：小额度那次
+    截断、同一 route 加大额度成功。不是对模型脾气的猜测。
+
+    2026-09-24 实测 claude-opus-5-5@boyue：连续 4 段压缩，每段 6000 额度那次都在 6000
+    处截断、16000 那次都通过（写了 8.6K–9.9K），每段白跑 60–65 s。Claude 的分词器数中文
+    比我们的估算多约六成，同样的内容它就要更多额度。学到之后直接从大额度开始。
+    """
+    def apply(rec):
+        rec["compact_wide_budget"] = True
+    try:
+        update_record(gateway, model, apply)
+    except OSError:
+        pass
+
+
 def note_context_ok(gateway, model, prompt_tokens):
     """记录「这个模型确实收下过这么多 token」—— 只涨不跌的已知下界。
 
