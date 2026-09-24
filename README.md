@@ -594,7 +594,13 @@ Claude Code 自己也不把它们给模型，暂不补。
 `subagent` 工具把只读调研交给一个**全新上下文**的 child agent，只把有界报告交回来。
 适合「在整个仓库里找出所有 X 并判断哪些要改」这类中间要读几十个文件、
 但主线只需要结论的任务。约束编在代码里：只提供 `read_file/list_dir/glob/grep`，
-**不可嵌套**、报告有长度上限，并沿用触发时冻结的模型、网关与 hook context。
+**不可嵌套**、报告有长度上限，并沿用触发时冻结的网关与 hook context。
+
+**派之前先问你用哪个模型。** 交互会话里，主模型要派子代理时会弹出决策门，一个子代理
+一道题（「agent1 · 查资料 · 任务：… 用哪个模型？」）：推荐项是主会话当前的模型，其余选项
+来自席位池里实测能用的旗舰（最多 4 个）。一次派几个就能各选各的；Esc 取消这次派发，
+主模型会被告知是你取消的。`/auto`、非交互运行（`-p`）、子代理自己再派时不弹，照旧用
+当前模型；嫌打扰可在 settings 里设 `"subagent_model_gate": false`。
 
 普通 chat 的主模型可自行决定调用它，不需要用户先开 `/workflow` 或特殊 effort。
 单个高上下文调查走 `task`；真正互相独立的调查可用 `tasks` 一次并行启动 2–3 个
@@ -623,8 +629,8 @@ M3c-3 已实现的交互合同如下：
 |---|---|
 | `/agents`、`/agents list`、Ctrl+T | 只列当前 chat 的 child；行内显示 state、short id、name、model@gateway、更新时间与 pending inbox |
 | Space / `/agents peek <id>` | 有界查看最新 child transcript，不改变输入目标 |
-| Enter / `/agents attach <id>` | attach 后 prompt 明示 `agent <id>›`，footer 同时保留主 chat 属性和 child 状态/route |
-| Esc、列 0 Left、`/agents detach` | 回主输入框，恢复 attach 前的主草稿、历史和 queue，不取消主/child 工作 |
+| Enter / `/agents attach <id>` | **整屏切到这个子代理的记录**：开头是主代理交给它的原话（高亮块），之后是它的每一步，边跑边更新；青色标题行写明在看谁；PgUp/PgDn、滚轮滚它的记录；打字发给它（prompt 明示 `agent <id>›`） |
+| Esc、列 0 Left、`/agents detach` | 回主会话：主屏原样还在，看子代理期间主会话的新输出随即补上；恢复 attach 前的主草稿、历史和 queue，不取消主/child 工作 |
 | `/agents send <id> <text>` | 向 child inbox 追加一条独立消息；completed/waiting child 在后台恢复同一 transcript |
 
 attach 期间 Enter/Tab 都定向到 child inbox，主会话 steer/next-turn queue 保持原样且不与

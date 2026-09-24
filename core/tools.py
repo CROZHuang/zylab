@@ -2368,6 +2368,92 @@ def _child_extra_tools():
         return ()
 
 
+SUBAGENT_GATE_CONTEXT = "给每个子代理选模型：推荐项是主会话当前的模型。Esc 取消这次派发。"
+
+
+def _subagent_model_options(model, gateway):
+    """决策门里的选项：当前模型（推荐）+ 席位池里实测能用的另几家，最多 4 个。
+
+    不另编名单：席位池是用户 2026-09-04 自己定的异构组合（Kimi / GLM / DeepSeek /
+    Qwen 旗舰），`workflow_default_rows` 只给出最近一次实测成功、能调工具的那条 route。
+    """
+    from . import models as models_db
+    options = [{"label": f"{model}（当前模型）", "model": model, "gateway": gateway,
+                "detail": f"{gateway} · 和主会话同一个模型"}]
+    seen = {(str(gateway), str(model))}
+    try:
+        rows = models_db.workflow_default_rows()
+    except Exception:                                  # noqa: BLE001 - 能力表坏了就只给当前模型
+        rows = []
+    for row in rows:
+        route = (str(row.get("gateway") or ""), str(row.get("id") or ""))
+        if not all(route) or route in seen:
+            continue
+        seen.add(route)
+        options.append({"label": route[1], "model": route[1], "gateway": route[0],
+                        "detail": f"{row.get('seat') or '席位'} · {route[0]}"})
+        if len(options) == 4:                          # 决策门每题最多 4 个选项
+            break
+    return options
+
+
+def _choose_subagent_models(_task, execution, specs, model, gateway):
+    """派子代理前让用户给每个代理选模型（用户 2026-09-24：「会弹出来决策门让 user
+    选择模型，比如 agent1 任务 XXX，你想选择 XX model」）。
+
+    返回 [(model, gateway)…]，与 specs 一一对应；None = 用户按 Esc 取消了这次派发；
+    [] = 没有问（不是主 agent、/auto、关掉了、没有可选的另一个模型、非交互）→ 照旧用
+    当前模型。没答 ≠ 同意任何一个具体选择，所以「没问成」一律回到原来的行为。
+    """
+    role = str(getattr(execution, "interaction_role", "main") or "main").lower()
+    if role != "main":
+        return []                                     # 子代理 / workflow 自己再派，不打扰人
+    cfg = HOOK_CTX.get("cfg") if isinstance(HOOK_CTX.get("cfg"), dict) else {}
+    if cfg.get("subagent_model_gate", True) is False:
+        return []
+    auto = HOOK_CTX.get("session_auto")
+    if callable(auto) and auto():
+        return []
+    request_interaction = getattr(_task, "request_interaction", None)
+    if not callable(request_interaction):
+        return []
+    options = _subagent_model_options(model, gateway)
+    if len(options) < 2:
+        return []
+    questions = []
+    for index, spec in enumerate(specs, 1):
+        task_text = " ".join(str(spec.get("task") or "").split())
+        name = " ".join(str(spec.get("name") or "").split()) or f"agent{index}"
+        questions.append({
+            "id": f"agent{index}",
+            "question": (f"agent{index} · {name[:80]}\n任务：{task_text[:300]}"
+                         "\n\n用哪个模型？")[:2_000],
+            "options": [
+                {"label": option["label"], "detail": option["detail"],
+                 **({"recommended": True} if position == 0 else {})}
+                for position, option in enumerate(options)],
+            "multi_select": False,
+        })
+    try:
+        normalized, _labels = normalize_decision_gate_request(
+            None, None, SUBAGENT_GATE_CONTEXT, questions=questions)
+    except ValueError:
+        return []
+    normalized["_interaction_role"] = "main"
+    result = _decision_gate_result(
+        request_interaction("decision_gate", normalized), normalized)
+    status = result.get("status")
+    if status == "cancelled":
+        return None
+    if status != "resolved":
+        return []
+    answers = result.get("answers") or {}
+    by_label = {option["label"]: (option["model"], option["gateway"])
+                for option in options}
+    return [by_label.get(str(answers.get(f"agent{index}") or ""), (model, gateway))
+            for index in range(1, len(specs) + 1)]
+
+
 def t_subagent(task=None, context=None, tasks=None, _task=None, **_):
     from . import subagent
     if task is not None and tasks is not None:
@@ -2419,8 +2505,23 @@ def t_subagent(task=None, context=None, tasks=None, _task=None, **_):
         # 这里只是把答案传下去；agents.create 还会按 CHILD_EXTRA_ALLOWED 过滤一遍。
         "extra_tools": _child_extra_tools(),
     }
+    specs = (
+        [dict(item) for item in tasks if isinstance(item, dict)]
+        if tasks is not None
+        else [{"task": task, "name": task}])
+    routes = _choose_subagent_models(
+        _task, execution, specs, common["model"], common["gateway"])
+    if routes is None:
+        return ("用户在选择模型的决策门里取消了这次派发，没有启动任何子代理。"
+                "不要再次派发同样的子代理，除非用户要求。")
     if tasks is not None:
+        if routes:
+            tasks = [dict(item, _model=route[0], _gateway=route[1])
+                     if isinstance(item, dict) else item
+                     for item, route in zip(tasks, routes)]
         return subagent.run_batch(tasks, **common)
+    if routes:
+        common["model"], common["gateway"] = routes[0]
     return subagent.run(task, context, **common)
 
 

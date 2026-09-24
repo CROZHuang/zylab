@@ -3665,6 +3665,10 @@ class InputPump:
             except queue.Empty:
                 return events
 
+    def set_agent_view_mode(self, active):
+        with self._lock:
+            self._agent_view_mode = bool(active)
+
     def set_history_mode(self, active):
         with self._lock:
             active = bool(active)
@@ -3724,6 +3728,16 @@ class InputPump:
             # The next redraw will issue a fresh DSR query.  Keeping the old
             # absolute row could map an immediate click into the wrong frame.
             self._cursor_screen_row = None
+        if getattr(self, "_agent_view_mode", False):
+            # 在看子代理：翻页、滚轮滚它的记录；打字、Esc、行首 ← 照常交给输入框
+            # （输入框此刻发往子代理，Esc / 行首 ← 由它发 detach 回 main）。
+            if isinstance(key, MouseEvent) and key.kind in {"scroll_up", "scroll_down"}:
+                return [PumpEvent("history_scroll",
+                                  value=3 if key.kind == "scroll_up" else -3)]
+            if key == "pageup":
+                return [PumpEvent("history_scroll", value="page_up")]
+            if key == "pagedown":
+                return [PumpEvent("history_scroll", value="page_down")]
         if isinstance(key, MouseEvent):
             if (key.modifiers & _MOUSE_SHIFT
                     and key.kind not in {"scroll_up", "scroll_down"}):
@@ -4567,6 +4581,9 @@ class TerminalRenderer:
         self._transcript_source_length = 0
         self._transcript_tool_names = {}
         self._history_active = False
+        # 子代理视图（attach 时整屏切过去）：借历史浏览那条备用屏通路——主会话在此期间的
+        # 输出照常记录、延后补画，回 main 时终端自己把主屏原样还回来。None = 没在看子代理。
+        self._agent_view = None
         self._history_offset = 0
         self._history_anchor_id = None
         self._history_header_row = None
@@ -4642,7 +4659,11 @@ class TerminalRenderer:
 
     @property
     def history_active(self):
-        return self._history_active
+        return self._history_active and self._agent_view is None
+
+    @property
+    def agent_view_active(self):
+        return self._agent_view is not None
 
     @property
     def mouse_enabled(self):
@@ -5252,7 +5273,9 @@ class TerminalRenderer:
 
     def _history_rows(self, width):
         rows = []
-        for entry in self._transcript:
+        source = (self._agent_view["entries"] if self._agent_view is not None
+                  else self._transcript)
+        for entry in source:
             values = entry.text.replace("\r\n", "\n").replace(
                 "\r", "\n").split("\n")
             if values and values[-1] == "":
@@ -5615,7 +5638,37 @@ class TerminalRenderer:
             self.render(snapshot)
         return True
 
+    def _agent_view_window(self, height, width):
+        view = self._agent_view
+        if (self._history_rows_snapshot is None
+                or self._history_snapshot_width != width):
+            self._history_rows_snapshot = self._history_rows(width)
+            self._history_snapshot_width = width
+        rows = self._history_rows_snapshot
+        max_offset = max(0, len(rows) - max(1, height))
+        self._history_offset = min(max(0, self._history_offset), max_offset)
+        end = max(0, len(rows) - self._history_offset)
+        start = max(0, end - max(1, height))
+        self._history_window_start = start
+        self._history_window_end = end
+        unseen = (f" · main +{self._history_unseen} 条新输出"
+                  if self._history_unseen else "")
+        position = f"{start + 1}-{end}/{len(rows)}" if rows else "0/0"
+        # 这一行最要紧的是「你在看谁」和「怎么回去」：先保住它们，按键说明有地方才加。
+        back = " · Esc 回 main"
+        extra = " · PgUp/PgDn 滚动 · 打字发给它"
+        fixed = f" · {position}{unseen}{back}"
+        title = " ".join(str(view.get("title") or "").split())
+        room = max(8, width - display_width("  ● " + fixed) - 1)
+        title = truncate_display(title, room)
+        header = f"  ● {title}{fixed}"
+        if display_width(header + extra) <= width:
+            header += extra
+        return truncate_display(header, width), rows[start:end]
+
     def _history_window(self, height, width):
+        if self._agent_view is not None:
+            return self._agent_view_window(height, width)
         if (self._history_rows_snapshot is None
                 or self._history_snapshot_width != width):
             if self._history_selection_anchor is not None:
@@ -5684,6 +5737,8 @@ class TerminalRenderer:
             "assistant": "\x1b[38;5;252m",
             "tool": "\x1b[38;5;110m",
             "status": "\x1b[2;38;5;103m",
+            # 子代理视图开头那块「主代理交给它的原话」
+            "brief": "\x1b[48;5;236;38;5;253m",
         }.get(kind, "\x1b[38;5;250m")
 
     def _render_history(self, snapshot):
@@ -5710,7 +5765,10 @@ class TerminalRenderer:
                 + self._highlight_history_row(text, row_index, width)
                 + ("\x1b[0m" if self.styled else ""))
         padding = max(0, history_height - len(history_lines))
-        header_style = "\x1b[48;5;236;38;5;250m" if self.styled else ""
+        header_style = (
+            ("\x1b[48;5;30;38;5;231m" if self._agent_view is not None
+             else "\x1b[48;5;236;38;5;250m")
+            if self.styled else "")
         reset = "\x1b[0m" if self.styled else ""
         lines = [header_style + header
                  + " " * max(0, width - display_width(header))
@@ -5729,6 +5787,14 @@ class TerminalRenderer:
 
     def _ensure_history_offset(self, desired, height, width, *, home=False):
         """Page older canonical messages until ``desired`` can be displayed."""
+        if self._agent_view is not None:
+            if (self._history_rows_snapshot is None
+                    or self._history_snapshot_width != width):
+                self._history_rows_snapshot = self._history_rows(width)
+                self._history_snapshot_width = width
+            max_offset = max(
+                0, len(self._history_rows_snapshot) - max(1, height))
+            return max_offset if home else min(max(0, desired), max_offset)
         if home:
             self._prepend_source_entries(all_remaining=True, width=width)
         while True:
@@ -5753,6 +5819,8 @@ class TerminalRenderer:
 
     def scroll_history(self, amount, snapshot=None):
         self._check_owner()
+        if self._agent_view is not None:
+            return self._scroll_agent_view(amount, snapshot)
         return False                     # 内联模式没有历史浏览器：向上滚就是终端自己的 scrollback
         if not self._transcript:
             return False
@@ -5801,6 +5869,90 @@ class TerminalRenderer:
         self._render_history(snapshot)
         return self._history_active
 
+    def _agent_view_entries(self, brief, messages):
+        """子代理的记录 → 视图条目：开头是主代理交给它的原话，之后是它自己的对话。"""
+        entries = []
+        brief = str(brief or "").strip()
+        if brief:
+            entries.append(_TranscriptEntry(
+                id=("agent-brief", 0), kind="brief",
+                parts=["任务说明（主代理交给它的原话）\n" + brief]))
+        skipped_brief = False
+        for index, message in enumerate(messages or ()):
+            if not isinstance(message, dict) or message.get("role") == "system":
+                continue
+            if (not skipped_brief and brief and message.get("role") == "user"
+                    and self._message_text(message).strip().startswith(
+                        brief.splitlines()[0].strip())):
+                skipped_brief = True          # 就是上面那块，别再列一遍
+                continue
+            entries.extend(self._message_entries(message, index))
+        return entries
+
+    def open_agent_view(self, *, title, brief, messages, snapshot=None):
+        """整屏切到一个子代理的记录（备用屏）。主会话此间的输出照常记录、延后补画。"""
+        self._check_owner()
+        self._agent_view = {"title": str(title or ""),
+                            "entries": self._agent_view_entries(brief, messages),
+                            "brief": brief}
+        if not self._history_active:
+            self.clear_spinner()
+            self._history_active = True
+            self._clear_composer_selection()
+            self._history_deferred = []
+            self._history_deferred_chars = 0
+            self._history_unseen = 0
+            self._clear_history_selection()
+            self._history_notice = ""
+            self._write(CSI + "?1049h")
+        self._history_offset = 0
+        self._history_rows_snapshot = None
+        self._render_history(snapshot or self._last_snapshot)
+        return True
+
+    def update_agent_view(self, *, messages, title=None, snapshot=None):
+        """子代理又往前走了：换上新记录。在看底部就跟着到底，往上翻着就停在原处。"""
+        self._check_owner()
+        view = self._agent_view
+        if view is None:
+            return False
+        width = max(20, _cols() - 1)
+        before = len(self._history_rows(width)) if self._history_offset else 0
+        view["entries"] = self._agent_view_entries(view.get("brief"), messages)
+        if title is not None:
+            view["title"] = str(title)
+        self._history_rows_snapshot = None
+        if self._history_offset:
+            grown = len(self._history_rows(width)) - before
+            self._history_offset = max(0, self._history_offset + grown)
+        self._render_history(snapshot or self._last_snapshot)
+        return True
+
+    def close_agent_view(self, snapshot=None):
+        """回 main：退出备用屏（终端把主屏原样还回来），补画这段时间主会话的输出。"""
+        self._check_owner()
+        if self._agent_view is None:
+            return False
+        return self.close_history(snapshot)
+
+    def _scroll_agent_view(self, amount, snapshot=None):
+        snapshot = snapshot or self._last_snapshot
+        width = max(20, _cols() - 1)
+        frame_lines, _, _ = self._build_frame(snapshot, width)
+        height = max(1, _lines() - len(frame_lines) - 1)
+        page = max(3, height - 2)
+        delta = {"page_up": page, "page_down": -page}.get(amount)
+        if delta is None:
+            try:
+                delta = int(amount)
+            except (TypeError, ValueError):
+                delta = 0
+        self._history_offset = self._ensure_history_offset(
+            max(0, self._history_offset + delta), height, width,
+            home=(amount == "home"))
+        self._render_history(snapshot)
+        return True
+
     def history_click(self, event, snapshot=None):
         """Backward-compatible name for history mouse handling."""
         return self.history_mouse(event, snapshot)
@@ -5822,6 +5974,7 @@ class TerminalRenderer:
             return False
         self._set_mouse_tracking("drag")
         deferred = self._history_deferred
+        self._agent_view = None
         self._history_active = False
         self._history_offset = 0
         self._history_anchor_id = None

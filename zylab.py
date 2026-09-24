@@ -870,6 +870,8 @@ class Session:
         tools.HOOK_CTX["workflow_start"] = self._start_workflow_from_tool
         tools.HOOK_CTX["workflow_control"] = self._control_workflow_from_tool
         tools.HOOK_CTX["decision_gate"] = self.decision_gate
+        # 派子代理前的「选模型」决策门在 /auto 下不弹（工具在 worker 线程里，看不到会话）。
+        tools.HOOK_CTX["session_auto"] = lambda: bool(getattr(self, "auto", False))
         tools.HOOK_CTX["goal_propose"] = self._goal_proposal_from_tool
         tools.HOOK_CTX["task_status"] = self.task_status_for_tool
         tools.HOOK_CTX["context_status"] = self.context_status_for_tool
@@ -3081,12 +3083,82 @@ class Session:
             self.pump.replace_buffer(
                 self._agent_drafts.get(run_id, ""),
                 active=True, publish=True)
+        self.open_agent_view(record)
         return record
+
+    # ---- 子代理视图：attach 即整屏切到它的记录（CC 的 subagent 视图，用户 2026-09-24 要）----
+    # 开头是主代理交给它的原话，之后是它自己的对话；每秒看一眼它的记录，有新东西就换上。
+    # 画在备用屏里：主会话此间的输出照常记录、延后补画，回 main 时终端把主屏原样还回来。
+    AGENT_VIEW_REFRESH_SECONDS = 1.0
+
+    def _agent_view_payload(self, record):
+        run_id = str(record.get("id") or "")
+        try:
+            transcript = self.agent_workspace.transcript(run_id) or {}
+        except Exception:                                  # noqa: BLE001
+            transcript = {}
+        messages = list(transcript.get("messages") or [])
+        title = _agent_dock_row(
+            record, activity=self._agent_activity.get(run_id, ""),
+            tokens=self._agent_tokens(record))
+        brief = str(record.get("task") or "")
+        if record.get("context"):
+            brief += "\n\n补充背景：\n" + str(record["context"])
+        return title, brief, messages
+
+    def open_agent_view(self, record):
+        opener = getattr(self.renderer, "open_agent_view", None)
+        if not callable(opener) or self.pump is None:
+            return False            # 全屏应用模式：保持原来的「只改输入框」
+        title, brief, messages = self._agent_view_payload(record)
+        opener(title=title, brief=brief, messages=messages,
+               snapshot=self.pump.snapshot())
+        self.pump.set_agent_view_mode(True)
+        self._agent_view_seen = (len(messages), title)
+        self._agent_view_checked = time.monotonic()
+        return True
+
+    def close_agent_view(self):
+        if self.pump is not None:
+            self.pump.set_agent_view_mode(False)
+        closer = getattr(self.renderer, "close_agent_view", None)
+        if not callable(closer):
+            return False
+        return closer(self.pump.snapshot() if self.pump is not None else None)
+
+    def refresh_agent_view(self, *, force=False):
+        """子代理视图开着时，每秒看一眼它的记录；有新东西（或名册那行变了）就换上。"""
+        if not getattr(self.renderer, "agent_view_active", False):
+            # 被动关掉（主会话输出攒太多被迫回屏）时，输入泵也回到正常模式。
+            if self.pump is not None and getattr(self.pump, "_agent_view_mode", False):
+                self.pump.set_agent_view_mode(False)
+            return False
+        now = time.monotonic()
+        if (not force and now - getattr(self, "_agent_view_checked", 0.0)
+                < self.AGENT_VIEW_REFRESH_SECONDS):
+            return False
+        self._agent_view_checked = now
+        try:
+            record = self.agent_record(self.attached_agent_id, refresh=True)
+        except Exception:                                  # noqa: BLE001
+            return False
+        if record is None:
+            return False
+        title, _brief, messages = self._agent_view_payload(record)
+        seen = (len(messages), title)
+        if seen == getattr(self, "_agent_view_seen", None):
+            return False
+        self._agent_view_seen = seen
+        self.renderer.update_agent_view(
+            messages=messages, title=title,
+            snapshot=self.pump.snapshot() if self.pump is not None else None)
+        return True
 
     def detach_agent(self, *, draft=None, publish=True):
         run_id = self.attached_agent_id
         if not run_id:
             return None
+        self.close_agent_view()
         snapshot = self.pump.snapshot() if self.pump is not None else None
         self._agent_drafts[run_id] = (
             str(draft) if draft is not None
@@ -5684,6 +5756,7 @@ class Session:
         def handle_input_events():
             nonlocal editor_active
             self.heartbeat_lease()
+            self.refresh_agent_view()
             for notice in self.drain_task_events():
                 emit_block(
                     notice["text"], source=notice["source"])
@@ -6649,6 +6722,12 @@ def status_line(sess):
         BOLD(title[:34]),
         BOLD(f"{ag.model}@{gateway}"),
     ]
+    # 在 /model 里给这个模型选了推理强度，就像 CC 的「Fable 5.1 · max」那样挂在模型旁边。
+    # 只读内存里的选择，不去读能力表：状态栏刷新得很勤。
+    effort_for = getattr(ag, "effort_for", None)
+    effort = effort_for() if callable(effort_for) else None
+    if isinstance(effort, str) and effort:
+        bits.append(f"推理 {effort}")
     pending_route = getattr(sess, "_pending_route", None)
     if pending_route:
         bits.append(BLUE(
@@ -14748,6 +14827,7 @@ def repl(sess, model):
                     if app_mode:
                         renderer.drain_posted()
                     sess.heartbeat_lease()
+                    sess.refresh_agent_view()
                     render_async_notices()
                     render_away_recap_ready()
                     render_memory_extract_ready()

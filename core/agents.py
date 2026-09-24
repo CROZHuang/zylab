@@ -681,9 +681,10 @@ class AgentRuntime:
             execution_context = tools.ExecutionContext.capture(
                 session=execution_context.session,
                 turn_id=execution_context.turn_id,
-                model=execution_context.model or model or MODEL,
-                gateway=(execution_context.gateway
-                         or client.route_for(gateway).name),
+                model=model or execution_context.model or MODEL,
+                gateway=(client.route_for(gateway).name if gateway
+                         else execution_context.gateway
+                         or client.route_for(None).name),
                 permission_mode=execution_context.permission_mode,
                 interaction_role=_interaction_role_for_kind(kind),
                 hook_config=execution_context.hook_config(),
@@ -692,11 +693,16 @@ class AgentRuntime:
         else:
             # The parent context may carry ``main``.  Child records must never
             # inherit that authority across the spawn boundary.
+            #
+            # 显式给了 model / gateway 就用它（用户在决策门里给这个子代理选的模型），
+            # 没给才沿用父上下文的。以前这里一律用父上下文的 —— 传进来的 model 被
+            # 悄悄丢掉（2026-09-24 选模型的端到端测试抓到：两个子代理都跑在父模型上）。
             execution_context = tools.ExecutionContext.capture(
                 session=execution_context.session,
                 turn_id=execution_context.turn_id,
-                model=execution_context.model,
-                gateway=execution_context.gateway,
+                model=model or execution_context.model,
+                gateway=(client.route_for(gateway).name if gateway
+                         else execution_context.gateway),
                 permission_mode=execution_context.permission_mode,
                 interaction_role=_interaction_role_for_kind(kind),
                 hook_config=execution_context.hook_config(),
@@ -856,6 +862,7 @@ class AgentRuntime:
                     initial += "\n\n补充背景：\n" + record["context"]
 
             continuations = 0
+            live_saved = [0.0]
             while True:
                 continuations += 1
                 if continuations > MAX_CONTINUATIONS:
@@ -895,6 +902,14 @@ class AgentRuntime:
                     event_type = event.get("t")
                     if event_type in {"tool_start", "tool_end"} and on_event:
                         on_event(event)
+                    if event_type == "tool_end":
+                        # 每做完一步就把记录落盘（限流）：主会话的子代理视图靠它实时跟进。
+                        # 以前只在一轮结束时存 —— 一个一口气调几十次工具的子代理，
+                        # 看它的人要等它全部做完才看得到任何一步。
+                        now = time.monotonic()
+                        if now - live_saved[0] >= LIVE_TRANSCRIPT_SECONDS:
+                            live_saved[0] = now
+                            sink([])
                     elif event_type == "error":
                         run_error = str(event.get("v") or "child agent error")
                     elif event_type == "interrupted":
@@ -1026,6 +1041,10 @@ class AgentRuntime:
 
     def events(self, identifier):
         return self.store.events(identifier)
+
+
+# 子代理跑的过程中，记录最多每隔这么久落盘一次（见 _execute 的 tool_end）。
+LIVE_TRANSCRIPT_SECONDS = 1.0
 
 
 class _WorkspaceDriver:

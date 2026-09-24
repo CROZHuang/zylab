@@ -154,6 +154,33 @@ class GreedyBatchAgent(FakeAgent):
         yield from super().run(user_input, **kwargs)
 
 
+class StepwiseAgent(FakeAgent):
+    """每一步调一次工具；每做完一步就去读已落盘的记录，看这一步是不是已经看得到。"""
+    observed = []
+    runtime = None
+
+    def run(self, user_input, *, allowed_tools=None, event_sink=None,
+            inbox_source=None, cancel=None, **_kwargs):
+        if user_input is not None:
+            self.messages.append({"role": "user", "content": str(user_input)})
+        for index in range(1, 4):
+            call = f"c{index}"
+            self.messages.append({"role": "assistant", "content": "", "tool_calls": [{
+                "id": call, "type": "function",
+                "function": {"name": "read_file", "arguments": "{}"}}]})
+            yield {"t": "tool_start", "name": "read_file"}
+            self.messages.append({"role": "tool", "tool_call_id": call,
+                                  "content": f"r{index}"})
+            yield {"t": "tool_end", "name": "read_file"}
+            rows = type(self).runtime.list(parent_session_id="parent-session")
+            saved = type(self).runtime.transcript(rows[0]["id"]).get("messages") or []
+            type(self).observed.append(
+                sum(1 for message in saved if message.get("role") == "tool"))
+        self.messages.append({"role": "assistant", "content": "report"})
+        yield {"t": "text", "v": "report"}
+        yield {"t": "end", "reason": "done"}
+
+
 class BlockingAgent(FakeAgent):
     started = threading.Event()
 
@@ -495,6 +522,18 @@ class AgentRuntimeTests(unittest.TestCase):
         self.assertTrue(all(
             row["parent_tool_call_id"] == "call-batch" for row in rows))
         self.assertLessEqual(len(result), subagent.MAX_COMBINED_REPORT + 500)
+
+    def test_each_step_is_saved_while_the_child_is_still_running(self):
+        """主会话的子代理视图靠落盘的记录实时跟进。以前只在一轮结束时存：一个一口气
+        调几十次工具的子代理，看它的人要等它全部做完才看得到任何一步。"""
+        StepwiseAgent.observed = []
+        with tempfile.TemporaryDirectory() as tmp, \
+                mock.patch.object(agents, "LIVE_TRANSCRIPT_SECONDS", 0):
+            runtime = agents.AgentRuntime(Path(tmp) / "runs",
+                                          agent_factory=StepwiseAgent)
+            StepwiseAgent.runtime = runtime
+            runtime.run_new("read three files", execution_context=execution())
+        self.assertEqual(StepwiseAgent.observed, [1, 2, 3])
 
     def test_batch_subagents_enforce_per_child_provider_attempt_budget(self):
         tasks = [

@@ -23,15 +23,60 @@ from tests.platform_support import assert_mode  # noqa: E402
 import zylab  # noqa: E402
 
 
+# 子进程环境是刻意精简的（陌生人的第一分钟），但 CPython 在 Windows 上缺了这几个就起不来：
+# 没有 SystemRoot，初始化随机数就失败 —— `Fatal Python error: … Python runtime state:
+# preinitialized`，Windows 3.10 那列冷启动 6 个失败的共同根因（2026-09-24 CI）。
+# 按「有就透传」写、不问平台：Linux / macOS 上本来就没有这些变量，行为不变。
+OS_ESSENTIALS = ("SystemRoot", "WINDIR", "PATHEXT", "COMSPEC")
+
+
 def run(args, home, extra=None, timeout=90):
     env = {"HOME": home, "PATH": "/usr/bin:/bin", "TERM": "dumb",
            "PYTHONIOENCODING": "utf-8",
            "ZYLAB_APP_ROOT": home,            # 别让仓库里的 .zylab-home/ 把测试引到真实状态
            "ZYLAB_KEYS_FILE": os.path.join(home, "keys.env")}
+    for name in OS_ESSENTIALS:
+        value = os.environ.get(name)          # Windows 上 os.environ 不分大小写
+        if value:
+            env[name] = value
     env.update(extra or {})
     return subprocess.run(
         [sys.executable, ENTRY, *args], env=env, cwd=ROOT, encoding="utf-8", errors="replace", text=True,
         capture_output=True, timeout=timeout, stdin=subprocess.DEVNULL)
+
+
+class ChildEnvironment(unittest.TestCase):
+    def test_the_child_keeps_what_windows_needs_to_start(self):
+        """精简环境不能精简掉解释器自己起来要的东西（Windows：SystemRoot）。"""
+        from unittest import mock
+        seen = {}
+
+        def fake_run(argv, env=None, **kwargs):
+            seen.update(env or {})
+            return mock.Mock(returncode=0, stdout="", stderr="")
+
+        with mock.patch.dict(os.environ, {"SystemRoot": r"C:\Windows",
+                                          "PATHEXT": ".COM;.EXE"}), \
+                mock.patch.object(subprocess, "run", side_effect=fake_run):
+            run(["--help"], "/tmp/cold-home")
+        self.assertEqual(seen.get("SystemRoot"), r"C:\Windows")
+        self.assertEqual(seen.get("PATHEXT"), ".COM;.EXE")
+        self.assertEqual(seen["PATH"], "/usr/bin:/bin", "其余照旧精简")
+
+    def test_nothing_extra_leaks_in_where_those_variables_do_not_exist(self):
+        from unittest import mock
+        seen = {}
+
+        def fake_run(argv, env=None, **kwargs):
+            seen.update(env or {})
+            return mock.Mock(returncode=0, stdout="", stderr="")
+
+        with mock.patch.dict(os.environ, {}, clear=False), \
+                mock.patch.object(subprocess, "run", side_effect=fake_run):
+            for name in OS_ESSENTIALS:
+                os.environ.pop(name, None)
+            run(["--help"], "/tmp/cold-home")
+        self.assertFalse(set(OS_ESSENTIALS) & set(seen))
 
 
 class ColdStartTests(unittest.TestCase):

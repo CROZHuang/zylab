@@ -47,6 +47,9 @@ def _normalize_batch(tasks):
         normalized.append({
             "task": task, "context": context or None,
             "name": name or f"Explore {index}",
+            # 用户在决策门里给这个子代理选的模型（内部键，工具参数里没有）
+            "model": str(raw.get("_model") or "") or None,
+            "gateway": str(raw.get("_gateway") or "") or None,
         })
     return normalized
 
@@ -108,7 +111,8 @@ def run_batch(tasks, *, model=None, gateway=None, execution_context=None,
                 record = workspace.spawn(
                     spec["task"], spec["context"],
                     execution_context=execution_context,
-                    model=model, gateway=gateway, name=spec["name"],
+                    model=spec.get("model") or model,
+                    gateway=spec.get("gateway") or gateway, name=spec["name"],
                     parent_tool_call_id=parent_tool_call_id,
                     kind="subagent", context_capsule=context_capsule,
                     extra_tools=extra_tools,

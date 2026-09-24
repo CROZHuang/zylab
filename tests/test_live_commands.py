@@ -471,6 +471,15 @@ class LiveCommandTests(unittest.TestCase):
         text = self.switch_with_context(40_000, 217_600)
         self.assertNotIn("先压缩", text)
 
+    def test_the_chosen_effort_shows_next_to_the_model(self):
+        """CC 在状态栏写「Fable 5.1 · max」；zylab 选了推理强度也要看得见。"""
+        self.assertNotIn("推理", CLI.status_line(self.session))
+        self.agent.set_effort("deepinfer", "old-model", "high")
+        self.assertIn("推理 high", CLI.status_line(self.session))
+        self.agent.set_effort("deepinfer", "other-model", "low")
+        self.assertNotIn("推理 low", CLI.status_line(self.session),
+                         "别的模型的选择不串到当前这个")
+
     def test_auto_toggle_changes_only_future_permission_decisions(self):
         with mock.patch.object(sys.stdin, "isatty", return_value=False):
             prior = self.session.permission_decision(

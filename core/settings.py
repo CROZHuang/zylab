@@ -75,6 +75,9 @@ DEFAULTS = {
     # [] = 所有家族都列。None = 出厂的六家（models.DEFAULT_PREFERRED_FAMILIES）。
     # 小目录（官方 API、DeepInfer）不受影响：实测能用的全列。
     "preferred_families": None,
+    # 派子代理前弹决策门，让你给每个子代理选模型（推荐项是主会话当前的模型）。
+    # /auto 与非交互运行（-p）下本来就不弹；嫌打扰可以设 false 彻底关掉。
+    "subagent_model_gate": True,
     "model_health": {
         # Seconds. These control probe freshness and the automatic route
         # circuit; explicit route choices may still bypass an open circuit.
