@@ -2371,30 +2371,83 @@ def _child_extra_tools():
 SUBAGENT_GATE_CONTEXT = "给每个子代理选模型：推荐项是主会话当前的模型。Esc 取消这次派发。"
 
 
-def _subagent_model_options(model, gateway):
-    """决策门里的选项：当前模型（推荐）+ 席位池里实测能用的另几家，最多 4 个。
+SUBAGENT_OTHER_LABEL = "其他模型…"
 
-    不另编名单：席位池是用户 2026-09-04 自己定的异构组合（Kimi / GLM / DeepSeek /
-    Qwen 旗舰），`workflow_default_rows` 只给出最近一次实测成功、能调工具的那条 route。
+
+def _subagent_model_options(model, gateway):
+    """决策门里的选项：当前模型（推荐）+ 偏好家族里另两家各一个代表 + 「其他模型…」。
+
+    来源和 /model 同一份（models.subagent_choices）：实测能调工具的、一个模型一条。不读
+    workflow 的席位池——那是手写的四席名单，GPT / Claude / 官方 DeepSeek 永远不出现（用户
+    2026-09-24：「之前最早的 workflow 机制非常死板，给我们后期增添了一定的麻烦」）。
+    返回 ``(选项, 全部可选)``；「其他模型…」只在全部里还有没列出来的时候出现。
     """
-    from . import models as models_db
+    from . import client as client_mod, models as models_db, settings as settings_mod
+    cfg = HOOK_CTX.get("cfg") if isinstance(HOOK_CTX.get("cfg"), dict) else {}
+    ready = {}
+
+    def reachable(route_gateway, _model):
+        """子代理在后台线程里发请求，不会弹「允许明文 HTTP 吗」——发不出去的网关不列。
+        父会话自己的网关刚在主线程上预检过，总是可以。"""
+        if route_gateway == gateway:
+            return True
+        if route_gateway not in ready:
+            try:
+                ready[route_gateway] = client_mod.transport_ready(
+                    client_mod.route_for(route_gateway))
+            except Exception:                              # noqa: BLE001
+                ready[route_gateway] = False
+        return ready[route_gateway]
+
+    try:
+        shortlist, everything = models_db.subagent_choices(
+            model, gateway, preferred=settings_mod.preferred_families(cfg),
+            route_allowed=reachable)
+    except Exception:                                  # noqa: BLE001 - 能力表坏了就只给当前模型
+        shortlist, everything = [], [{"model": model, "gateway": gateway, "family": ""}]
     options = [{"label": f"{model}（当前模型）", "model": model, "gateway": gateway,
                 "detail": f"{gateway} · 和主会话同一个模型"}]
-    seen = {(str(gateway), str(model))}
+    for item in shortlist:
+        options.append({"label": item["model"], "model": item["model"],
+                        "gateway": item["gateway"],
+                        "detail": " · ".join(
+                            value for value in (item.get("family"), item["gateway"]) if value)})
+    listed = {option["model"] for option in options}
+    if any(item["model"] not in listed for item in everything):
+        options.append({"label": SUBAGENT_OTHER_LABEL, "model": None, "gateway": None,
+                        "detail": f"从全部 {len(everything)} 个能调工具的模型里选"
+                                  "（和 /model 同一份）"})
+    return options, everything
+
+
+def _pick_subagent_model(request_interaction, index, spec, everything):
+    """「其他模型…」：在主线程上弹和 /model 同一份的完整列表。
+
+    返回 ``(模型, 网关)``；None = 在列表里按了 Esc（和决策门里 Esc 一样，取消这次派发）；
+    ``()`` = 没问成（非交互、请求无效），照旧用当前模型——没答不等于选了哪个。
+    """
+    name = " ".join(str(spec.get("name") or spec.get("task") or "").split())[:60]
+    rows = []
+    for position, item in enumerate(everything):
+        facts = [value for value in (item.get("family"), item["gateway"]) if value]
+        if position == 0:
+            facts.insert(0, "当前模型")
+        rows.append({"label": item["model"], "detail": " · ".join(facts)})
     try:
-        rows = models_db.workflow_default_rows()
-    except Exception:                                  # noqa: BLE001 - 能力表坏了就只给当前模型
-        rows = []
-    for row in rows:
-        route = (str(row.get("gateway") or ""), str(row.get("id") or ""))
-        if not all(route) or route in seen:
-            continue
-        seen.add(route)
-        options.append({"label": route[1], "model": route[1], "gateway": route[0],
-                        "detail": f"{row.get('seat') or '席位'} · {route[0]}"})
-        if len(options) == 4:                          # 决策门每题最多 4 个选项
-            break
-    return options
+        payload = normalize_pick_request({
+            "title": f"agent{index} · {name or '子代理'} · 用哪个模型？",
+            "options": rows, "_interaction_role": "main"})
+    except ValueError:
+        return ()
+    raw = request_interaction("pick", payload)
+    raw = raw if isinstance(raw, dict) else {}
+    status = str(raw.get("status") or "")
+    if status == "cancelled":
+        return None
+    if status != "resolved" or raw.get("attended") is not True:
+        return ()
+    routes = {item["model"]: (item["model"], item["gateway"]) for item in everything}
+    return routes.get(str(raw.get("choice") or ""), ())
 
 
 def _choose_subagent_models(_task, execution, specs, model, gateway):
@@ -2417,7 +2470,7 @@ def _choose_subagent_models(_task, execution, specs, model, gateway):
     request_interaction = getattr(_task, "request_interaction", None)
     if not callable(request_interaction):
         return []
-    options = _subagent_model_options(model, gateway)
+    options, everything = _subagent_model_options(model, gateway)
     if len(options) < 2:
         return []
     questions = []
@@ -2449,9 +2502,18 @@ def _choose_subagent_models(_task, execution, specs, model, gateway):
         return []
     answers = result.get("answers") or {}
     by_label = {option["label"]: (option["model"], option["gateway"])
-                for option in options}
-    return [by_label.get(str(answers.get(f"agent{index}") or ""), (model, gateway))
-            for index in range(1, len(specs) + 1)]
+                for option in options if option.get("model")}
+    routes = []
+    for index, spec in enumerate(specs, 1):
+        label = str(answers.get(f"agent{index}") or "")
+        if label == SUBAGENT_OTHER_LABEL:
+            picked = _pick_subagent_model(request_interaction, index, spec, everything)
+            if picked is None:
+                return None
+            routes.append(picked or (model, gateway))
+        else:
+            routes.append(by_label.get(label, (model, gateway)))
+    return routes
 
 
 def t_subagent(task=None, context=None, tasks=None, _task=None, **_):
@@ -2523,6 +2585,50 @@ def t_subagent(task=None, context=None, tasks=None, _task=None, **_):
     if routes:
         common["model"], common["gateway"] = routes[0]
     return subagent.run(task, context, **common)
+
+
+def normalize_pick_request(payload):
+    """「从列表里选一项」的请求（kind="pick"）：标题 + 1–500 个 {label, detail}，label 唯一。
+
+    和决策门一样当不可信数据处理：主线程只画规范化以后的这一份。
+    """
+    payload = payload if isinstance(payload, dict) else {}
+    title = " ".join(str(payload.get("title") or "").split())[:300] or "选择一项"
+    raw = payload.get("options")
+    if not isinstance(raw, (list, tuple)) or not 1 <= len(raw) <= 500:
+        raise ValueError("pick 需要 1-500 个 options")
+    options, labels = [], set()
+    for index, option in enumerate(raw):
+        if not isinstance(option, dict):
+            raise ValueError(f"pick option[{index}] 必须是 object")
+        label = str(option.get("label") or "").strip()
+        if not label or "\x00" in label or len(label) > 160:
+            raise ValueError(f"pick option[{index}] label 无效")
+        if label in labels:
+            raise ValueError(f"pick option[{index}] label 重复")
+        labels.add(label)
+        detail = " ".join(str(option.get("detail") or "").split())[:300]
+        options.append({"label": label, "detail": detail})
+    return {"title": title, "options": options, "_interaction_role": "main"}
+
+
+def normalize_pick_result(raw, request):
+    """主线程的回答 → 交回工作线程的结果。选项外的「选择」一律作废，不冒充用户选了什么。"""
+    labels = {option["label"] for option in (request or {}).get("options") or ()}
+    raw = raw if isinstance(raw, dict) else {}
+    status = str(raw.get("status") or "").strip().lower()
+    reason = str(raw.get("reason") or "")[:512]
+    if status == "resolved":
+        choice = str(raw.get("choice") or "").strip()
+        if raw.get("attended") is True and choice in labels:
+            return {"choice": choice, "notes": "", "attended": True, "status": "resolved"}
+        status, reason = "invalid", "回答不在原来的选项里"
+    if status not in _DECISION_GATE_STATUSES:
+        status = "invalid"
+    result = {"choice": "", "notes": "", "attended": False, "status": status}
+    if reason:
+        result["reason"] = reason
+    return result
 
 
 _DECISION_GATE_STATUSES = frozenset({

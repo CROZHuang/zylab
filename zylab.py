@@ -3077,6 +3077,8 @@ class Session:
             busy = snapshot.busy
             self.pump.configure(
                 target=run_id, target_history=self._agent_history(record),
+                target_label=_agent_label(record),
+                dock=_composer_dock_items(self),
                 busy=busy, prompt=self.composer_prompt(busy=busy),
                 queued=self._composer_queue(), status=status_line(self),
                 activity=snapshot.activity, publish=False)
@@ -3085,6 +3087,19 @@ class Session:
                 active=True, publish=True)
         self.open_agent_view(record)
         return record
+
+    def switch_agent(self, identifier):
+        """名册里 Enter（或点选）：切到那个子代理；已经在看它就不动。
+
+        有整屏子代理视图时直接切过去。以前先往主会话里打一段预览再 attach——在名册里
+        来回切几次，主会话的记录里就堆了几段同样的预览。
+        """
+        identifier = str(identifier or "").strip()
+        if identifier and identifier == str(self.attached_agent_id or ""):
+            return None
+        if not callable(getattr(self.renderer, "open_agent_view", None)):
+            show_agent_preview(self, identifier)    # 全屏应用模式没有子代理视图：保留预览
+        return self.attach_agent(identifier)
 
     # ---- 子代理视图：attach 即整屏切到它的记录（CC 的 subagent 视图，用户 2026-09-24 要）----
     # 开头是主代理交给它的原话，之后是它自己的对话；每秒看一眼它的记录，有新东西就换上。
@@ -3098,7 +3113,7 @@ class Session:
         except Exception:                                  # noqa: BLE001
             transcript = {}
         messages = list(transcript.get("messages") or [])
-        title = _agent_dock_row(
+        title = _agent_view_title(
             record, activity=self._agent_activity.get(run_id, ""),
             tokens=self._agent_tokens(record))
         brief = str(record.get("task") or "")
@@ -3167,7 +3182,8 @@ class Session:
         if self.pump is not None:
             busy = snapshot.busy
             self.pump.configure(
-                target=None, busy=busy,
+                target=None, target_label="", busy=busy,
+                dock=_composer_dock_items(self),
                 prompt=self.composer_prompt(busy=busy),
                 queued=self._composer_queue(), status=status_line(self),
                 activity=snapshot.activity, publish=False)
@@ -5234,6 +5250,42 @@ class Session:
                 pass
         return False
 
+    def _pick_owner(self, payload):
+        """在 terminal owner 线程上弹一个列表让人选一项（派子代理时的「其他模型…」）。
+
+        用的就是 /model 那个列表部件：↑↓ 首尾相接、打字筛选；Esc 是取消，不是选了什么。
+        """
+        payload = payload if isinstance(payload, dict) else {}
+        options = [item for item in payload.get("options") or ()
+                   if isinstance(item, dict)]
+        owner = getattr(self, "_ui_owner_thread_id", None)
+        if owner is not None and threading.get_ident() != owner:
+            return self._decision_gate_unattended(
+                options, status="invalid", reason="选择列表必须由 terminal owner 弹出")
+        pump = getattr(self, "pump", None)
+        stream = getattr(pump, "stream", None) if pump is not None else None
+        try:
+            interactive = bool(
+                stream.isatty() if stream is not None else sys.stdin.isatty())
+        except (AttributeError, OSError, ValueError):
+            interactive = False
+        if not interactive or pump is None or getattr(self, "renderer", None) is None:
+            return self._decision_gate_unattended(
+                options, reason="当前运行环境没有可交互 terminal")
+
+        def render(item):
+            detail = str(item.get("detail") or "")
+            return f"{item['label']}  {detail}".rstrip()
+
+        picked = self.pick(
+            options, title=str(payload.get("title") or "选择一项"), render=render,
+            page=12, allow_filter=True,
+            controls="↑↓ 选择 · 打字筛选 · Enter 选定 · Esc 取消")
+        if not isinstance(picked, dict) or not picked.get("label"):
+            return {"choice": "", "notes": "", "attended": False, "status": "cancelled"}
+        return {"choice": str(picked["label"]), "notes": "", "attended": True,
+                "status": "resolved"}
+
     def decision_gate(self, payload):
         """Compatibility callback for direct (owner-thread) tool execution.
 
@@ -5316,6 +5368,24 @@ class Session:
                 result = self._decision_gate_unattended(
                     options, status="invalid",
                     reason=f"decision gate 请求无效：{exc}")
+        elif kind == "pick" and not payload_is_object:
+            result = self._decision_gate_unattended(
+                options, status="invalid",
+                reason="pick interaction payload 必须是 object")
+        elif kind == "pick" and interaction_role != "main":
+            result = self._decision_gate_unattended(
+                options, status="unattended",
+                reason="只有当前窗口的主 agent 可以弹选择列表")
+        elif kind == "pick":
+            # 「从列表里选一项」（派子代理时点了「其他模型…」）：协议与决策门相同。
+            try:
+                normalized_request = tools.normalize_pick_request(payload)
+                payload = normalized_request
+                options = normalized_request["options"]
+            except (TypeError, ValueError) as exc:
+                result = self._decision_gate_unattended(
+                    options, status="invalid",
+                    reason=f"选择列表请求无效：{exc}")
         else:
             result = self._decision_gate_unattended(
                 options, status="invalid",
@@ -5373,7 +5443,7 @@ class Session:
                 result = self._decision_gate_unattended(
                     options, status="persistence_error",
                     reason=f"interaction 请求无法记账：{type(exc).__name__}: {exc}")
-            if (begun and kind == "decision_gate"
+            if (begun and kind in ("decision_gate", "pick")
                     and normalized_request is not None):
                 try:
                     previous_task_id = getattr(
@@ -5383,7 +5453,10 @@ class Session:
                     self._interaction_task_id = task_id
                     self._interaction_request_id = request_id
                     try:
-                        owner_result = self._decision_gate_owner(payload)
+                        owner_result = (
+                            self._decision_gate_owner(payload)
+                            if kind == "decision_gate"
+                            else self._pick_owner(payload))
                     finally:
                         if previous_task_id is None:
                             self.__dict__.pop("_interaction_task_id", None)
@@ -5404,9 +5477,13 @@ class Session:
                 # Normalize before writing the durable resolution.  This
                 # keeps the audit truthful even for a malformed owner,
                 # stale key, or an embedding callback returning extras.
-                result = tools.normalize_decision_gate_result(
-                    owner_result, normalized_request or payload)
-        elif (controller is None and kind == "decision_gate"
+                result = (
+                    tools.normalize_decision_gate_result(
+                        owner_result, normalized_request or payload)
+                    if kind == "decision_gate"
+                    else tools.normalize_pick_result(
+                        owner_result, normalized_request))
+        elif (controller is None and kind in ("decision_gate", "pick")
               and normalized_request is not None):
             result = self._decision_gate_unattended(
                 options, status="persistence_error",
@@ -5929,8 +6006,7 @@ class Session:
                 elif event.kind == "agent_attach":
                     flush_model(force=True)
                     try:
-                        show_agent_preview(self, event.value)
-                        self.attach_agent(event.value)
+                        self.switch_agent(event.value)
                     except (AGENTS.AgentRuntimeError, ValueError) as exc:
                         emit_block(RED(f"  [agents] {exc}\r\n"))
                     snapshot = self.refresh_composer(
@@ -12896,14 +12972,75 @@ def _agent_activity_text(payload):
     return " ".join(part for part in (tool, args[:60]) if part)
 
 
-def _agent_dock_row(record, *, activity="", tokens=None):
-    """名册行（PLAN-agent-visibility 纪律 2/3）：状态点 · 席位 · label · 最近一步 · 耗时 · token。"""
+def _agent_label(record):
+    """子代理的任务名：挂在输入框上沿、写进「发给 @…」。"""
+    record = record or {}
+    text = str(record.get("name") or "").strip() or str(record.get("task") or "").strip()
+    text = " ".join((text.splitlines() or [""])[0].split())
+    return text[:60] or str(record.get("id") or "")
+
+
+def _agent_event(record, *, activity="", tokens=None):
     state = str(record.get("state") or "")
     kind = {"completed": "finished", "failed": "failed", "cancelled": "cancelled"}.get(
         state, "activity")
-    event_obj = AGENT_EVENTS.from_agent_record(
+    return AGENT_EVENTS.from_agent_record(
         kind, record, tokens=tokens, activity=activity)
-    return AGENT_EVENTS.roster_row(event_obj)
+
+
+def _agent_dock_row(record, *, activity="", tokens=None):
+    """名册行（PLAN-agent-visibility 纪律 2/3）：状态点 · 席位 · label · 最近一步 · 耗时 · token。"""
+    return AGENT_EVENTS.roster_row(
+        _agent_event(record, activity=activity, tokens=tokens))
+
+
+def _agent_view_title(record, *, activity="", tokens=None):
+    """子代理视图标题行里的「在看谁」：就是名册里它那一行（● 正在看）。"""
+    left, right, _tone = AGENT_EVENTS.roster_parts(
+        _agent_event(record, activity=activity, tokens=tokens), viewed=True)
+    return f"{left}  {right}" if right else left
+
+
+_ROSTER_TOKENS_SECONDS = 5.0
+
+
+def _roster_tokens(sess, record):
+    """名册右边的 token 数。要读子代理的记录文件，所以跑着的每 5 秒才读一次，结束了的只读一次。"""
+    counter = getattr(sess, "_agent_tokens", None)
+    if not callable(counter):
+        return None
+    cache = getattr(sess, "_roster_token_cache", None)
+    if not isinstance(cache, dict):
+        cache = {}
+        try:
+            sess._roster_token_cache = cache
+        except AttributeError:
+            pass
+    run_id = str(record.get("id") or "")
+    finished = str(record.get("state") or "") in AGENTS.TERMINAL_STATES
+    now = time.monotonic()
+    cached = cache.get(run_id)
+    if cached is not None and (cached[2] or now - cached[0] < _ROSTER_TOKENS_SECONDS):
+        return cached[1]
+    try:
+        tokens = counter(record)
+    except Exception:                                   # noqa: BLE001 - 名册只是显示
+        tokens = None
+    cache[run_id] = (now, tokens, finished)
+    return tokens
+
+
+def _agent_roster_item(sess, record, *, attached_id=""):
+    """输入框下面名册里一个子代理的那一行（照 CC：● 正在看 / ◯ 其余，耗时 · token 靠右）。"""
+    run_id = str(record.get("id") or "")
+    activity_map = getattr(sess, "_agent_activity", {}) or {}
+    viewed = bool(attached_id) and run_id == attached_id
+    left, right, tone = AGENT_EVENTS.roster_parts(
+        _agent_event(record, activity=activity_map.get(run_id, ""),
+                     tokens=_roster_tokens(sess, record)),
+        viewed=viewed)
+    return tui.DockItem(left, event="agent_attach", value=run_id, viewed=viewed,
+                        right=right, action="查看", tone=tone)
 
 
 def _composer_dock_items(sess):
@@ -12950,25 +13087,37 @@ def _composer_dock_items(sess):
     else:
         selected = []
 
+    attached_id = str(getattr(sess, "attached_agent_id", None) or "")
+    if attached_id and all(str(row.get("id") or "") != attached_id for row in selected):
+        # 正在看的那个一定在名册里——哪怕它是上一轮的、已经结束了；否则名册里没有一行
+        # 标着「正在看」，也就没法从名册回到它。
+        record = next(
+            (row for row in rows if str(row.get("id") or "") == attached_id), None)
+        if record is None:
+            try:
+                record = sess.agent_record(attached_id)
+            except (AGENTS.AgentRuntimeError, OSError, ValueError, KeyError):
+                record = None
+        if isinstance(record, dict) and record.get("id"):
+            selected = [record, *selected]
+
     if selected:
-        selected = selected[:4]
-        attached = bool(getattr(sess, "attached_agent_id", None))
-        header = tui.DockItem(
-            f"● main · {len(selected)} child agents · click/Ctrl+T open",
-            event="agent_detach" if attached else None)
-        activity_map = getattr(sess, "_agent_activity", {}) or {}
-        return (
-            header,
-            *(tui.DockItem(
-                _agent_dock_row(
-                    row, activity=activity_map.get(str(row.get("id") or ""), "")),
-                event="agent_attach",
-                value=str(row.get("id") or ""))
-              for row in selected),
-        )
+        shown = list(selected[:4])
+        if attached_id and all(str(row.get("id") or "") != attached_id for row in shown):
+            shown[-1] = next(
+                row for row in selected if str(row.get("id") or "") == attached_id)
+        hidden = len(selected) - len(shown)
+        # main 也是名册里的一行（CC 同）：输入框里按 ↓ 先落在它上面，在看子代理时 Enter 它回 main。
+        main = tui.DockItem(
+            ("◯ main" if attached_id else "● main")
+            + (f" · 另有 {hidden} 个子代理 · Ctrl+T 看全部" if hidden else ""),
+            event="agent_detach", viewed=not attached_id,
+            action="回 main" if attached_id else "")
+        return (main, *(
+            _agent_roster_item(sess, row, attached_id=attached_id) for row in shown))
 
     return tuple(
-        tui.DockItem(row, event="agents")
+        tui.DockItem(row, event="agents", action="打开线程")
         for row in _workflow_dock_rows(
             getattr(sess, "_workflow_current", None),
             activity_map=getattr(sess, "_agent_activity", None)))
@@ -14885,8 +15034,7 @@ def repl(sess, model):
                     renderer.render(snapshot)
                 elif event.kind == "agent_attach":
                     try:
-                        show_agent_preview(sess, event.value)
-                        sess.attach_agent(event.value)
+                        sess.switch_agent(event.value)
                     except (AGENTS.AgentRuntimeError, ValueError) as exc:
                         renderer.write_output(
                             RED(f"  [agents] {exc}\r\n"))

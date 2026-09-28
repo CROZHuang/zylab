@@ -1490,6 +1490,104 @@ def default_picker_rows(rows=None, *, catalog_sizes=None, preferred=None):
     return selected
 
 
+# 派子代理前的「选模型」决策门每题最多 4 项：当前模型 + 这么多家各一个代表 + 「其他模型…」。
+SUBAGENT_SHORTLIST = 2
+
+
+def _stem_order(preferred, stems):
+    """偏好家族（词干或公司名，如 gpt、Anthropic）→ 目录里对应词干的先后顺序。"""
+    order = []
+    for name in (DEFAULT_PREFERRED_FAMILIES if preferred is None else preferred):
+        wanted = str(name or "").strip().lower()
+        for stem, company in stems:
+            if stem not in order and wanted in (stem, company):
+                order.append(stem)
+    return order
+
+
+def _subagent_rank(row, current_gateway):
+    """一家里挑谁当代表：先最新一代，再旗舰档（非视觉、非 flash/mini、非开源尺寸、非量化
+    变体），再版本号；同一版本优先当前网关、上下文大的。与 /model 同一个「先代次、后档位」。"""
+    model_id = str(row.get("id") or "")
+    parsed = parse_model_name(model_id)
+    if parsed is None or not parsed.version:
+        return (1, 0, 0, 0, 0, (), 0, 0, model_id)       # 没版本号的排最后
+    tier = 2 if parsed.lower else (1 if parsed.size else 0)
+    # 版本补齐到同一长度再取负：否则 (5,) 会排在 (5, 5) 前面，5 压过 5.5。
+    version = tuple(parsed.version) + (0,) * max(0, 6 - len(parsed.version))
+    return (0, int(bool(parsed.vision)), -parsed.version[0], tier,
+            int(bool(parsed.variant)), tuple(-part for part in version),
+            int(str(row.get("gateway") or "") != str(current_gateway or "")),
+            -int(row.get("context") or 0), model_id)
+
+
+def subagent_choices(current_model, current_gateway, *, rows=None, preferred=None,
+                     route_allowed=None):
+    """派子代理时可选的模型（用户 2026-09-24：「别让 list 手写而是机制化」）。
+
+    和 /model 同一个来源（default_picker_rows：偏好家族的最新旗舰 + 小目录里实测能用的），
+    只留实测能调工具的；一个模型只列一次——同一个模型挂在几个网关上时取当前网关那条。
+    返回 ``(推荐, 全部)``：全部以当前模型打头，其后偏好家族按偏好顺序、其余按公司名；
+    推荐是按偏好顺序、跳过当前模型那一家，每家取一个代表，最多 SUBAGENT_SHORTLIST 家。
+    不读 workflow 的席位池（那是一份手写名单）。``route_allowed(网关, 模型)`` 可以再筛一道
+    （调用方用它排除后台发不出去的网关）；筛掉了一家的代表就轮到这家的下一个。
+    """
+    source = (default_picker_rows(preferred=preferred) if rows is None
+              else [dict(row) for row in rows])
+    current_model = str(current_model or "")
+    current_gateway = str(current_gateway or "")
+    by_model = {}
+    for row in source:
+        model_id = str(row.get("id") or "")
+        gateway = str(row.get("gateway") or "")
+        if (not model_id or not gateway or row.get("status") != "ok"
+                or row.get("supports_tools") is not True):
+            continue
+        if route_allowed is not None and not route_allowed(gateway, model_id):
+            continue
+        held = by_model.get(model_id)
+        if held is None or (gateway == current_gateway
+                            and str(held.get("gateway") or "") != current_gateway):
+            by_model[model_id] = row
+
+    def stem_of(model_id):
+        parsed = parse_model_name(model_id)
+        return parsed.stem if parsed else model_id.lower()
+
+    stems = []
+    for model_id in by_model:
+        pair = (stem_of(model_id), str(family_of(model_id) or "").lower())
+        if pair not in stems:
+            stems.append(pair)
+    order = _stem_order(preferred, stems)
+
+    def placement(row):
+        model_id = str(row["id"])
+        stem = stem_of(model_id)
+        position = order.index(stem) if stem in order else len(order)
+        company = display_family(model_id).lower() if position == len(order) else ""
+        return (position, company, _subagent_rank(row, current_gateway))
+
+    others = sorted((row for model_id, row in by_model.items()
+                     if model_id != current_model), key=placement)
+    everything = [{"model": current_model, "gateway": current_gateway,
+                   "family": display_family(current_model),
+                   "stem": stem_of(current_model)}]
+    everything += [{"model": str(row["id"]), "gateway": str(row["gateway"]),
+                    "family": display_family(str(row["id"])),
+                    "stem": stem_of(str(row["id"]))} for row in others]
+    shortlist = []
+    for stem in order:
+        if stem == everything[0]["stem"]:
+            continue
+        best = next((item for item in everything[1:] if item["stem"] == stem), None)
+        if best is not None:
+            shortlist.append(best)
+        if len(shortlist) == SUBAGENT_SHORTLIST:
+            break
+    return shortlist, everything
+
+
 def keyed_gateways():
     """配了 key、也有 endpoint 的网关 —— /model refresh 要刷的就是它们。
 

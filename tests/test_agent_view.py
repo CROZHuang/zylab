@@ -167,7 +167,7 @@ class SessionOpensAndFollowsTheView(unittest.TestCase):
 
     def test_refresh_redraws_only_when_something_changed(self):
         sess, store, record = self.make_session(child(1))
-        with mock.patch("zylab._agent_dock_row", return_value="○ 同一行"):
+        with mock.patch("zylab._agent_view_title", return_value="● 同一行"):
             sess.open_agent_view(record)
             self.assertFalse(sess.refresh_agent_view(force=True), "没变化就不重画")
             store["messages"] = child(2)
@@ -177,7 +177,7 @@ class SessionOpensAndFollowsTheView(unittest.TestCase):
 
     def test_refresh_is_throttled(self):
         sess, store, record = self.make_session(child(1))
-        with mock.patch("zylab._agent_dock_row", return_value="○ 同一行"):
+        with mock.patch("zylab._agent_view_title", return_value="● 同一行"):
             sess.open_agent_view(record)
             store["messages"] = child(2)
             self.assertFalse(sess.refresh_agent_view(), "一秒之内不去读记录")

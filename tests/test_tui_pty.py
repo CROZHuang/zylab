@@ -336,12 +336,20 @@ class InputNavigationTests(unittest.TestCase):
         ), publish=False)
         pump._handle_line(tui.CursorPosition(x=4, y=20))
         with mock.patch.object(tui, "_cols", return_value=80):
+            # 名册画在输入框下面（照 CC）：光标在第 20 行、下沿第 21 行、
+            # main 第 22 行、子代理第 23 行。
             events = pump._handle_line(tui.MouseEvent(
+                "press", x=12, y=23, button=0))
+            on_main = pump._handle_line(tui.MouseEvent(
+                "press", x=12, y=22, button=0))
+            above = pump._handle_line(tui.MouseEvent(
                 "press", x=12, y=18, button=0))
 
         self.assertEqual(len(events), 1)
         self.assertEqual(events[0].kind, "agent_attach")
         self.assertEqual(events[0].value, "a-child0001")
+        self.assertNotIn("agent_attach", [event.kind for event in on_main])
+        self.assertNotIn("agent_attach", [event.kind for event in above])
 
     def test_cursor_position_wait_closes_dsr_scheduling_gap(self):
         pump = tui.InputPump()
@@ -1975,16 +1983,18 @@ class RendererTests(unittest.TestCase):
         renderer.render(snapshot)
         rendered = tui._ANSI.sub("", stream.getvalue())
 
-        self.assertLess(rendered.index("queued prompt"), rendered.index("wf-dock"))
-        self.assertLess(rendered.index("wf-dock"), rendered.index("DAG"))
-        self.assertLess(rendered.index("DAG"), rendered.index("steer› "))
+        # 名册画在输入框和状态栏下面（照 CC）；它仍在同一帧里，清输入区时一起清掉：
+        # 从帧顶（排队那行）往下 ESC[J，光标下面的名册也在其中。
+        self.assertLess(rendered.index("queued prompt"), rendered.index("steer› "))
         self.assertLess(rendered.index("steer› "), rendered.index("chat demo"))
-        self.assertEqual(renderer._rows_before_cursor, 5)
+        self.assertLess(rendered.index("chat demo"), rendered.index("wf-dock"))
+        self.assertLess(rendered.index("wf-dock"), rendered.index("DAG"))
+        self.assertEqual(renderer._rows_before_cursor, 2)
 
         before_clear = len(stream.getvalue())
         renderer.clear_input()
         self.assertEqual(
-            stream.getvalue()[before_clear:], "\r\x1b[5A\x1b[J")
+            stream.getvalue()[before_clear:], "\r\x1b[2A\x1b[J")
 
     def test_fullscreen_picker_redraw_enters_once_and_exit_restores_screen(self):
         stream = self.TTY()

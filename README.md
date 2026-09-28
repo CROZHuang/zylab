@@ -597,10 +597,14 @@ Claude Code 自己也不把它们给模型，暂不补。
 **不可嵌套**、报告有长度上限，并沿用触发时冻结的网关与 hook context。
 
 **派之前先问你用哪个模型。** 交互会话里，主模型要派子代理时会弹出决策门，一个子代理
-一道题（「agent1 · 查资料 · 任务：… 用哪个模型？」）：推荐项是主会话当前的模型，其余选项
-来自席位池里实测能用的旗舰（最多 4 个）。一次派几个就能各选各的；Esc 取消这次派发，
-主模型会被告知是你取消的。`/auto`、非交互运行（`-p`）、子代理自己再派时不弹，照旧用
-当前模型；嫌打扰可在 settings 里设 `"subagent_model_gate": false`。
+一道题（「agent1 · 查资料 · 任务：… 用哪个模型？」）：第一项是主会话当前的模型（推荐），
+接着是偏好家族（settings `preferred_families`，默认 gpt、claude、deepseek、kimi、glm、qwen）
+顺序里另外两家各自最新的旗舰（跳过当前模型那一家），最后是「其他模型…」——打开和 `/model`
+同一份的完整列表（↑↓ 首尾相接、打字筛选）。候选和 `/model` 同一个来源：实测能调工具的、
+一个模型只列一次，后台发不出去的网关（没配地址、明文 HTTP 没放行）不列；新公司、新版本
+不用改代码。一次派几个就能各选各的；决策门或列表里按 Esc 取消这次派发，主模型会被告知
+是你取消的。`/auto`、非交互运行（`-p`）、子代理自己再派时不弹，照旧用当前模型；嫌打扰
+可在 settings 里设 `"subagent_model_gate": false`。它不读 workflow 的席位池。
 
 普通 chat 的主模型可自行决定调用它，不需要用户先开 `/workflow` 或特殊 effort。
 单个高上下文调查走 `task`；真正互相独立的调查可用 `tasks` 一次并行启动 2–3 个
@@ -617,9 +621,11 @@ M3c-3 已提供 Claude Code 风格的 `/agents` workspace。子代理的正文**
 `/agents peek <id>` 的续行，报告本身作为工具结果交给主模型转述（PLAN-agent-visibility J1/J2）。
 主模型等待子代理时，活动行原地显示 `✻ 等待 N 个后台代理完成`，数字随完成递减；状态栏带
 `N agents`。TUI 还能 list/peek/attach child，并在主模型运行期间把 direct message 独立发进 child
-inbox。当前 turn 的普通 child 会常驻在 composer 上方的名册里（`○ 席位  label  最近一步  耗时 · ↓ tokens`，
-最后一个结束后随下一帧消失）；`/agents attach <id>`
-查看并 attach 该线程，`/agents detach` 返回主输入框。内联模式不接管鼠标：滚轮、滚动条、
+inbox。当前 turn 的普通 child 会常驻在输入框和状态栏**下面**的名册里（照 Claude Code）：第一行是
+`● main`，之后每个子代理一行 `◯ 席位  label  最近一步`，耗时 · ↓ tokens 靠右；`●` 是正在看的那个、
+`◯` 是其余，结束了的写 `✓ 完成` / `✗ 失败`。最后一个结束后随下一帧消失（正在看的那个一直留着）。
+**输入框里按 ↓ 进名册**（光标在最后一行、不在翻历史时；先落在 main），↑↓ 选、Enter 切过去、
+Esc 回输入框；`/agents attach <id>` 查看并 attach 该线程，`/agents detach` 返回主输入框。内联模式不接管鼠标：滚轮、滚动条、
 拖拽选择都是终端原生的，transcript 就在终端 scrollback 里；只有 `--app` 全屏模式由 TUI
 处理滚轮与选区。
 
@@ -629,7 +635,8 @@ M3c-3 已实现的交互合同如下：
 |---|---|
 | `/agents`、`/agents list`、Ctrl+T | 只列当前 chat 的 child；行内显示 state、short id、name、model@gateway、更新时间与 pending inbox |
 | Space / `/agents peek <id>` | 有界查看最新 child transcript，不改变输入目标 |
-| Enter / `/agents attach <id>` | **整屏切到这个子代理的记录**：开头是主代理交给它的原话（高亮块），之后是它的每一步，边跑边更新；青色标题行写明在看谁；PgUp/PgDn、滚轮滚它的记录；打字发给它（prompt 明示 `agent <id>›`） |
+| 输入框里 ↓（进名册）→ ↑↓ → Enter | 名册里选一个子代理，Enter 切过去；main 那行 Enter = 回 main；Esc 回输入框，最上面再 ↑ 也回输入框，最下面再 ↓ 绕回 main |
+| Enter / `/agents attach <id>` | **整屏切到这个子代理的记录**：开头是主代理交给它的原话（高亮块），之后是它的每一步，边跑边更新；青色标题行写明在看谁；输入框换成青色、上沿挂它的任务名、草稿为空时写「发给 @它…」；PgUp/PgDn、滚轮滚它的记录；打字发给它 |
 | Esc、列 0 Left、`/agents detach` | 回主会话：主屏原样还在，看子代理期间主会话的新输出随即补上；恢复 attach 前的主草稿、历史和 queue，不取消主/child 工作 |
 | `/agents send <id> <text>` | 向 child inbox 追加一条独立消息；completed/waiting child 在后台恢复同一 transcript |
 
@@ -983,7 +990,7 @@ generation，再原子切换 `architecture/current.json`；同 repo 只允许一
 | `/doctor` | 只读检查 DB、sandbox/network capability、gateway/transport、terminal 与 session inventory |
 | `/rewind` | 预览并恢复 checkpoint 的 conversation/code/both，或创建 branch/精确摘要前缀 |
 | 空闲时 ↑↓；Ctrl-A/E/U/K/W | 翻历史；常规行编辑 |
-| child dock 点击；Ctrl+T 或 `/agents` | dock 直接 attach 当前 turn 的 child；panel 可查看全部 child，Enter attach，Space peek |
+| 输入框里 ↓；Ctrl+T 或 `/agents` | ↓ 进输入框下面的名册（↑↓ 选、Enter 切过去、Esc 返回）；panel 可查看全部 child，Enter attach，Space peek |
 | attached composer | Enter/Tab 发给 child；Esc 或列 0 Left detach，主/child 草稿、历史和 queue 隔离 |
 | 裸 `/resume` | 打开持久 session panel；默认只看当前 repo 的 active 会话 |
 | session panel 输入 `/` | 进入筛选；Esc 先退出筛选并保留 panel，再按 Esc 才关闭 |

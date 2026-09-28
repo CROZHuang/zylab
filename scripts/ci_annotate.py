@@ -162,6 +162,30 @@ def pick_blocks(causes, limit=None):
     return out
 
 
+_TEST_MODULE = re.compile(r"\(([\w.]+)\)\s*$")
+
+
+def module_counts(names):
+    """失败名 → 「按模块：test_a 3 · test_b 1」——纯函数，测得到。
+
+    放在失败清单**第一行**：清单正文有 MAX_BODY 上限、按模块字母序排，后半截的
+    模块会整个看不见；这一行短，截断前就把每个红了的模块和条数交代完。
+    （2026-09-24：Windows py3.13 多出 12 个失败块，全落在截掉的那半截里。）
+    """
+    counts = {}
+    for line in names:
+        match = _TEST_MODULE.search(line)
+        if not match:
+            continue
+        parts = match.group(1).split(".")
+        module = parts[1] if parts[0] == "tests" and len(parts) > 1 else parts[0]
+        counts[module] = counts.get(module, 0) + 1
+    if not counts:
+        return ""
+    return "按模块：" + " · ".join(
+        f"{module} {count}" for module, count in sorted(counts.items()))
+
+
 def annotations(log):
     """返回 [(标题, 正文)]；条数受 MAX_BLOCKS 约束，没有可报的就返回空。"""
     out = []
@@ -176,7 +200,9 @@ def annotations(log):
             body.append(f"       首例 {tidy_cause(name, NAME_LINE)}")
         out.append(("根因汇总", "\n".join(body)))
     if names:
-        out.append(("失败清单", "\n".join(names[:MAX_NAMES])))
+        summary = module_counts(names)
+        out.append(("失败清单", "\n".join(
+            ([summary] if summary else []) + names[:MAX_NAMES])))
     for index, (_, _, _, block) in enumerate(pick_blocks(causes), 1):
         out.append((f"traceback {index}", block))
     hit = HANG.search(log)

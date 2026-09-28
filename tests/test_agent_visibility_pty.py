@@ -94,8 +94,9 @@ class AgentVisibilityPTYTests(unittest.TestCase):
         self.assertIn("ZYLAB_TEST_WAITING_1", out)
         self.assertLess(out.find("ZYLAB_TEST_WAITING_2"), out.find("ZYLAB_TEST_WAITING_1"))
         # J4：名册行（席位 + label）出现过；J5：状态栏计数出现过
-        self.assertIn("○ Kimi  归纳调研线摘要", plain)
-        self.assertIn("○ GLM  抓取 arXiv 元数据", plain)
+        # （名册的圆点 09-24 起照 CC：● 是正在看的那个、◯ 是其余，不再表示状态）
+        self.assertIn("◯ Kimi  归纳调研线摘要", plain)
+        self.assertIn("◯ GLM  抓取 arXiv 元数据", plain)
         self.assertIn("2 agents", plain)
 
 

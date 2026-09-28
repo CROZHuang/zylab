@@ -219,22 +219,43 @@ def finished_hint(event, peek_id=None):
     return f"  ⎿  报告 {size:,} 字 · {where} 查看 · 已交给主 agent"
 
 
-def roster_row(event, *, width_label=22, width_activity=28, now=None):
-    """名册行：``○ Kimi  label  activity  5m 05s · ↓ 89.6k``。"""
-    mark = {"finished": "●", "failed": "✗", "cancelled": "×"}.get(event.kind, "○")
+def _roster_clock(event, now=None):
     elapsed = event.elapsed
     if elapsed is None and event.started_at:
         elapsed = elapsed_seconds(event.started_at, event.ended_at, now=now)
-    seconds = int(round(elapsed or 0))
-    minutes, secs = divmod(seconds, 60)
-    clock = f"{minutes}m {secs:02d}s"
+    minutes, secs = divmod(int(round(elapsed or 0)), 60)
+    hours, minutes = divmod(minutes, 60)
+    clock = f"{hours}h {minutes:02d}m" if hours else f"{minutes}m {secs:02d}s"
+    return clock + (f" · {fmt_tokens(event.tokens)}" if event.tokens is not None else "")
+
+
+def roster_row(event, *, width_label=22, width_activity=28, now=None):
+    """名册行：``○ Kimi  label  activity  5m 05s · ↓ 89.6k``。"""
+    mark = {"finished": "●", "failed": "✗", "cancelled": "×"}.get(event.kind, "○")
     label = _one_line(event.label, width_label)
     activity = _one_line(event.activity, width_activity) if event.activity else ""
     parts = [f"{mark} {event.seat or '?'}", label]
     if activity:
         parts.append(activity)
-    tail = clock + (f" · {fmt_tokens(event.tokens)}" if event.tokens is not None else "")
-    return "  ".join(parts) + "  " + tail
+    return "  ".join(parts) + "  " + _roster_clock(event, now=now)
+
+
+def roster_parts(event, *, viewed, width_label=22, width_activity=28, now=None):
+    """输入框下面那份名册的一行（照 CC）：返回 ``(左, 右, 色调)``。
+
+    圆点表示「在不在看它」（● 正在看 / ◯ 其余），不再表示状态——结束了的写成字
+    （✓ 完成 / ✗ 失败 / × 已取消）并上色；耗时 · token 放右边，由界面靠右画。
+    """
+    status = {"finished": "✓ 完成", "failed": "✗ 失败",
+              "cancelled": "× 已取消"}.get(event.kind, "")
+    parts = [f"{'●' if viewed else '◯'} {event.seat or '?'}",
+             _one_line(event.label, width_label)]
+    if status:
+        parts.append(status)
+    elif event.activity:
+        parts.append(_one_line(event.activity, width_activity))
+    tone = {"finished": "ok", "failed": "error"}.get(event.kind, "")
+    return "  ".join(parts), _roster_clock(event, now=now), tone
 
 
 def waiting_line(count):

@@ -171,6 +171,39 @@ class Escaping(unittest.TestCase):
                              ci_annotate.MAX_BODY)
 
 
+class EveryFailingModuleIsNamed(unittest.TestCase):
+    """失败清单被截断时，每个红了的模块仍然看得见、带条数。
+
+    2026-09-24 公开仓库 CI：Windows py3.13 那列从 57 个失败块涨到 69 个，而清单按
+    模块字母序排、正文 3500 字符只放得下约 24 个长名字——停在 test_graft，多出来的
+    12 个全在看不见的后半截，日志又要 admin 权限才下得到，**说不出是哪几个用例**。
+    """
+
+    @staticmethod
+    def log_with(names):
+        blocks = []
+        for module, test in names:
+            blocks.append(
+                "=" * 70 + f"\nFAIL: {test} ({module}.Cases.{test})\n" + "-" * 70
+                + "\nTraceback (most recent call last):\nAssertionError: x\n")
+        return "".join(blocks) + "-" * 70 + "\nRan 99 tests in 1.0s\n\nFAILED (failures=60)\n"
+
+    def test_the_modules_at_the_end_of_a_long_list_are_still_counted(self):
+        names = [(f"test_{chr(ord('a') + i % 20)}{'x' * 5}",
+                  "test_" + "a_rather_long_descriptive_name_" * 3 + str(i))
+                 for i in range(60)]
+        body = dict(ci_annotate.annotations(self.log_with(names)))["失败清单"]
+        shown = ci_annotate.escape(body)          # 真正发出去的是截过的这一份
+        for module in sorted({module for module, _ in names}):
+            self.assertIn(f"{module} 3", shown, f"{module} 不在清单里")
+
+    def test_one_module_one_count(self):
+        names = [("test_view", "test_one"), ("test_view", "test_two"),
+                 ("test_gate", "test_three")]
+        body = dict(ci_annotate.annotations(self.log_with(names)))["失败清单"]
+        self.assertEqual(body.splitlines()[0], "按模块：test_gate 1 · test_view 2")
+
+
 class AsACommand(unittest.TestCase):
     """workflow 直接 `python scripts/ci_annotate.py <日志>` 调它。"""
 

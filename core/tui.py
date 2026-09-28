@@ -18,6 +18,7 @@ from . import paths
 import base64
 from dataclasses import dataclass, replace as dataclass_replace
 
+import io
 import os
 import queue
 import re
@@ -146,11 +147,25 @@ class PasteEvent:
 
 @dataclass(frozen=True)
 class DockItem:
-    """One composer-adjacent status row with an optional click action."""
+    """One composer-adjacent status row with an optional click action.
+
+    有 ``event`` 的行可以用键盘选中（输入框里按 ↓ 进名册，Enter 发出 event）。
+    ``viewed`` 只在子代理名册上用：True = 正在看的那个（●），False = 其余（◯），
+    None = 不是名册行（workflow 面板那几行）。``right`` 靠右画（耗时 · token），
+    ``action`` 是 Enter 的说明，``tone`` 给结束了的代理上色（ok / error）。
+    """
 
     text: str
     event: str | None = None
     value: object = None
+    viewed: bool | None = None
+    right: str = ""
+    action: str = ""
+    tone: str = ""
+
+
+# 名册最多画几行（main + 4 个子代理）。点击换算与画面都按这个数截。
+DOCK_LIMIT = 5
 
 
 def _decode_cursor_position(sequence):
@@ -2717,6 +2732,10 @@ class InputSnapshot:
     modal_question_index: int = 0
     modal_selected: tuple = ()
     modal_error: str = ""
+    # 名册里键盘焦点在第几行（下标对 dock）；None = 焦点在输入框。
+    dock_selected: int | None = None
+    # 输入框此刻发给哪个子代理（它的任务名）：画在输入框上沿、写进占位提示。
+    target_label: str = ""
 
 
 @dataclass(frozen=True)
@@ -3256,6 +3275,16 @@ class LineEditor:
     def _redraw(self):
         return [PumpEvent("redraw", snapshot=self.snapshot())]
 
+    def leaves_on_down(self):
+        """↓ 在输入框里已经没事可做：不在 Ctrl+R 搜索、没有补全菜单、不在翻历史、
+        光标在最后一行。这时 ↓ 才轮到输入框下面的名册（CC 的 onHistoryDownPastEnd）。"""
+        if self._search is not None or self._matches():
+            return False
+        if ((self.target is not None or not self.busy)
+                and self.history_index < len(self.history)):
+            return False
+        return "\n" not in self.text[self.cursor:]
+
     @staticmethod
     def _paste_placeholder(index, text):
         return f"[Pasted text #{index} +{text.count(chr(10)) + 1} lines]"
@@ -3550,6 +3579,10 @@ class InputPump:
         self._prompt_editor = None
         self._queued = ()
         self._dock = ()
+        # 名册里的键盘焦点（下标对 _dock）；None = 焦点在输入框
+        self._dock_focus = None
+        self._target_label = ""
+        self._layout_helper = None
         self._status = ""
         self._activity = ""
         self._history_mode = False
@@ -3607,7 +3640,8 @@ class InputPump:
     def _decorate_snapshot(self, snapshot):
         return dataclass_replace(
             snapshot, queued=self._queued, dock=self._dock,
-            status=self._status, activity=self._activity)
+            status=self._status, activity=self._activity,
+            dock_selected=self._dock_focus, target_label=self._target_label)
 
     def _decorate_event(self, event):
         if event.snapshot is None:
@@ -3689,33 +3723,91 @@ class InputPump:
             self._events.put(PumpEvent("redraw", snapshot=snapshot))
         return snapshot
 
+    def _layout(self):
+        """一个不往终端写的排版器：点击换算要和画面用同一套排版，不另算一遍。"""
+        if self._layout_helper is None:
+            self._layout_helper = TerminalRenderer(stream=io.StringIO())
+        return self._layout_helper
+
     def _dock_click_event(self, mouse):
         if (self._cursor_screen_row is None
                 or mouse.kind != "press" or mouse.button != 0):
             return None
         if mouse.x < 1 or mouse.x > _cols():
             return None
-        dock = self._dock[:5]
+        dock = self._dock_rows()
         if not dock:
             return None
-        snapshot = self.editor.snapshot()
-        raw_text = str(snapshot.text)
-        safe_text = sanitize_terminal_text(raw_text)
-        safe_cursor = len(sanitize_terminal_text(
-            raw_text[:snapshot.cursor]))
-        _, cursor = TerminalRenderer._editor_rows(
-            str(snapshot.prompt), safe_text, safe_cursor,
-            max(4, max(20, _cols() - 1) - 4))
-        cursor_frame_row = (
-            len(self._queued) + len(dock) + 1 + cursor[0])
-        frame_top = self._cursor_screen_row - cursor_frame_row
-        index = mouse.y - (frame_top + len(self._queued))
+        layout = self._layout()
+        _, cursor_row, _ = layout._build_frame(
+            self._decorate_snapshot(self.editor.snapshot()),
+            max(20, _cols() - 1))
+        dock_row = layout.frame_dock_row
+        if dock_row is None:
+            return None
+        frame_top = self._cursor_screen_row - cursor_row
+        index = mouse.y - (frame_top + dock_row)
         if not 0 <= index < len(dock):
             return None
         item = dock[index]
         if not isinstance(item, DockItem) or not item.event:
             return None
         return PumpEvent(item.event, value=item.value)
+
+    # ---- 名册（输入框下面那几行）的键盘焦点：照 CC 的 Footer 上下文 ----
+    def _dock_rows(self, dock=None):
+        return tuple(self._dock if dock is None else dock)[:DOCK_LIMIT]
+
+    @staticmethod
+    def _selectable(rows):
+        return [index for index, item in enumerate(rows)
+                if isinstance(item, DockItem) and item.event]
+
+    def _remap_dock_focus(self, old_rows, new_rows):
+        """名册每秒都在变（耗时、新来的代理）：焦点跟着原来那一行走，找不到就取最近的。"""
+        focus = self._dock_focus
+        if focus is None:
+            return None
+        selectable = self._selectable(new_rows)
+        if not selectable:
+            return None
+        old = old_rows[focus] if 0 <= focus < len(old_rows) else None
+        if isinstance(old, DockItem):
+            key = (old.event, old.value)
+            same = new_rows[focus] if focus < len(new_rows) else None
+            if isinstance(same, DockItem) and (same.event, same.value) == key:
+                return focus
+            for index in selectable:
+                if (new_rows[index].event, new_rows[index].value) == key:
+                    return index
+        return min(selectable, key=lambda index: abs(index - focus))
+
+    def _handle_dock_key(self, key):
+        """焦点在名册时的按键。返回 None = 这个键不归名册：焦点回输入框，键照常处理。"""
+        rows = self._dock_rows()
+        selectable = self._selectable(rows)
+        if self._dock_focus not in selectable:
+            self._dock_focus = None
+            return None
+        position = selectable.index(self._dock_focus)
+        if key == "up":
+            # 最上面那行再 ↑ 回输入框（输入框就在名册上面）
+            self._dock_focus = selectable[position - 1] if position else None
+            return self.editor._redraw()
+        if key == "down":
+            # 最下面那行再 ↓ 绕回第一行：用户要列表首尾相接，不是死胡同
+            self._dock_focus = selectable[wrap_step(position, 1, len(selectable))]
+            return self.editor._redraw()
+        if key == "enter":
+            item = rows[self._dock_focus]
+            if item.viewed:
+                return []              # 正在看的就是它
+            return [PumpEvent(item.event, value=item.value)]
+        if key == "esc":
+            self._dock_focus = None    # 只退出名册；在子代理视图里再按一次 Esc 才回 main
+            return self.editor._redraw()
+        self._dock_focus = None
+        return None
 
     def _handle_line(self, key):
         """Route viewport navigation and dock clicks before line editing."""
@@ -3790,6 +3882,16 @@ class InputPump:
             # so the user's draft and normal shortcuts remain untouched.
             self._history_mode = False
             return [PumpEvent("history_close"), *self.editor.handle(key)]
+        if self._dock_focus is not None:
+            events = self._handle_dock_key(key)
+            if events is not None:
+                return events
+            # 焦点回到输入框，这个键照常交给输入框（打字 = 接着写草稿）
+        elif (key == "down" and self._selectable(self._dock_rows())
+                and self.editor.leaves_on_down()):
+            # 输入框里 ↓ 已经没事可做：进名册，落在第一行（main）
+            self._dock_focus = self._selectable(self._dock_rows())[0]
+            return self.editor._redraw()
         if key == "ctrl-c" and self._composer_selection_active:
             return [PumpEvent("composer_copy")]
         if key == "esc" and self._composer_selection_active:
@@ -3806,7 +3908,7 @@ class InputPump:
                   dock=_FRAME_UNSET, status=_FRAME_UNSET,
                   activity=_FRAME_UNSET,
                   target=_FRAME_UNSET, target_history=_FRAME_UNSET,
-                  publish=True):
+                  target_label=_FRAME_UNSET, publish=True):
         """原子更新 composer 状态，只产生一帧完整 redraw。"""
         with self._lock:
             old_busy = self.editor.busy
@@ -3829,10 +3931,14 @@ class InputPump:
                     self._composer_selection_active = False
                 self._queued = next_queued
                 self._cursor_screen_row = None
+            if target_label is not _FRAME_UNSET:
+                self._target_label = str(target_label or "")
             if dock is not _FRAME_UNSET:
                 next_dock = tuple(dock or ())
                 if next_dock != self._dock:
                     self._composer_selection_active = False
+                self._dock_focus = self._remap_dock_focus(
+                    self._dock_rows(), self._dock_rows(next_dock))
                 self._dock = next_dock
                 self._cursor_screen_row = None
             if status is not _FRAME_UNSET:
@@ -4560,6 +4666,7 @@ class TerminalRenderer:
         self.styled = terminal_style_enabled(self.stream)
         self._drawn = False
         self._rows_before_cursor = 0
+        self.frame_dock_row = None       # 最近一帧里名册第一行的行号（点击换算用）
         # 非换行结尾的模型 chunk 暂存在 composer 上一行。下一 chunk 先回到
         # 该列续写，避免 render() 的 ESC[J 把刚输出的正文擦掉。
         self._output_partial_col = None
@@ -5471,7 +5578,7 @@ class TerminalRenderer:
         dock = tuple(
             self._transcript_plain(
                 str(value.text if isinstance(value, DockItem) else value))
-            for value in tuple(snapshot.dock)[:5])
+            for value in tuple(snapshot.dock)[:DOCK_LIMIT])
         return (int(width), prompt, str(safe_text), queued, dock)
 
     def _composer_selection_bounds(self, value=None):
@@ -5513,9 +5620,7 @@ class TerminalRenderer:
         _, cursor_row, _ = self._build_frame(snapshot, width)
         frame_top = int(cursor_screen_row) - int(cursor_row)
         line_index = int(event.y) - frame_top
-        editor_start = (
-            len(tuple(snapshot.queued))
-            + len(tuple(snapshot.dock)[:5]))
+        editor_start = len(tuple(snapshot.queued))
         row = line_index - (editor_start + 1)
         raw_text = str(snapshot.text)
         safe_text = self._transcript_plain(raw_text)
@@ -5658,10 +5763,10 @@ class TerminalRenderer:
         back = " · Esc 回 main"
         extra = " · PgUp/PgDn 滚动 · 打字发给它"
         fixed = f" · {position}{unseen}{back}"
-        title = " ".join(str(view.get("title") or "").split())
-        room = max(8, width - display_width("  ● " + fixed) - 1)
+        title = str(view.get("title") or "").replace("\r", " ").replace("\n", " ")
+        room = max(8, width - display_width("  " + fixed) - 1)
         title = truncate_display(title, room)
-        header = f"  ● {title}{fixed}"
+        header = f"  {title}{fixed}"
         if display_width(header + extra) <= width:
             header += extra
         return truncate_display(header, width), rows[start:end]
@@ -6327,17 +6432,6 @@ class TerminalRenderer:
                     ("\x1b[2;38;5;103m" if self.styled else "")
                     + truncate_display("  " + plain, width)
                     + ("\x1b[0m" if self.styled else ""))
-            dock = []
-            for index, item in enumerate(snapshot.dock[:5]):
-                value = item.text if isinstance(item, DockItem) else item
-                plain = self._transcript_plain(value).replace(
-                    "\r", " ").replace("\n", " ")
-                style = (
-                    "\x1b[38;5;75m" if self.styled and index == 0
-                    else ("\x1b[2;38;5;103m" if self.styled else ""))
-                dock.append(
-                    style + truncate_display("  " + plain, width)
-                    + ("\x1b[0m" if self.styled else ""))
             title = []
             if snapshot.mode == "prompt" and snapshot.title:
                 safe_title = self._transcript_plain(snapshot.title)
@@ -6349,6 +6443,8 @@ class TerminalRenderer:
             accent = (
                 "\x1b[38;5;214m" if self.styled and snapshot.active
                 else border)
+            if snapshot.target is not None and self.styled:
+                border = accent = "\x1b[38;5;37m"      # 发给子代理：整框换成青色（CC 同）
             reset = "\x1b[0m" if self.styled else ""
             inner_width = max(4, width - 4)
             editor_prompt = str(snapshot.prompt)
@@ -6361,10 +6457,13 @@ class TerminalRenderer:
             editor_rows, cursor = self._editor_rows(
                 editor_prompt, safe_text,
                 safe_cursor, inner_width)
-            if (not safe_text and not snapshot.busy and snapshot.mode == "line"
-                    and editor_rows and snapshot.target is None):
+            recipient = " ".join(
+                self._transcript_plain(snapshot.target_label).split())
+            if (not safe_text and snapshot.mode == "line" and editor_rows
+                    and (snapshot.target is not None or not snapshot.busy)):
                 # 像 Claude Code：草稿为空时给一行淡色占位，光标仍停在提示符后
-                hint = COMPOSER_PLACEHOLDER
+                hint = (COMPOSER_PLACEHOLDER if snapshot.target is None
+                        else f"发给 @{recipient or snapshot.target}…")
                 room = inner_width - display_width(editor_prompt) - 1
                 if room > 8:
                     if display_width(hint) > room:
@@ -6381,6 +6480,16 @@ class TerminalRenderer:
                     _ANSI.sub("", editor_prompt), safe_text,
                     selection_bounds[0], selection_bounds[1], inner_width)
             top = border + "╭" + "─" * (width - 2) + "╮" + reset
+            if snapshot.target is not None and recipient:
+                badge = " " + truncate_display(
+                    recipient, max(1, min(40, width - 12))) + " "
+                run = width - 3 - display_width(badge)
+                if run >= 4:
+                    badge_style = (
+                        "\x1b[48;5;30;38;5;231m" if self.styled else "")
+                    top = (border + "╭" + "─" * run + reset
+                           + badge_style + badge + reset
+                           + border + "─╮" + reset)
             bottom = border + "╰" + "─" * (width - 2) + "╯" + reset
             boxed = [top]
             for value in editor_rows:
@@ -6389,9 +6498,8 @@ class TerminalRenderer:
                     accent + "│" + reset + " " + value
                     + " " * padding + " " + border + "│" + reset)
             boxed.append(bottom)
-            lines = queued + dock + title + boxed
-            cursor_row = (
-                len(queued) + len(dock) + len(title) + 1 + cursor[0])
+            lines = queued + title + boxed
+            cursor_row = len(queued) + len(title) + 1 + cursor[0]
             cursor_col = 2 + cursor[1]
             lines.extend(self._guided_option_lines(
                 snapshot.options, width, snapshot.selected))
@@ -6415,7 +6523,77 @@ class TerminalRenderer:
                 ("\x1b[2;38;5;103m" if self.styled else "")
                 + truncate_display("  " + metadata, width)
                 + ("\x1b[0m" if self.styled else ""))
+        self.frame_dock_row = None
+        if snapshot.mode in ("line", "prompt"):
+            dock_lines = self._dock_lines(snapshot, width)
+            if dock_lines:
+                self.frame_dock_row = len(lines)
+                lines.extend(dock_lines)
         return lines, cursor_row, cursor_col
+
+    def _dock_lines(self, snapshot, width):
+        """输入框下面的名册：● 正在看的、◯ 其余、❯ 键盘焦点、耗时靠右。
+
+        照 CC 2.1.281 的 Footer：输入框里按 ↓ 进来（没进来时第一行写着「↓ 选择」），
+        进来以后最下面一行写按键说明。workflow 那几行（viewed=None）保持原来的配色。
+        """
+        items = tuple(snapshot.dock)[:DOCK_LIMIT]
+        if not items:
+            return []
+        styled = self.styled
+        reset = "\x1b[0m" if styled else ""
+        dim = "\x1b[2m" if styled else ""
+        focus = snapshot.dock_selected
+        selectable = [
+            index for index, item in enumerate(items)
+            if isinstance(item, DockItem) and item.event]
+        lines = []
+        for index, item in enumerate(items):
+            is_item = isinstance(item, DockItem)
+            plain = self._transcript_plain(
+                item.text if is_item else item).replace(
+                    "\r", " ").replace("\n", " ")
+            right = (self._transcript_plain(item.right).replace(
+                "\r", " ").replace("\n", " ") if is_item and item.right else "")
+            viewed = item.viewed if is_item else None
+            focused = focus == index
+            if viewed is True:
+                style = "\x1b[1m"
+            elif viewed is False:
+                style = "" if focused else "\x1b[2m"
+            elif index == 0:
+                style = "\x1b[38;5;75m"
+            else:
+                style = "" if focused else "\x1b[2;38;5;103m"
+            tone = {"ok": "\x1b[32m", "error": "\x1b[31m"}.get(
+                item.tone if is_item else "", "")
+            style = (style + tone) if styled else ""
+            suffix = ""
+            if focus is None and selectable and index == selectable[0]:
+                suffix = "  ↓ 选择"
+            left = ("❯ " if focused else "  ") + plain
+            if right and display_width(right) + 8 <= width:
+                room = width - display_width(right) - 2
+                body = truncate_display(left, room)
+                tail = truncate_display(suffix, max(0, room - display_width(body)))
+                gap = " " * max(
+                    1, width - display_width(body + tail) - display_width(right))
+                lines.append(style + body + reset + dim + tail + reset
+                             + style + gap + right + reset)
+            else:
+                body = truncate_display(left, width)
+                tail = truncate_display(suffix, max(0, width - display_width(body)))
+                lines.append(style + body + reset + dim + tail + reset)
+        if focus is not None and 0 <= focus < len(items):
+            item = items[focus]
+            controls = ["↑↓ 选择"]
+            if isinstance(item, DockItem) and item.event and not item.viewed:
+                controls.append(f"Enter {item.action or '打开'}")
+            controls.append("Esc 回输入框")
+            controls.append("Ctrl+T 全部")
+            lines.append(dim + truncate_display(
+                "  " + " · ".join(controls), width) + reset)
+        return lines
 
     def _validate_composer_selection(self, snapshot, width):
         """Drop a selection when the frame it refers to is no longer stable."""
@@ -6448,7 +6626,7 @@ class TerminalRenderer:
         signature = (
             int(width), int(cursor_row), int(cursor_col), len(lines),
             str(snapshot.prompt), str(snapshot.text), int(snapshot.cursor),
-            tuple(snapshot.queued), tuple(snapshot.dock[:5]),
+            tuple(snapshot.queued), tuple(snapshot.dock[:DOCK_LIMIT]),
         )
         now = time.monotonic()
         if (signature == self._last_mouse_query_signature

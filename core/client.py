@@ -736,6 +736,25 @@ def require_secure_transport(route, *, trace_context=None, purpose=None,
     return request
 
 
+def transport_ready(route):
+    """不弹窗地回答：现在往这条 route 发请求，传输守卫会不会放行（没配地址算不放行）。
+
+    后台线程发出的请求不会弹确认框——授权器在非 owner 线程上直接拒绝（fail closed）。
+    所以替后台请求挑网关时只能挑已经放行的：https、白名单里的 http、或整个进程放开了。
+    本会话里临时点头放行过的 http 在这里看不见（那份授权在 Session 里）。
+    """
+    try:
+        request = transport_request(route)
+    except Exception:                                   # noqa: BLE001 - 解析不了就是不能用
+        return False
+    base = str(request.get("base") or "").strip()
+    if not base:
+        return False
+    scheme = urllib.parse.urlsplit(base).scheme.casefold()
+    return (scheme == "https" or _ALLOW_INSECURE_HTTP
+            or request["base"] in _ALLOWED_INSECURE_ENDPOINTS)
+
+
 class Interrupted(RuntimeError):
     """用户在流式过程中按了 Esc。"""
 
